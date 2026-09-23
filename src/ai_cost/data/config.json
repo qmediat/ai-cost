@@ -1,0 +1,158 @@
+{
+  "currency_display": "USD",
+  "eur_per_usd": 0.92,
+  "window_default_hours": 24,
+  "reconcile": {
+    "tolerance_pct": 5
+  },
+  "subscriptions": [],
+  "providers": {
+    "anthropic": {
+      "billing": "mixed",
+      "cache_ttl_default": "1h"
+    },
+    "openai": {
+      "billing": "mixed",
+      "default_model": ""
+    },
+    "google": {
+      "billing": "api"
+    },
+    "xai": {
+      "billing": "api",
+      "trust_cli_cost": true
+    },
+    "deepseek": {
+      "billing": "api"
+    },
+    "github": {
+      "copilot_plan_exhausted": false,
+      "actions_plan_exhausted": false,
+      "actions_runner": "linux"
+    }
+  },
+  "budgets": {
+    "daily_usd": 150,
+    "monthly_usd": 2500,
+    "per_provider_daily_usd": {
+      "google": 60,
+      "xai": 30
+    }
+  },
+  "sizing": {
+    "packet_bytes": {
+      "XS": 15000,
+      "S": 50000,
+      "M": 120000,
+      "L": 300000
+    },
+    "loc": {
+      "XS": 40,
+      "S": 150,
+      "M": 400,
+      "L": 1000
+    }
+  },
+  "vendor": {
+    "default_profile": "consultancy-eu",
+    "hours_per_day": 6,
+    "profiles": {
+      "consultancy-eu": {
+        "currency": "EUR",
+        "description": "European consultancy (security audit / remediation rates)",
+        "bands_hours": {
+          "XS": [
+            1,
+            2
+          ],
+          "S": [
+            3,
+            6
+          ],
+          "M": [
+            8,
+            16
+          ],
+          "L": [
+            16,
+            32
+          ],
+          "XL": [
+            32,
+            64
+          ]
+        },
+        "integration_pct": 25,
+        "staffing": {
+          "junior": {
+            "rate": 70,
+            "time_factor": 1.8,
+            "senior_review_pct": 25
+          },
+          "mid": {
+            "rate": 100,
+            "time_factor": 1.2,
+            "senior_review_pct": 10
+          },
+          "senior": {
+            "rate": 150,
+            "time_factor": 1.0,
+            "senior_review_pct": 0
+          }
+        },
+        "package": {
+          "min_hours": 8,
+          "round_to_hours": 4
+        }
+      },
+      "software-house": {
+        "currency": "USD",
+        "description": "Software house (2026 blended team rates)",
+        "bands_hours": {
+          "XS": [
+            1,
+            2
+          ],
+          "S": [
+            3,
+            6
+          ],
+          "M": [
+            8,
+            16
+          ],
+          "L": [
+            16,
+            32
+          ],
+          "XL": [
+            32,
+            64
+          ]
+        },
+        "integration_pct": 20,
+        "staffing": {
+          "junior": {
+            "rate": 30,
+            "time_factor": 1.8,
+            "senior_review_pct": 25
+          },
+          "mid": {
+            "rate": 45,
+            "time_factor": 1.2,
+            "senior_review_pct": 10
+          },
+          "senior": {
+            "rate": 70,
+            "time_factor": 1.0,
+            "senior_review_pct": 0
+          }
+        },
+        "package": {
+          "min_hours": 8,
+          "round_to_hours": 4
+        }
+      }
+    }
+  }
+}
