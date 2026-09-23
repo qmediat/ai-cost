@@ -26,6 +26,7 @@ from ..errors import ConfigError
 from ..models import CheckStatus, PeakOffpeakPrice, Provider, TokenTierPrice
 from ..ops import doctor
 from ..prices_check import (
+    USER_AGENT,
     CheckResult,
     ModelCheck,
     ProviderCheck,
@@ -675,13 +676,14 @@ def test_window_hours_and_check_days_are_capped_so_timedelta_never_overflows() -
     assert parse_config(builtin_config(), "cfg").window_default_hours == 24
 
 
-def test_fetch_refuses_an_empty_agent_list_explicitly() -> None:
-    try:
-        fetch("https://vendor.example/prices", agents=(), opener=lambda *a, **k: None)
-    except ValueError as exc:
-        assert "user agent" in str(exc)
-    else:
-        raise AssertionError("no agents: an explicit ValueError, never an assert")
+def test_the_price_check_identifies_itself_and_never_as_a_browser() -> None:
+    import inspect
+
+    from .. import __version__
+
+    assert inspect.signature(fetch).parameters["agent"].default == USER_AGENT
+    assert f"ai-cost/{__version__} (+https://github.com/qmediat/ai-cost)" == USER_AGENT
+    assert "Chrome" not in USER_AGENT and "Safari" not in USER_AGENT and "Mozilla" not in USER_AGENT
 
 
 def test_a_null_plan_override_removes_the_plan_instead_of_zeroing_it() -> None:

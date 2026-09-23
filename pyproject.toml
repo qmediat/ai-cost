@@ -1,6 +1,6 @@
 [project]
 name = "ai-cost"
-version = "2.2.1"
+version = "2.2.2"
 description = "What a block of AI-assisted work cost: real, API-only equivalent, vendor quote — from the usage already on disk"
 readme = "README.md"
 requires-python = ">=3.9"

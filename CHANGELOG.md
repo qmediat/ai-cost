@@ -3,9 +3,24 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-09-23
+
+First public release on PyPI and GitHub.
+
+### Changed
+
+- The price drift check identifies itself as `ai-cost/<version> (+https://github.com/qmediat/ai-cost)` and no
+  longer retries as a browser when a vendor page refuses it: such a page is reported as `fetch-failed` and its
+  prices are maintained by hand in your prices file.
+
+### Added
+
+- `SECURITY.md`: where to report privately, and a plain statement of what the tool reads and when it touches the
+  network.
+
 ## [2.2.1] - 2026-09-23
 
-First public release on PyPI and GitHub (2.2.0 was tagged but never published: its usage-log path check skipped an
+Tagged, never published (2.2.0 was tagged but never published: its usage-log path check skipped an
 absent file below a symlinked directory such as macOS's `/var`).
 
 ### Fixed

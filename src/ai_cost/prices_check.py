@@ -23,6 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from . import __version__
 from .config import Paths, PriceBook, deep_merge
 from .errors import ToolError
 from .models import CheckStatus, PeakOffpeakPrice, PriceEntry, Provider, TokenTierPrice
@@ -31,8 +32,9 @@ from .process import self_command
 from .timeutil import iso, now, parse_ts
 from .values import money
 
-UA_PLAIN = "Mozilla/5.0"
-UA_BROWSER = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+# The checker says who it is. A vendor page that refuses this agent is reported as fetch-failed; the checker never
+# presents itself as a browser to get past that.
+USER_AGENT = f"ai-cost/{__version__} (+https://github.com/qmediat/ai-cost)"
 AMOUNT = re.compile(r"\$\s?(\d+(?:[.,]\d+)?)")
 SCAN_SPAN = 600
 LOCK_SECONDS = 600
@@ -152,7 +154,6 @@ def _http_only(url: str) -> None:
 
 
 _REDIRECTS = (301, 302, 303, 307, 308)
-_RETRY_WITH_NEXT_AGENT = (403, 310)  # forbidden for this UA, or a redirect loop / too many hops
 
 
 def _redirect(exc: urllib.error.HTTPError, current: str) -> str | None:
@@ -192,26 +193,15 @@ def fetch(
     url: str,
     timeout: int = 15,
     hops: int = 5,
-    agents: Sequence[str] = (UA_PLAIN, UA_BROWSER),
+    agent: str = USER_AGENT,
     opener: Callable[..., Any] = _OPENER.open,
 ) -> str:
-    """GET following redirects by hand (3.9's urllib ignores 308); the plain UA first, the browser UA on 403/loop.
+    """GET following redirects by hand (3.9's urllib ignores 308), as the one agent the checker is.
 
     Only http(s) targets are followed: a page must not redirect the checker to a local file.
     """
     _http_only(url)
-    if not agents:
-        raise ValueError("fetch: at least one user agent is required")
-    *retried, final = agents
-    for agent in retried:
-        try:
-            return _get(url, agent, hops, timeout, opener)
-        except urllib.error.HTTPError as exc:
-            if exc.code not in _RETRY_WITH_NEXT_AGENT:
-                raise
-    return _get(
-        url, final, hops, timeout, opener
-    )  # the last agent's error is the caller's, whatever its code
+    return _get(url, agent, hops, timeout, opener)
 
 
 def page_text(raw: str) -> str:
@@ -222,20 +212,8 @@ def page_text(raw: str) -> str:
 
 
 def fetch_variants(url: str, timeout: int = 15) -> list[str]:
-    """The page as the plain and the browser UA see it (some sites serve different tables to each)."""
-    texts: list[str] = []
-    errors: list[BaseException] = []
-    for agent in (UA_PLAIN, UA_BROWSER):
-        try:
-            text = page_text(fetch(url, timeout, agents=(agent,)))
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            errors.append(exc)
-            continue
-        if text not in texts:
-            texts.append(text)
-    if not texts:
-        raise errors[0]
-    return texts
+    """The page text as the checker sees it, as the list of variants the matching step walks (one today)."""
+    return [page_text(fetch(url, timeout))]
 
 
 # ---- matching -----------------------------------------------------------------------------------------------------
