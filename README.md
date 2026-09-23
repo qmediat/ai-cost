@@ -1,3 +1,12 @@
+<p align="left">
+  <a href="https://www.qmediat.io/open-source?utm_source=oss-readme&utm_medium=ai-cost&utm_campaign=open-source">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/qmediat/.github/b35746f6b3c933d9eeb539033ef40ea9876349ae/assets/qmediat-wordmark-light.svg">
+      <img src="https://raw.githubusercontent.com/qmediat/.github/b35746f6b3c933d9eeb539033ef40ea9876349ae/assets/qmediat-wordmark-badge.svg" alt="Quantum Media Technologies" height="40">
+    </picture>
+  </a>
+</p>
+
 # ai-cost — what did the AI-assisted work cost?
 
 One command, three honest answers for a block of work done with LLMs — through Claude Code, Codex CLI, Gemini CLI,
@@ -243,4 +252,8 @@ python3 scripts/build.py src dist/ai-cost   # the shipped single file, reproduci
 - Under `--project`, rows that name no scope at all (a usage-log line without `session`) are included in every
   project's report, and rows of named workspaces that are no directory are left out; both are counted in the header.
 
-MIT © 2026 the ai-cost authors. Not affiliated with Anthropic, OpenAI, Google, xAI, DeepSeek or GitHub.
+MIT © 2026 Quantum Media Technologies sp. z o.o. Not affiliated with Anthropic, OpenAI, Google, xAI, DeepSeek or GitHub.
+
+---
+
+Made by [Quantum Media Technologies](https://www.qmediat.io/open-source?utm_source=oss-readme&utm_medium=ai-cost&utm_campaign=open-source) · [more open source from qmediat](https://github.com/qmediat)

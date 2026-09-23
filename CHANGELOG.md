@@ -3,6 +3,13 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The README opens with the Quantum Media Technologies wordmark and closes with a "Made by" line, both linking to
+  www.qmediat.io/open-source; the copyright line names the company as LICENSE does.
+
 ## [2.2.2] - 2026-09-23
 
 First public release on PyPI and GitHub.
