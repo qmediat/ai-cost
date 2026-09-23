@@ -282,8 +282,10 @@ def _readable_key(path: Path) -> Path:
     try:
         path.stat()
     except FileNotFoundError:
-        if any(part.is_symlink() for part in (path, *path.parents)):
-            raise  # a dangling link somewhere in the path: unreadable, never a plain absent file
+        # A dangling link somewhere in the path is unreadable; a link to an existing directory (macOS /var, /tmp)
+        # above a merely absent file is not.
+        if any(part.is_symlink() and not part.exists() for part in (path, *path.parents)):
+            raise
     return key
 
 

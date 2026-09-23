@@ -3,9 +3,19 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-09-23
+
+First public release on PyPI and GitHub (2.2.0 was tagged but never published: its usage-log path check skipped an
+absent file below a symlinked directory such as macOS's `/var`).
+
+### Fixed
+
+- A usage-log path below a symbolic link to an existing directory (macOS `/var`, `/tmp`, a linked home) is treated
+  like any other path: only a link whose target is absent makes the path a counted skip.
+
 ## [2.2.0] - 2026-09-23
 
-First public release on PyPI and GitHub.
+Tagged, never published.
 
 ### Added
 

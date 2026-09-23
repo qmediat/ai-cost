@@ -653,6 +653,13 @@ def test_a_github_line_needs_a_cost_and_a_symlink_loop_is_a_skip(tmp_path: Path)
     gone: list[Skipped] = []
     assert _unique([dangling, missing_dir_link / "u.jsonl"], gone) == []
     assert len(gone) == 2 and all("cannot resolve" in s.reason for s in gone)
+    real_dir = tmp_path / "real-dir"
+    real_dir.mkdir()
+    linked_dir = tmp_path / "linked-dir"
+    # A link to an EXISTING directory (macOS /var, /tmp) above an absent file: the path is kept, not skipped.
+    os.symlink(real_dir, linked_dir)
+    fine: list[Skipped] = []
+    assert _unique([linked_dir / "absent.jsonl"], fine) == [linked_dir / "absent.jsonl"] and not fine
 
 
 def test_a_cost_only_line_reaches_the_api_group_and_a_bad_line_of_another_window_is_not_this_windows_skip(
