@@ -241,7 +241,7 @@ price as if no subscription existed). State the window, the sources found, and w
 ## 5. With the package instead (optional)
 
 ```bash
-pipx install ai-cost            # or the single-file build from the GitHub release
+pipx install ai-costs           # the PyPI name is ai-costs, the command is ai-cost; or the single-file build from the GitHub release
 ai-cost report --since 2026-09-20T08:00Z --until 2026-09-20T18:00Z      # real / API-only / vendor quote
 ai-cost log --from-response resp.json --provider openai --ref job-42     # apps: one line per request
 ai-cost report --attribute "feature=feat/x|src/x/"                      # who paid for what

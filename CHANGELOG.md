@@ -3,16 +3,20 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.3] - 2026-09-23
+
+First public release on PyPI and GitHub.
 
 ### Changed
 
 - The README opens with the Quantum Media Technologies wordmark and closes with a "Made by" line, both linking to
   www.qmediat.io/open-source; the copyright line names the company as LICENSE does.
+- The distribution name on PyPI is **`ai-costs`** (`pip install ai-costs`): PyPI refuses `ai-cost` as too similar to
+  an existing, empty project. The command stays `ai-cost` and the package stays `ai_cost`.
 
 ## [2.2.2] - 2026-09-23
 
-First public release on PyPI and GitHub.
+Tagged, never published.
 
 ### Changed
 

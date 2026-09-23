@@ -44,7 +44,7 @@ a plugin skeleton, the daily job, `reconcile`, exit codes and every `doctor` lin
 AI agent operating the tool on their behalf.
 
 ```bash
-pipx install ai-cost             # or: pip install ai-cost
+pipx install ai-costs            # or: pip install ai-costs  (the PyPI name is ai-costs; the command is ai-cost)
 # or the single executable file from the GitHub release: put it on PATH and run it
 # or no package at all: standalone/SKILL.md is a one-file Claude Code skill that counts and prices with a stdlib snippet
 ai-cost selftest [-v]            # the package's own tests, run from the shipped file, offline
