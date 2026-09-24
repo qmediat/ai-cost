@@ -3,6 +3,15 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-09-24
+
+### Added
+
+- Provider `alibaba` (Alibaba Cloud Model Studio, international/Singapore list prices): `qwen3.8-max` (2 / 6 USD per
+  1M, cache hits at 10 % of the input price), `qwen3.8-flash` (0.15 / 0.47), `qwen3.7-plus` and `qwen3.6-flash` with
+  their 256K–1M long tier. A usage-log row with `provider: alibaba` and one of these model ids is priced like any
+  other; `ai-cost prices check` verifies the amounts against the Model Studio pricing page.
+
 ## [2.2.3] - 2026-09-23
 
 First public release on PyPI and GitHub.

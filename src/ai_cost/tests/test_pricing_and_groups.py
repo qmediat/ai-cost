@@ -161,6 +161,21 @@ def test_grok_long_tier(tmp_path: Path) -> None:
     )
 
 
+def test_qwen_flat_rate_and_the_256k_long_tier(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
+    flat = _row(Provider.ALIBABA, "qwen3.8-max", Tokens(input=300_000, cached_input=20_000, output=10_000))
+    assert (
+        abs(
+            price(flat, book, config).usd - ((300_000 - 20_000) * 2.0 + 20_000 * 0.2 + 10_000 * 6.0) / MILLION
+        )
+        < 1e-9
+    )
+    long_ = _row(Provider.ALIBABA, "qwen3.7-plus", Tokens(input=300_000, cached_input=0, output=10_000))
+    assert abs(price(long_, book, config).usd - (300_000 * 1.2 + 10_000 * 4.8) / MILLION) < 1e-9
+    short = _row(Provider.ALIBABA, "qwen3.7-plus", Tokens(input=200_000, cached_input=0, output=10_000))
+    assert abs(price(short, book, config).usd - (200_000 * 0.4 + 10_000 * 1.6) / MILLION) < 1e-9
+
+
 def test_deepseek_peak_calendar(tmp_path: Path) -> None:
     config, book = _setup(tmp_path)
     assert is_peak(parse_ts("2026-09-22T02:30:00Z"), book.peak_hours_utc)

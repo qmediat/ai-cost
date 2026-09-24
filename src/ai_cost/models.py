@@ -19,7 +19,7 @@ _PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 class Provider:
     """Who bills for a row: a provider id of the pricebook, which is the registry (ADR-0004).
 
-    The six the core has real-billing rules for are constants; any other id a prices file lists is a valid provider
+    The seven the core has real-billing rules for are constants; any other id a prices file lists is a valid provider
     for a plugin's rows and is priced at list price (``api``) unless a rule says otherwise. ``value`` keeps the
     enum-era spelling, so ``row.provider.value`` and the JSON output are unchanged.
     """
@@ -32,6 +32,7 @@ class Provider:
     GOOGLE: ClassVar[Provider]
     XAI: ClassVar[Provider]
     DEEPSEEK: ClassVar[Provider]
+    ALIBABA: ClassVar[Provider]
     GITHUB: ClassVar[Provider]
 
     def __new__(cls, value: str) -> Provider:
@@ -65,6 +66,7 @@ Provider.OPENAI = Provider("openai")
 Provider.GOOGLE = Provider("google")
 Provider.XAI = Provider("xai")
 Provider.DEEPSEEK = Provider("deepseek")
+Provider.ALIBABA = Provider("alibaba")  # Alibaba Cloud Model Studio — the Qwen models (2026-09-24)
 Provider.GITHUB = Provider("github")
 
 
