@@ -34,7 +34,7 @@ from ..timeutil import parse_ts
 from ..values import count, money
 
 if TYPE_CHECKING:
-    from ..config import PriceBook
+    from ..config import Config, Paths, PriceBook
     from ..plugins import Context
 
 SCHEMA = 1
@@ -305,6 +305,13 @@ def _unique(paths: list[Path], skipped: list[Skipped]) -> list[Path]:
     return kept
 
 
+def log_files(paths: Paths, config: Config) -> list[Path]:
+    """The default usage log (the ``Paths`` given, else the environment's) and every file in config ``usage_logs``."""
+    from ..log import default_path
+
+    return [paths.usage_log or default_path(), *(Path(p).expanduser() for p in config.usage_logs)]
+
+
 class UsageLogSource:
     """The default usage log (``AI_COST_USAGE_LOG`` / the XDG data dir) plus every file in config ``usage_logs``."""
 
@@ -312,12 +319,7 @@ class UsageLogSource:
 
     def collect(self, ctx: Context) -> Collected:
         """Rows of every usage log inside the window; unknown counter keys become report warnings."""
-        from ..log import default_path
-
-        default = (
-            ctx.paths.usage_log or default_path()
-        )  # the Paths given to the report, never the process env
-        listed = [default, *(Path(p).expanduser() for p in ctx.config.usage_logs)]
+        listed = log_files(ctx.paths, ctx.config)  # the Paths given to the report, never the process env
         paths = _unique(
             listed, ctx.skipped
         )  # the default file named again in the config is read once, not twice

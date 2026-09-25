@@ -32,12 +32,9 @@
     }
   },
   "budgets": {
-    "daily_usd": 150,
-    "monthly_usd": 2500,
-    "per_provider_daily_usd": {
-      "google": 60,
-      "xai": 30
-    }
+    "daily_usd": 0,
+    "monthly_usd": 0,
+    "per_provider_daily_usd": {}
   },
   "sizing": {
     "packet_bytes": {

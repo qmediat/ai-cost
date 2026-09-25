@@ -22,6 +22,7 @@ from urllib.parse import unquote
 from ..models import Billing, Collected, Provider, RowKind, Scope, Skipped, Tokens, UsageRow, Window
 from ..timeutil import parse_ts
 from ..values import as_object, count, money
+from .files import listing, or_skip
 
 if TYPE_CHECKING:
     from ..plugins import Context
@@ -32,7 +33,7 @@ TICKS_PER_USD = 1e10  # costUsdTicks → USD: 3564980000 ticks were the CLI's 0.
 
 def usage_files(grok_home: Path) -> list[Path]:
     """Every ``usage.json`` under ``<grok_home>/sessions/<cwd>/<session>/``, in directory order."""
-    return sorted((grok_home / "sessions").glob("*/*/usage.json"))
+    return listing(grok_home / "sessions", "*/*/usage.json")
 
 
 def _tokens(usage: Mapping[str, Any]) -> Tokens:
@@ -132,7 +133,7 @@ def collect_grok_build(grok_home: Path, window: Window, billing: Billing = Billi
     rows: list[UsageRow] = []
     skipped: list[Skipped] = []
     min_mtime = (window.start - timedelta(minutes=1)).timestamp()
-    for path in usage_files(grok_home):
+    for path in or_skip(lambda: usage_files(grok_home), SOURCE_NAME, grok_home / "sessions", skipped):
         try:
             if path.stat().st_mtime < min_mtime:
                 continue

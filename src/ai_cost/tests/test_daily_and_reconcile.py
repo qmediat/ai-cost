@@ -171,7 +171,10 @@ def test_per_project_files_split_the_plan_shares_by_api_equivalent(tmp_path: Pat
     assert unused and all(
         s["usd"] == 0.0 and "global.md" in s["note"] for s in unused
     ), "no project used OpenAI: the share stays global"
-    assert all(any("ADR-0003" in w for w in r["warnings"]) for r in by_name.values())
+    assert all(
+        any("split by API-equivalent share" in w and "ADR" not in w for w in r["warnings"])
+        for r in by_name.values()
+    ), "the note says the policy in words; the decision records are not published"
 
 
 def test_a_split_share_keeps_its_own_note_and_the_totals_follow_the_split(tmp_path: Path) -> None:

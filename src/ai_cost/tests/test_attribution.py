@@ -65,7 +65,7 @@ def test_claude_rows_carry_branch_and_every_streamed_entrys_segments(tmp_path: P
     rows = {
         r.at.minute if r.at else -1: r
         for r in collect_claude(
-            find_session_files(paths.claude_home, tmp_path / "proj", "sess-attr", False), None
+            find_session_files(paths.claude_home, tmp_path / "proj", "sess-attr", False, []), None
         ).rows
     }
     assert rows[1].scope == Scope(paths=("sed -i x pkg/cost/x.py", "git add pkg/cost/x.py"))
@@ -117,7 +117,7 @@ def test_subscription_weights_sum_every_model_of_a_provider(tmp_path: Path) -> N
     write_claude_session(paths, tmp_path / "proj")  # fable in the session, sonnet in the subagent
     config, book = defaults(paths)
     rows = collect_claude(
-        find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False), None
+        find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False, []), None
     ).rows
     assert {r.model for r in rows} >= {"claude-fable-5-1", "claude-sonnet-5"}
     tagged = [replace(r, scope=Scope(branch="fable" if "fable" in r.model else "sonnet")) for r in rows]

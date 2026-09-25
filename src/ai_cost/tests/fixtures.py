@@ -143,6 +143,24 @@ def _session_records() -> list[str]:
     ]
 
 
+def write_recent_claude_session(paths: Paths, project: Path, messages: int = 3) -> Path:
+    """A session whose messages finished in the last hour: rows inside the doctor's 24 h window."""
+    from ..collectors.claude import project_dir
+
+    root = project_dir(paths.claude_home, project)
+    root.mkdir(parents=True, exist_ok=True)
+    end = datetime.now(timezone.utc)
+    lines = []
+    for n in range(messages):
+        record = json.loads(_assistant(f"recent-{n}", 0, USAGE_SMALL))
+        record["timestamp"] = iso(end - timedelta(minutes=10 * (n + 1)))
+        record["cwd"] = str(project)
+        lines.append(json.dumps(record))
+    path = root / "sess-recent.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 def write_claude_session(paths: Paths, project: Path) -> Path:
     """One session (``_session_records``) and a subagent transcript under it."""
     from ..collectors.claude import project_dir

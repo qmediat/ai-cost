@@ -38,7 +38,7 @@ $ ai-cost report --session latest
 
 ## Install
 
-New here? [`docs/SETUP.md`](docs/SETUP.md) is the deterministic path — the first 10 minutes with a Verify command per
+New here? [`docs/SETUP.md`](https://github.com/qmediat/ai-cost/blob/main/docs/SETUP.md) is the deterministic path — the first 10 minutes with a Verify command per
 step, what is read from where, the config reference, the usage-log hook for apps and MCP servers (Python and Node),
 a plugin skeleton, the daily job, `reconcile`, exit codes and every `doctor` line — written for the person and for the
 AI agent operating the tool on their behalf.
@@ -48,10 +48,10 @@ pipx install ai-costs            # or: pip install ai-costs  (the PyPI name is a
 # or the single executable file from the GitHub release: put it on PATH and run it
 # or no package at all: standalone/SKILL.md is a one-file Claude Code skill that counts and prices with a stdlib snippet
 ai-cost selftest [-v]            # the package's own tests, run from the shipped file, offline
-ai-cost install --init-config    # writes ~/.config/ai-cost/config.json — put YOUR plans, seats and budgets there
+ai-cost install --init-config    # writes ~/.config/ai-cost/config.json and prints what to put in it: YOUR plans and billing rules
 ai-cost install --schedule 3     # price drift check every 3 days (launchd on macOS, cron elsewhere)
 ai-cost install --schedule-reports   # yesterday's global + per-project reports every morning (06:40 local; --at HH:MM)
-ai-cost doctor                   # sources found, plugins loaded, config, price freshness, both schedules, last daily run
+ai-cost doctor                   # sources, your plans, how each provider was billed, prices, schedules — every !! line names what is missing
 ```
 
 Requirements: Python ≥ 3.9. `gh` only for `--github`.
@@ -65,11 +65,11 @@ Requirements: Python ≥ 3.9. `gh` only for `--github`.
 | `prices show` | merged registry (shipped defaults → your overrides) |
 | `prices check` | re-read every vendor page, report `confirmed` / `changed?` / `not-found` / `fetch-failed`; exit 4 on drift |
 | `prices update` | check, then write unambiguous changes to **your** `~/.config/ai-cost/prices.json` |
-| `doctor` | diagnostics: sources found (Claude, Codex, Gemini CLI, Grok Build), plugins, config, prices, both schedules, the newest daily index, the last reconciliation; exit 1 on problems |
+| `doctor` | diagnostics: sources found (Claude, Codex, Gemini CLI, Grok Build, the usage log), your plans and how each provider's rows of the last 24 h were billed (a `!!` line names the key to set and the value that fits), plugins, config, prices, both schedules, the newest daily index, the last reconciliation; exit 1 on problems |
 | `daily` | write one UTC day's reports: `global.{md,json}` over every project and `<project dir>.{md,json}` per Claude project touched that day, plus `index.json` — `--date YYYY-MM-DD` (default yesterday), `--out DIR` (default `AI_COST_REPORTS_DIR` or `$XDG_DATA_HOME/ai-cost/reports`), `--quiet`; the job `install --schedule-reports` runs |
 | `reconcile` | `--provider xai --usd 156.11 [--tokens 80200000] --hours 24` (or `--since/--until`): the local count of one provider against the figure its console shows, gap vs `reconcile.tolerance_pct` (5); exit 1 above it; history in `~/.local/state/ai-cost/reconcile.jsonl` |
 | `monitor` | rolling-window totals (`--hours N`, default the config's `window_default_hours`) → `~/.local/state/ai-cost/history.jsonl` with `--append`; budget check from config, exit 3 on breach; `--history N` |
-| `install` | `--init-config`, `--schedule DAYS`, `--unschedule`, `--schedule-reports [--at HH:MM]` (the daily job, 06:40 local by default), `--unschedule-reports` |
+| `install` | `--init-config` (writes the config, prints what to put in it), `--schedule DAYS`, `--unschedule`, `--schedule-reports [--at HH:MM]` (the daily job, 06:40 local by default), `--unschedule-reports` |
 | `selftest` | offline, no network, no secrets; also runs the tests of every loaded plugin that ships some |
 
 The window comes from `--since/--until`, else from the session's first and last timestamp, else the last `--hours`
@@ -136,7 +136,7 @@ actually charged), doctor lines and tests. A plugin is a module exporting `PLUGI
 discovered through the `ai_cost.plugins` entry-point group, the config list `plugins: ["my_package"]`, or the
 environment variable `AI_COST_PLUGINS=my_package,other`. Its settings live under `plugin_settings.<name>` in the
 config and can be overridden for one run with `--setting <name>.<key>=<value>`. The protocol is in
-[`src/ai_cost/plugins.py`](src/ai_cost/plugins.py): a `Source` has a `name` and `collect(ctx) -> Collected`, an
+[`src/ai_cost/plugins.py`](https://github.com/qmediat/ai-cost/blob/main/src/ai_cost/plugins.py): a `Source` has a `name` and `collect(ctx) -> Collected`, an
 `Enricher` has `enrich(rows, ctx) -> rows`, and `Context` gives them the paths, the config, the window, the request,
 the plugin's settings and the shared `skipped` / `warnings` sinks.
 
@@ -184,7 +184,7 @@ price it applies differently — never a number to hide.
 
 Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`[start, end]`), `window_hours`,
 `row_count`, `sources`, `warnings`, `skipped` (`[{source, path, reason}]`), `prices_checked_at`, `real`
-(`subscriptions[]`, `usage[]`, `cash_usd`, `subscription_usd`, `total_usd`, `unknown_billing`), `api` (`lines[]`,
+(`subscriptions[]`, `usage[]`, `cash_usd`, `subscription_usd`, `total_usd`, `unknown_billing`, `unknown_by_provider`, `unfigured_ledger`), `api` (`lines[]`,
 `total_usd`), `vendor` (when items exist), `attribution` (with `--attribute`). A line's `calls` is what it folded in
 (rows, review runs, Copilot reviews — the `Runs` column) and `model_calls` the API requests its sources reported
 (`Model calls`; 0 where none does); `--detail` adds `rows[]`, where
@@ -199,17 +199,21 @@ unpriced model exits 5 unless `--unpriced skip`.
 ## Configuration
 
 `~/.config/ai-cost/config.json` (`install --init-config` writes it from the shipped defaults,
-[`src/ai_cost/data/config.json`](src/ai_cost/data/config.json); it ships no subscriptions, add yours) — subscriptions
+[`src/ai_cost/data/config.json`](https://github.com/qmediat/ai-cost/blob/main/src/ai_cost/data/config.json); it ships no subscriptions, add yours) — subscriptions
 (plan, seats, attribution `time` | `full` | `none`), provider billing switches (`providers.<name>.billing`, the rule for that provider's rows that carry no billing evidence of their own — a plugin's xai or deepseek rows follow it as the built-in sources follow `anthropic.billing`,
 `openai.billing`, `google.billing` for Gemini CLI sessions, `github.copilot_plan_exhausted`, `xai.trust_cli_cost` — a
 positive CLI-reported cost is the row's
-cash, 0 or absent means the CLI did not price the run and the list price applies), budgets, item sizing thresholds,
+cash, 0 or absent means the CLI did not price the run and the list price applies), budgets for `monitor` (daily / monthly 0 by
+default = no check; a provider listed with 0 = any spend is a breach), item sizing thresholds,
 vendor profiles, `plugins` and `plugin_settings`. A `null` anywhere in it means "no override" (the shipped value
 stays); inside a list a `null` is an error — a list such as `subscriptions` replaces the shipped list whole, so there
 is no shipped item a `null` could stand for. `openai.default_model` names the model of a Codex rollout that does not
-say its own (empty by default: such rows are `unknown`).
+say its own (empty by default: such rows are `unknown`). `ai-cost doctor` lists what the file still lacks: a CLI
+whose files never say how a session was paid (Claude Code always; Gemini CLI and Grok Build when they run on an
+account plan) needs its `providers.<name>.billing`, and a provider used on a plan needs that plan under
+`subscriptions`.
 `~/.config/ai-cost/prices.json` — price overrides in the shape of
-[`src/ai_cost/data/prices.json`](src/ai_cost/data/prices.json), the registry the shipped file carries (the single
+[`src/ai_cost/data/prices.json`](https://github.com/qmediat/ai-cost/blob/main/src/ai_cost/data/prices.json), the registry the shipped file carries (the single
 source; `prices show --format json --snapshot` prints it). An override may change numbers, never a price's shape;
 a `null` anywhere in your file means "no override" (the shipped value stays), and to clear a shipped block set it to an
 empty value: `"next": {}`, `"long": {}`, `"valid_until": ""`; a plan set to `null` is removed.
@@ -219,8 +223,8 @@ Env: `AI_COST_CONFIG`, `AI_COST_PRICES`, `AI_COST_CONFIG_DIR`, `AI_COST_STATE_DI
 `AI_COST_PLUGINS`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME` (`~/.gemini` by default), `GROK_HOME`
 (`~/.grok` by default).
 
-Where the numbers come from and what they leave out: [`references/pricing-sources.md`](references/pricing-sources.md)
-and [`references/vendor-pricing.md`](references/vendor-pricing.md).
+Where the numbers come from and what they leave out: [`references/pricing-sources.md`](https://github.com/qmediat/ai-cost/blob/main/references/pricing-sources.md)
+and [`references/vendor-pricing.md`](https://github.com/qmediat/ai-cost/blob/main/references/vendor-pricing.md).
 
 ## Development
 

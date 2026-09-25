@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Callable
@@ -61,6 +62,12 @@ class RealGroup:
     usage: Sequence[Line]
     unknown_billing: int = (
         0  # rows nobody could attribute to a plan or a key (the API group prices the ones with tokens)
+    )
+    unknown_by_provider: Mapping[str, int] = field(
+        default_factory=dict
+    )  # the rows a billing rule could place, per provider id
+    unfigured_ledger: int = (
+        0  # ledger rows without a figure; ``unknown_billing`` = these + the per-provider rows
     )
 
     @property
@@ -342,29 +349,27 @@ def real_group(rows: Sequence[UsageRow], book: PriceBook, config: Config, window
     skipped here.
     """
     lines: dict[tuple[Provider, str], Line] = {}
-    unknown = 0
+    unknown: Counter[str] = Counter()
+    unfigured = 0
     for row in rows:
-        if (
-            row.billing is Billing.UNKNOWN
-        ):  # never cash, whatever figure it carries: a figure without a rule is an
-            unknown += (
-                1  # estimate (the shim's "what a plan session would have cost"); a source that knows the key
-            )
-            continue  # was charged says API
+        # Never cash, whatever figure it carries: a figure without a rule is an estimate (a plan session's "what it
+        # would have cost"); a source that knows what the key was charged says API.
+        if row.billing is Billing.UNKNOWN:
+            unknown[row.provider.value] += 1
+            continue
         if row.billing is Billing.API_SETTLED:
             continue  # a ledger line or a sibling row carries what the key was charged
         if row.kind is RowKind.LEDGER:  # a ledger row is cash by its own figure, whoever the provider is
-            if (
-                row.cost_reported is None
-            ):  # a charge record without a figure: counted as unknown, never booked as 0
-                unknown += 1
+            if row.cost_reported is None:  # a charge record without a figure: unknown, never booked as 0
+                unfigured += 1
                 continue
             label, money = "api-key (ledger)", Money(float(row.cost_reported), "pay-per-token, ledgered")
         else:
             label, money = real_rule(row.provider)(row, book, config)
         lines.setdefault((row.provider, label), Line(row.provider, label)).add(row, money)
     usage = sorted(lines.values(), key=lambda line: -line.usd)
-    return RealGroup(subscription_shares(config, book, window), usage, unknown)
+    shares = subscription_shares(config, book, window)
+    return RealGroup(shares, usage, sum(unknown.values()) + unfigured, dict(unknown), unfigured)
 
 
 # ---- vendor -----------------------------------------------------------------------------------------------------

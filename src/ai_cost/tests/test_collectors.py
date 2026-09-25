@@ -27,14 +27,14 @@ from .fixtures import (
 def test_session_and_subagent_transcripts_are_found(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
     write_claude_session(paths, tmp_path / "proj")
-    files = find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False)
+    files = find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False, [])
     assert [name for name, _ in files] == ["sess-1", "sess-1"]
 
 
 def test_session_latest_picks_the_newest_transcript(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
     write_claude_session(paths, tmp_path / "proj")
-    files = find_session_files(paths.claude_home, tmp_path / "proj", "latest", False)
+    files = find_session_files(paths.claude_home, tmp_path / "proj", "latest", False, [])
     assert files and files[0][0] == "sess-1"
 
 
@@ -42,7 +42,7 @@ def test_claude_dedupes_streamed_messages_and_counts_malformed_lines(tmp_path: P
     paths = paths_in(tmp_path)
     write_claude_session(paths, tmp_path / "proj")
     collected = collect_claude(
-        find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False), None
+        find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False, []), None
     )
     assert len(collected.rows) == 4, "the <synthetic> zero-token turn is no row: nothing to price"
     assert [s.reason for s in collected.skipped] == [
@@ -62,7 +62,7 @@ def test_claude_cache_split_and_unsplit_records(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
     write_claude_session(paths, tmp_path / "proj")
     rows = collect_claude(
-        find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False), None
+        find_session_files(paths.claude_home, tmp_path / "proj", "sess-1", False, []), None
     ).rows
     first = next(r for r in rows if r.tokens.output == 2000)
     assert first.tokens.cache_write_1h == 100_000 and first.tokens.cache_write_unsplit == 0
@@ -123,7 +123,7 @@ def test_codex_model_switch_prices_each_turn_with_its_model(tmp_path: Path) -> N
 def test_session_by_path_brings_its_subagents(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
     session = write_claude_session(paths, tmp_path / "proj")
-    files = find_session_files(paths.claude_home, None, str(session), False)
+    files = find_session_files(paths.claude_home, None, str(session), False, [])
     assert [p.name for _, p in files] == ["sess-1.jsonl", "agent-a.jsonl"]
 
 
@@ -367,7 +367,7 @@ def test_a_broken_symlink_among_the_transcripts_is_a_counted_skip_not_a_tracebac
     paths = paths_in(tmp_path)
     root = write_claude_session(paths, tmp_path / "proj").parent
     (root / "gone.jsonl").symlink_to(tmp_path / "never-existed.jsonl")
-    files = find_session_files(paths.claude_home, tmp_path / "proj", None, False)
+    files = find_session_files(paths.claude_home, tmp_path / "proj", None, False, [])
     assert any(name == "gone" for name, _ in files), "listed: its fate is decided when it is read"
     collected = collect_claude(files, None)
     assert collected.rows and any("gone.jsonl" in s.path for s in collected.skipped)

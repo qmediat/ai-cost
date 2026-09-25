@@ -11,12 +11,14 @@ import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from ..models import Billing, Collected, Provider, RowKind, Scope, Skipped, Tokens, UsageRow, Window
 from ..timeutil import parse_ts
 from ..values import as_object, count
+from .files import listing, or_skip
 
 _TS_RE = re.compile(r'"timestamp":\s*"([^"]+)"')
 
@@ -41,8 +43,13 @@ def find_session_files(
     project_path: Path | None,
     session: str | None,
     all_projects: bool,
+    skipped: list[Skipped],
 ) -> list[tuple[str, Path]]:
-    """``(session_id, path)`` for every transcript requested; a session's ``subagents`` files ride along."""
+    """``(session_id, path)`` for every transcript requested; a session's ``subagents`` files ride along.
+
+    A project directory that cannot be listed is one counted skip in ``skipped`` and the other projects are still
+    read; the projects directory itself raises ``OSError`` when it cannot be listed.
+    """
     if session and Path(session).is_file():
         path = Path(session)
         return [
@@ -51,10 +58,11 @@ def find_session_files(
         ]
     roots = [project_dir(claude_home, project_path or Path.cwd())]
     if all_projects:
-        roots = sorted(p for p in (claude_home / "projects").glob("*") if p.is_dir())
+        roots = [p for p in listing(claude_home / "projects", "*") if p.is_dir()]
     files: list[tuple[str, Path]] = []
     for root in roots:
-        candidates = sorted(root.glob("*.jsonl"), key=_mtime, reverse=True)
+        listed = or_skip(partial(listing, root, "*.jsonl"), "claude", root, skipped)
+        candidates = sorted(listed, key=_mtime, reverse=True)
         if session == "latest":
             candidates = candidates[:1]
         elif session and session != "all":

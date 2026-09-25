@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from ..models import Billing, Collected, Provider, RowKind, Scope, Skipped, Tokens, UsageRow, Window
 from ..timeutil import parse_ts
 from ..values import as_object, count
+from .files import listing, or_skip
 
 if TYPE_CHECKING:
     from ..plugins import Context
@@ -258,6 +259,11 @@ def _session_rows(session: _Session, windowed: _Windowed, default_model: str) ->
     ]
 
 
+def rollout_files(codex_home: Path) -> list[Path]:
+    """Every rollout under ``<codex_home>/sessions/YYYY/MM/DD/``, in path order (``OSError``: cannot be listed)."""
+    return listing(codex_home / "sessions", "*/*/*/rollout-*.jsonl")
+
+
 def collect_codex(
     codex_home: Path, window: Window, default_model: str, billing_default: Billing = Billing.UNKNOWN
 ) -> Collected:
@@ -269,7 +275,7 @@ def collect_codex(
     rows: list[UsageRow] = []
     skipped: list[Skipped] = []
     min_mtime = (window.start - timedelta(minutes=1)).timestamp()
-    for path in sorted((codex_home / "sessions").glob("*/*/*/rollout-*.jsonl")):
+    for path in or_skip(lambda: rollout_files(codex_home), "codex", codex_home / "sessions", skipped):
         try:
             if path.stat().st_mtime < min_mtime:
                 continue

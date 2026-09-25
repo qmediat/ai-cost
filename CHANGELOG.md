@@ -3,6 +3,49 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-09-25
+
+### Added
+
+- `ai-cost install --init-config` prints what to put in the new file — your plans, and the billing rule of every
+  provider whose session files cannot say how you paid — with the link to the setup guide; on an existing file it
+  points to `ai-cost doctor`.
+- `ai-cost doctor` shows the setup: each declared plan, a CLI whose files never say how a session was paid and has no
+  `providers.<name>.billing`, a provider used on a plan that no subscription covers, and one line per provider with
+  its rows of the last 24 h by billing (on a plan, per token, unknown) and the rule applied. Every `!!` line names the
+  key to set and the value that fits. The usage logs (the default one and those in `usage_logs`) are listed as
+  sources, and the budgets `monitor` checks are shown.
+- `ai-cost --help` ends with where to start and the link to the setup guide; every `install` option has a description.
+- The JSON report's `real` group has `unknown_by_provider` (the rows of unknown billing a rule could place, per
+  provider) and `unfigured_ledger` (ledger rows without a figure); the two sum to `unknown_billing`.
+
+### Changed
+
+- `doctor` no longer counts a CLI you do not use as a problem (a `--` line naming the variable that points at its
+  home); a session directory that cannot be read, and finding no usage anywhere, are. A state directory that does
+  not exist yet but can be created is `ok`; a file or a dangling link in its way is a problem.
+- A plan declared without `covers` pays for the provider the price registry names for it: neither the report
+  header nor `doctor` says any more that no subscription covers that provider. A plan with `covers` pays for what
+  they name.
+
+### Fixed
+
+- A CLI's session directory that exists but cannot be listed (an unreadable `~/.codex`, `~/.claude`, …) crashed
+  `report` and `doctor` with a `PermissionError` on Python 3.9–3.12 and was read as empty in silence on 3.13+; it is
+  now a counted skip (`cannot list: …`) in the report and a `!!` line in `doctor`, on every Python; one project
+  directory that cannot be listed is skipped on its own and the other projects are read.
+- The report header no longer says GitHub plan rows cost nothing when `copilot_plan_exhausted` or
+  `actions_plan_exhausted` already prices them.
+- The report header's line about rows of unknown billing names each provider, its count and the values its rule can
+  take.
+- The shipped budgets are 0 (no check): `monitor` reports a breach only against budgets you set. A config file
+  written by an earlier `install --init-config` keeps the budgets it copied then (150 / 2500 USD); edit or remove
+  them there.
+- `ai-cost install` without an action, or `--force` without `--init-config`, is a usage error (exit 2) that says what
+  to give.
+- The README's links point to the GitHub repository, so they work on PyPI too; help texts and the daily report's note
+  on split subscription shares no longer cite internal decision records.
+
 ## [2.3.0] - 2026-09-24
 
 ### Added

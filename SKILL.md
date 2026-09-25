@@ -20,7 +20,9 @@ description: >-
 
 `ai-cost` is one executable file (a zipapp built from the package `src/ai_cost/`, Python 3.9+, stdlib only). It reads
 local files and sends nothing; the network is used only when asked for — the optional price-drift check, and
-`--github` for live GitHub counts through `gh`. Human docs: `README.md`;
+`--github` for live GitHub counts through `gh`. Human docs: `README.md`; setup step by step, with a Verify per step
+(for the person and for the agent operating the tool): `docs/SETUP.md`
+(https://github.com/qmediat/ai-cost/blob/main/docs/SETUP.md);
 design: the design note and ADRs kept with the development source (not shipped); sources and assumptions: `references/pricing-sources.md`,
 `references/vendor-pricing.md`. Run it by its full path when the shell's PATH is not the user's login PATH.
 
@@ -77,9 +79,15 @@ background price check.
   loaded and why a module did not.
 - **Scope for vendor:** hand-size items when the number will be shown to anyone — a Markdown table with a `size`
   column (XS/S/M/L/XL), or a JSON list of `{id, title, size}`.
-- **Your plans:** `ai-cost install --init-config`, then edit `subscriptions` (plan, seats,
-  `attribution: time|full|none`) and `providers.github.copilot_plan_exhausted` once the month's Copilot credits are
-  gone.
+- **Your plans (first run):** `ai-cost install --init-config` writes `~/.config/ai-cost/config.json` and prints the next
+  steps. Put in it, from what the user tells you (never guess a plan): `subscriptions` — one entry per plan they pay,
+  `{"plan": <a name from ai-cost prices show>, "seats": N, "covers": ["anthropic"], "attribution": "time"}`; and
+  `providers.<name>.billing` wherever the session files cannot say how a session was paid — Claude Code always
+  (`anthropic`: `subscription` on a Claude plan, `api` on an API key), Gemini CLI (`google`) and Grok Build (`xai`)
+  when they run on an account plan instead of their default `api` key; `providers.github.copilot_plan_exhausted` once
+  the month's Copilot credits are gone. Then `ai-cost doctor`: every `!!` line names the key still missing and the
+  value that fits — work them off until `doctor: all good`. A `--` line is information: a CLI with no files is
+  one the user does not run, unless they say they do — then its home is elsewhere and the line names the variable.
 
 ## Prices
 
@@ -94,8 +102,11 @@ carries an expired `valid_until`.
 
 ## Operations
 
-- `doctor` — transcripts / rollouts / Gemini sessions found, plugins loaded (and why one did not), config + prices
-  present and fresh, `valid_until`, state dir writable, schedule installed. Exit 1 on problems.
+- `doctor` — the files of every CLI (a CLI not used is `--`; nothing found anywhere is `!!`), the usage log, the
+  declared plans, how each provider's rows of the last 24 h were billed (a CLI without its billing rule, rows of
+  unknown billing, a provider on a plan no subscription covers — each a `!!` naming the key), plugins loaded (and why
+  one did not), config + prices present and fresh, `valid_until`, state dir writable or creatable, schedules
+  installed. Exit 1 on problems.
 - `monitor [--hours N] --append [--quiet]` — appends `{ts, window, hours, real_usd, cash_usd, api_usd,
   by_provider_api_usd}` to `~/.local/state/ai-cost/history.jsonl`; budgets from `config.budgets` (daily, per
   provider); exit 3 on breach. `monitor --history 30` prints the tail. Suitable for a cron line.

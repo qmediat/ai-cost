@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -22,10 +23,22 @@ from . import __version__
 from .attribution import attribution_group, parse_rules
 from .collectors import BUILTIN, collect_claude, collect_github, find_session_files
 from .collectors.claude import SOURCE_NAME as CLAUDE_SOURCE
+from .collectors.files import or_skip
+from .collectors.usage_log import log_files
 from .config import MAX_WINDOW_HOURS, Config, Paths, PriceBook
 from .errors import ToolError, UsageError
 from .groups import RealGroup, Report, api_group, needs_list_price, real_group, vendor_group
 from .models import Billing, Collected, Provider, Scope, Size, Skipped, UsageRow, Window, WorkItem
+from .onboarding import (
+    Check,
+    Mark,
+    billing_hint,
+    init_config_lines,
+    paid_for,
+    setup_checks,
+    source_checks,
+    source_files,
+)
 from .plugins import (
     Context,
     Enricher,
@@ -214,11 +227,23 @@ def _gather(
     request: ReportRequest, paths: Paths, config: Config, loaded: Loaded, book: PriceBook | None = None
 ) -> _Gathered:
     project, all_projects = _default_project(request, paths)
-    files = find_session_files(paths.claude_home, project, request.session, all_projects)
+    unlisted: list[Skipped] = []
+    files = or_skip(
+        lambda: find_session_files(paths.claude_home, project, request.session, all_projects, unlisted),
+        "claude",  # the name the Claude collector's own skips carry
+        paths.claude_home / "projects",
+        unlisted,
+    )
     claude = collect_claude(files, None, Billing.rule(config.anthropic_billing))
     window = resolve_window(request, claude.span, config.window_default_hours)
     gathered = _Gathered(
-        window, [], [], [f"claude transcripts ×{len({p for _, p in files})}"], [], list(claude.skipped), book
+        window,
+        [],
+        [],
+        [f"claude transcripts ×{len({p for _, p in files})}"],
+        [],
+        [*unlisted, *claude.skipped],
+        book,
     )
     if not files:
         gathered.warnings.append(
@@ -226,16 +251,7 @@ def _gather(
         )
     gathered.rows += [row for row in claude.rows if window.contains(row.at)]
     if request.github:  # before the plugins, so their enrichers see every row — the live GitHub rows included
-        live = collect_github(list(request.github), window, config.github.actions_runner)
-        gathered.rows += live.rows
-        if live.rows and not _github_paid_for(config):
-            gathered.warnings.append(
-                "live GitHub rows are plan rows and no subscription covers github: Copilot reviews and Actions "
-                "minutes cost nothing here — add the plan, or set providers.github.copilot_plan_exhausted / "
-                "actions_plan_exhausted"
-            )
-        merge_skips(gathered.skipped, list(live.skipped))
-        gathered.sources.append(f"github ({', '.join(request.github)})")
+        _gather_github(request, config, book, gathered)
     _collect_sources(request, paths, config, loaded, gathered)
     gathered.rows = _inherit_scope_by_ref(gathered.rows)
     if project is not None and not all_projects:  # the sources' raw working directories, before any enricher
@@ -243,6 +259,22 @@ def _gather(
     _enrich_rows(request, paths, config, loaded, gathered)
     gathered.rows = _with_billing_rules(gathered.rows, config)
     return gathered
+
+
+def _gather_github(
+    request: ReportRequest, config: Config, book: PriceBook | None, gathered: _Gathered
+) -> None:
+    """The live GitHub rows of ``--github``, and a warning when no plan or allowance switch says how they are paid."""
+    live = collect_github(list(request.github), gathered.window, config.github.actions_runner)
+    gathered.rows += live.rows
+    if live.rows and not paid_for("github", config, book):
+        gathered.warnings.append(
+            "live GitHub rows are plan rows and no subscription covers github: Copilot reviews and Actions "
+            "minutes cost nothing here — add the plan, or set providers.github.copilot_plan_exhausted / "
+            "actions_plan_exhausted"
+        )
+    merge_skips(gathered.skipped, list(live.skipped))
+    gathered.sources.append(f"github ({', '.join(request.github)})")
 
 
 # ---- per-project scope (ADR-0006) -------------------------------------------------------------------------------
@@ -339,17 +371,6 @@ def _with_billing_rules(rows: list[UsageRow], config: Config) -> list[UsageRow]:
         )
         for row in rows
     ]
-
-
-def _covers(cover: str, provider: str) -> bool:
-    """A plan cover names a provider exactly (``github``) or one of its products (``github-copilot``)."""
-    return cover == provider or cover.startswith(f"{provider}-")
-
-
-def _github_paid_for(config: Config) -> bool:
-    """Whether the config says how GitHub is paid: a plan that covers it, or the allowance flags set."""
-    covered = any(_covers(cover, "github") for plan in config.subscriptions for cover in plan.covers)
-    return covered or config.github.copilot_plan_exhausted or config.github.actions_plan_exhausted
 
 
 def _context(
@@ -547,21 +568,15 @@ def _drop_unpriced(
     gathered.rows = kept
 
 
-def _config_warnings(paths: Paths, config: Config) -> list[str]:
+def _config_warnings(paths: Paths, config: Config, book: PriceBook) -> list[str]:
     """Without a user config the subscriptions are the package defaults; with one, every plan rule needs its plan."""
     if paths.user_config_file().exists():
-        covered = {
-            name for plan in config.subscriptions for name in plan.covers
-        }  # "github-copilot" covers github
-        uncovered = [
-            name for name in _plan_providers(config) if not any(_covers(cover, name) for cover in covered)
-        ]
-        if not uncovered:
-            return []
+        on_plan = sorted(name for name, rule in config.billing_rules.items() if rule == "subscription")
         return [
             f"providers.{name}.billing = subscription but no subscription covers {name}: those plan rows cost "
             f"nothing here — add the plan to {paths.user_config_file()}"
-            for name in uncovered
+            for name in on_plan
+            if not paid_for(name, config, book)
         ]
     if not config.subscriptions:
         return [
@@ -571,19 +586,20 @@ def _config_warnings(paths: Paths, config: Config) -> list[str]:
     return [f"no user config — subscriptions are the defaults ({plans}); run `ai-cost install --init-config`"]
 
 
-def _plan_providers(config: Config) -> list[str]:
-    """The providers whose configured rule (any ``providers.<name>.billing``) puts their rows on a plan."""
-    return sorted(name for name, rule in config.billing_rules.items() if rule == "subscription")
-
-
 def _billing_warnings(real: RealGroup | None) -> list[str]:
-    """Rows of unknown billing are priced by the API group only — count them in the header."""
+    """Rows of unknown billing are priced by the API group only — count them per provider, with the rule to set."""
     if real is None or not real.unknown_billing:
         return []
+    names = sorted(real.unknown_by_provider)
+    counts = [f"{name} {real.unknown_by_provider[name]}" for name in names]
+    unfigured = real.unfigured_ledger
+    counts += [f"{unfigured} ledger row(s) without a figure, counted nowhere else"] if unfigured else []
+    rules = "; ".join(f"providers.{name}.billing — {billing_hint(name)}" for name in names)
+    fix = f"set {rules}; or add" if names else "add"
     return [
-        f"{real.unknown_billing} usage row(s) with unknown billing are left out of the real group (the API group "
-        "prices the ones with tokens; a ledger row without a figure is counted nowhere else) — set "
-        "providers.<name>.billing, or add a plugin that knows how those sessions were paid"
+        f"{real.unknown_billing} usage row(s) with unknown billing are left out of the real group "
+        f"({', '.join(counts)}; the API group prices the ones with tokens) — {fix} a plugin that knows how those "
+        "sessions were paid"
     ]
 
 
@@ -615,7 +631,7 @@ def build_report(
             paths.user_prices_file(),
             list_priced="api" in request.groups or bool(request.attribute),
         )
-    gathered.warnings += _config_warnings(paths, config)
+    gathered.warnings += _config_warnings(paths, config, book)
     items = _vendor_items(request, gathered, config)
     window, rows = gathered.window, gathered.rows
     real = real_group(rows, book, config, window) if "real" in request.groups else None
@@ -644,16 +660,21 @@ def build_report(
 # ---- doctor -----------------------------------------------------------------------------------------------------
 
 
-def _doctor_skipped(paths: Paths, config: Config, book: PriceBook, line: Callable[[bool, str], None]) -> None:
-    """What the collectors could not use in the last 24 h, per source (the counted records of Invariant #14d)."""
+Line = Callable[[bool, str], None]
+
+
+def _doctor_window(paths: Paths, config: Config, book: PriceBook, line: Line) -> Report | None:
+    """The last 24 h, collected once: the skipped records and the setup lines read the same rows."""
     try:
-        report = build_report(ReportRequest(all_projects=True, hours=24.0, groups=()), paths, config, book)
+        return build_report(ReportRequest(all_projects=True, hours=24.0, groups=()), paths, config, book)
     except ToolError as exc:
         line(False, f"collection over the last 24 h failed: {exc}")
-        return
-    by_source: dict[str, int] = {}
-    for item in report.skipped:
-        by_source[item.source] = by_source.get(item.source, 0) + 1
+        return None
+
+
+def _doctor_skipped(report: Report, line: Line) -> None:
+    """What the collectors could not use in the last 24 h, per source (the counted records of Invariant #14d)."""
+    by_source = Counter(item.source for item in report.skipped)
     detail = ", ".join(f"{name} {count}" for name, count in sorted(by_source.items())) or "none"
     line(
         True,
@@ -661,7 +682,13 @@ def _doctor_skipped(paths: Paths, config: Config, book: PriceBook, line: Callabl
     )
 
 
-Line = Callable[[bool, str], None]
+def _render(checks: Iterable[Check], line: Line, emit: Emit) -> None:
+    """A verdict goes through ``line`` (a problem counts); information is printed and never counted."""
+    for check in checks:
+        if check.mark is Mark.INFO:
+            emit(f"  --  {check.text}")
+        else:
+            line(check.mark is Mark.OK, check.text)
 
 
 def doctor(paths: Paths, config: Config, book: PriceBook, emit: Emit) -> int:
@@ -676,31 +703,31 @@ def doctor(paths: Paths, config: Config, book: PriceBook, emit: Emit) -> int:
     emit(f"ai-cost {__version__} doctor")
     _doctor_sources(paths, config, book, line, emit)
     _doctor_prices(book, line)
-    _doctor_config(paths, config, book, line, emit)
+    _doctor_state(paths, line, emit)
     emit(f"doctor: {'all good' if problems == 0 else f'{problems} issue(s)'}")
     return 0 if problems == 0 else 1
 
 
 def _doctor_sources(paths: Paths, config: Config, book: PriceBook, line: Line, emit: Emit) -> None:
+    """Python, the files of every source, the window's skipped records, the setup lines, plugins, user files."""
     line(sys.version_info >= (3, 9), f"python {sys.version.split()[0]}")
-    transcripts = sum(1 for _ in (paths.claude_home / "projects").glob("*/*.jsonl"))
-    line(transcripts > 0, f"Claude transcripts: {transcripts} files under {paths.claude_home / 'projects'}")
-    _doctor_skipped(paths, config, book, line)
-    rollouts = sum(1 for _ in (paths.codex_home / "sessions").glob("*/*/*/rollout-*.jsonl"))
-    line(rollouts > 0, f"Codex rollouts: {rollouts} under {paths.codex_home / 'sessions'}")
-    chats = len(list((paths.gemini_home / "tmp").glob("*/chats/session-*.json*")))
-    emit(
-        ("  ok  " if chats else "  --  ") + f"Gemini CLI sessions: {chats} under {paths.gemini_home / 'tmp'}"
-    )
-    grok = len(list((paths.grok_home / "sessions").glob("*/*/usage.json")))
-    emit(
-        ("  ok  " if grok else "  --  ") + f"Grok Build sessions: {grok} under {paths.grok_home / 'sessions'}"
-    )
+    found = source_files(paths)
+    report = _doctor_window(paths, config, book, line)
+    rows = list(report.rows) if report else []
+    _render(source_checks(found, log_files(paths, config), len(rows) if report else None), line, emit)
+    if report is not None:
+        _doctor_skipped(report, line)
+    _render(setup_checks(found, config, book, rows), line, emit)
     _doctor_plugins(paths, config, line, emit)
     user_config = paths.user_config_file()
     emit(
         ("  ok  " if user_config.exists() else "  --  ")
-        + f"user config {user_config} {'present' if user_config.exists() else 'absent → defaults'}"
+        + f"user config {user_config} "
+        + (
+            "present"
+            if user_config.exists()
+            else "absent → defaults (ai-cost install --init-config writes it)"
+        )
     )
     user_prices = paths.user_prices_file()
     emit(
@@ -772,18 +799,20 @@ def _doctor_prices(book: PriceBook, line: Line) -> None:
                 )
 
 
-def _doctor_config(paths: Paths, config: Config, book: PriceBook, line: Line, emit: Emit) -> None:
-    for sub in config.subscriptions:
-        line(
-            sub.plan in book.plans,
-            f"subscription {sub.plan} ×{sub.seats}{'' if sub.plan in book.plans else ' — unknown plan'}",
-        )
+def _doctor_state(paths: Paths, line: Line, emit: Emit) -> None:
+    """The last price check, the state directory, the tools and the scheduled jobs."""
     last = load_result(paths)
     emit(
         ("  ok  " if last else "  --  ")
         + f"last price check: {last.checked_at if last else 'never'} ({state_file(paths)})"
     )
-    line(_writable(paths.state_dir), f"state dir {paths.state_dir} writable")
+    state = paths.state_dir
+    if _writable(state):
+        line(
+            True, f"state dir {state} writable" + ("" if state.exists() else " (created on the first write)")
+        )
+    else:
+        line(False, f"state dir {state} is not writable — AI_COST_STATE_DIR, or fix the permissions")
     _doctor_tools(emit)
     _doctor_reports(paths, line, emit)
 
@@ -841,8 +870,13 @@ def _doctor_reports(paths: Paths, line: Line, emit: Emit) -> None:
 
 
 def _writable(path: Path) -> bool:
-    probe = path if path.is_dir() else path.parent
-    return probe.exists() and os.access(probe, os.W_OK)
+    """A directory that can be written, or created: its nearest existing ancestor is a writable directory."""
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        if probe.is_symlink():  # a dangling link: the first write would fail on it, not create a directory
+            return False
+        probe = probe.parent
+    return probe.is_dir() and os.access(probe, os.W_OK)
 
 
 # ---- monitor ----------------------------------------------------------------------------------------------------
@@ -1193,7 +1227,8 @@ def init_config(paths: Paths, force: bool, emit: Emit) -> int:
 
     target = paths.user_config_file()
     if target.exists() and not force:
-        emit(f"exists: {target} (use --force to overwrite)")
+        for text in init_config_lines(target, written=False):
+            emit(text)
         return 0
     defaults = builtin_config()
     ensure_dir(target.parent, "config directory")
@@ -1202,7 +1237,8 @@ def init_config(paths: Paths, force: bool, emit: Emit) -> int:
         target.write_text(starter + "\n")
     except OSError as exc:
         raise ToolError(f"cannot write {target}: {exc}") from exc
-    emit(f"written {target} — edit your plans, seats and budgets")
+    for text in init_config_lines(target, written=True):
+        emit(text)
     return 0
 
 

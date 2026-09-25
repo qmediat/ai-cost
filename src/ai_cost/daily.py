@@ -247,7 +247,7 @@ def _share_plans(built: list[_Built]) -> None:
     for by_provider in weights:
         for provider, usd in by_provider.items():
             totals[provider] = totals.get(provider, 0.0) + usd
-    note = "subscription shares here are this project's part of the day's plans (split by API-equivalent share, ADR-0003); the whole shares are in global.md"
+    note = "subscription shares here are this project's part of the day's plans (split by API-equivalent share); the whole shares are in global.md"
     for item, by_provider in zip(built, weights):
         real = item.report.real
         if real is None:

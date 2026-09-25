@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from ..models import Billing, Collected, Provider, RowKind, Scope, Skipped, Tokens, UsageRow, Window
 from ..timeutil import parse_ts
 from ..values import count
+from .files import listing, or_skip
 
 if TYPE_CHECKING:
     from ..plugins import Context
@@ -33,7 +34,7 @@ SOURCE_NAME = "gemini-cli"  # the one name of this source: on every row and on t
 
 def session_files(gemini_home: Path) -> list[Path]:
     """Every session file under ``<gemini_home>/tmp/*/chats``, oldest first."""
-    return sorted((gemini_home / "tmp").glob("*/chats/session-*.json*"))
+    return listing(gemini_home / "tmp", "*/chats/session-*.json*")
 
 
 def project_paths(gemini_home: Path, skipped: list[Skipped]) -> dict[str, str]:
@@ -166,7 +167,7 @@ def collect_gemini_cli(
     rows: list[UsageRow] = []
     skipped: list[Skipped] = []
     projects = project_paths(gemini_home, skipped)
-    for path in session_files(gemini_home):
+    for path in or_skip(lambda: session_files(gemini_home), SOURCE_NAME, gemini_home / "tmp", skipped):
         try:
             rows += _collect_file(path, window, skipped, billing, projects)
         except (OSError, ValueError) as exc:  # ValueError: not JSON, or a .json without messages

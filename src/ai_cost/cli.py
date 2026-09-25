@@ -33,6 +33,7 @@ from .log import (
     entry as log_entry,
 )
 from .models import CheckStatus, Provider
+from .onboarding import SETUP_GUIDE, START_HERE
 from .ops import (
     DAILY_CADENCE,
     DAILY_JOB,
@@ -124,7 +125,7 @@ def _report_output(report: argparse.ArgumentParser) -> None:
         metavar="LABEL=REGEX",
         help="attribute rows to LABEL when REGEX matches their branch / workspace / PR, else the paths the turn "
         "touched (prices every row like --group api); "
-        "(repeatable; mixed and unattributed are always reported — ADR-0003)",
+        "(repeatable; mixed and unattributed are always reported)",
     )
     report.add_argument("--no-auto-check", action="store_true")
     report.add_argument("--quiet", action="store_true")
@@ -189,11 +190,20 @@ def _install_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
     install = sub.add_parser(
         "install",
         help="--init-config writes the user config; --schedule N installs a price check every N days",
+        description="Set the tool up: the user config (start here), the periodic price check, the daily reports.",
     )
-    install.add_argument("--init-config", action="store_true")
-    install.add_argument("--force", action="store_true")
-    install.add_argument("--schedule", metavar="DAYS", type=int)
-    install.add_argument("--unschedule", action="store_true")
+    install.add_argument(
+        "--init-config",
+        action="store_true",
+        help="write ~/.config/ai-cost/config.json from the defaults and print what to put in it",
+    )
+    install.add_argument(
+        "--force", action="store_true", help="with --init-config: overwrite an existing file"
+    )
+    install.add_argument(
+        "--schedule", metavar="DAYS", type=int, help="check the vendors' price pages every DAYS days"
+    )
+    install.add_argument("--unschedule", action="store_true", help="remove the price-check job")
     install.add_argument(
         "--schedule-reports",
         action="store_true",
@@ -202,13 +212,11 @@ def _install_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
     install.add_argument(
         "--at", metavar="HH:MM", help="local time of the daily run (default 06:40; with --schedule-reports)"
     )
-    install.add_argument("--unschedule-reports", action="store_true")
+    install.add_argument("--unschedule-reports", action="store_true", help="remove the daily-report job")
 
 
 def _log_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    log = sub.add_parser(
-        "log", help="append one usage-log line (ADR-0005): counters from flags or a raw API response"
-    )
+    log = sub.add_parser("log", help="append one usage-log line: counters from flags or a raw API response")
     log.add_argument("--provider", help="pricebook provider id (required for OpenAI-shaped responses)")
     log.add_argument("--model", help="model id as the API reports it (taken from the response when present)")
     log.add_argument("--from-response", metavar="FILE", help="raw API response JSON; '-' reads stdin")
@@ -247,6 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-cost",
         description="Cost of AI-assisted work: real (subscriptions + API keys), API-only equivalent, vendor quote.",
+        epilog="\n".join(("start here:", *START_HERE, f"guide: {SETUP_GUIDE}")),
+        formatter_class=argparse.RawDescriptionHelpFormatter,  # the epilog keeps its lines: the URL never wraps
     )
     parser.add_argument("--version", action="version", version=f"ai-cost {__version__}")
     sub = parser.add_subparsers(dest="command")
@@ -397,10 +407,7 @@ def _quiet_emit(text: str) -> None:
 
 def cmd_install(args: argparse.Namespace, paths: Paths) -> int:
     """User config, the periodic price check and the daily-report job."""
-    if args.schedule is not None and args.schedule < 1:
-        raise UsageError(f"--schedule: the interval is in whole days, at least 1 (got {args.schedule})")
-    if args.at and not args.schedule_reports:
-        raise UsageError("--at sets the time of --schedule-reports; give both")
+    _check_install_args(args)
     code = 0
     if args.init_config:
         code = init_config(paths, args.force, emit)
@@ -414,6 +421,28 @@ def cmd_install(args: argparse.Namespace, paths: Paths) -> int:
         cadence = _cadence(args.at) if args.at else DAILY_CADENCE
         code = install_job(paths, DAILY_JOB, cadence, self_command(), emit) or code
     return code
+
+
+def _check_install_args(args: argparse.Namespace) -> None:
+    """Each modifier with its action, a whole-day interval, at least one action — else a ``UsageError``."""
+    if args.schedule is not None and args.schedule < 1:
+        raise UsageError(f"--schedule: the interval is in whole days, at least 1 (got {args.schedule})")
+    if args.at and not args.schedule_reports:
+        raise UsageError("--at sets the time of --schedule-reports; give both")
+    if args.force and not args.init_config:
+        raise UsageError("--force overwrites the file of --init-config; give both")
+    actions = (
+        args.init_config,
+        args.schedule is not None,
+        args.unschedule,
+        args.schedule_reports,
+        args.unschedule_reports,
+    )
+    if not any(actions):
+        raise UsageError(
+            "install: nothing to do — start with --init-config, or give --schedule DAYS, --schedule-reports, "
+            "--unschedule, --unschedule-reports (ai-cost install --help)"
+        )
 
 
 def _cadence(text: str) -> Cadence:

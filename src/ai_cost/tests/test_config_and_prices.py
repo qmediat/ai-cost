@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import email
 import json
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from .. import config as config_module
 from ..config import (
     Paths,
     builtin_config,
@@ -48,15 +50,40 @@ from ..prices_check import (
 from .fixtures import defaults, paths_in, with_test_plans
 
 
+def _shipped_budgets() -> Any:
+    """The package as if it shipped budgets, so a merge test can tell "the shipped value" from zero."""
+    shipped = builtin_config()
+    shipped["budgets"] = {"daily_usd": 150, "monthly_usd": 2500, "per_provider_daily_usd": {"google": 60}}
+    package_json = config_module._package_json
+    return mock.patch.object(
+        config_module,
+        "_package_json",
+        side_effect=lambda name: copy.deepcopy(shipped) if name == "config.json" else package_json(name),
+    )
+
+
+def test_the_package_ships_no_budget_of_its_own(tmp_path: Path) -> None:
+    assert builtin_config()["budgets"] == {"daily_usd": 0, "monthly_usd": 0, "per_provider_daily_usd": {}}
+    budgets = load_config(paths_in(tmp_path)).budgets
+    assert (budgets.daily_usd, budgets.monthly_usd, dict(budgets.per_provider_daily_usd)) == (
+        0,
+        0,
+        {},
+    ), "0 = no check: monitor flags nothing until the user sets a budget"
+
+
 def test_user_config_subscriptions_replace_and_dicts_merge(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
     paths.user_config_dir.mkdir()
     (paths.user_config_dir / "config.json").write_text(
         json.dumps({"subscriptions": [{"plan": "claude-pro"}], "budgets": {"daily_usd": 1}})
     )
-    config = load_config(paths)
+    with _shipped_budgets():
+        config = load_config(paths)
     assert [s.plan for s in config.subscriptions] == ["claude-pro"]
-    assert config.budgets.daily_usd == 1 and config.budgets.monthly_usd == 2500
+    assert (
+        config.budgets.daily_usd == 1 and config.budgets.monthly_usd == 2500
+    ), "the user's key over the shipped"
 
 
 def test_user_prices_override_by_model_and_keep_the_shape(tmp_path: Path) -> None:
@@ -803,10 +830,11 @@ def test_an_empty_value_clears_a_shipped_block_while_null_keeps_it() -> None:
 
 def test_an_empty_section_in_a_user_file_is_no_override_outside_the_clearable_blocks(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
-    shipped = load_config(paths).budgets
-    paths.user_config_dir.mkdir(parents=True, exist_ok=True)
-    paths.user_config_file().write_text(json.dumps({"budgets": {}}))
-    assert load_config(paths).budgets == shipped, "an empty budgets object keeps the shipped budgets"
+    with _shipped_budgets():
+        shipped = load_config(paths).budgets
+        paths.user_config_dir.mkdir(parents=True, exist_ok=True)
+        paths.user_config_file().write_text(json.dumps({"budgets": {}}))
+        assert load_config(paths).budgets == shipped, "an empty budgets object keeps the shipped budgets"
     base = builtin_prices()
     book = parse_pricebook(base, {"providers": {}}, "prices")
     assert book.raw["providers"] == base["providers"], "an empty providers object prints the shipped registry"
@@ -844,11 +872,12 @@ def test_a_null_text_setting_in_the_user_file_means_the_default(tmp_path: Path) 
 
 def test_a_null_in_the_user_config_keeps_the_shipped_value_for_every_key(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
-    shipped = load_config(paths)
-    paths.user_config_dir.mkdir(parents=True, exist_ok=True)
-    user = {"vendor": {"default_profile": None}, "budgets": {"daily_usd": None, "monthly_usd": None}}
-    paths.user_config_file().write_text(json.dumps(user))
-    config = load_config(paths)
+    with _shipped_budgets():
+        shipped = load_config(paths)
+        paths.user_config_dir.mkdir(parents=True, exist_ok=True)
+        user = {"vendor": {"default_profile": None}, "budgets": {"daily_usd": None, "monthly_usd": None}}
+        paths.user_config_file().write_text(json.dumps(user))
+        config = load_config(paths)
     assert config.vendor_default_profile == shipped.vendor_default_profile, "not an error, not ''"
     assert config.budgets == shipped.budgets, "not zero: the shipped budgets"
 
