@@ -246,14 +246,29 @@ def entry_for(row: UsageRow, book: PriceBook) -> PriceEntry | None:
     return book.entry(row.provider, row.model)
 
 
+UNTRACKED_NOTE = "provider report − local records"  # a provider day's difference (ADR-0008)
+
+
 def _own_figure(row: UsageRow, config: Config) -> Money | None:
-    """A row whose amount is not a list price: a usage-report line, a GitHub count under a report, a cost-only line."""
+    """The amount of a row whose price is not a list price, or ``None``.
+
+    A usage-report line and a provider day's difference carry their amounts; a GitHub count under a report costs 0 here
+    (the report holds its amount); a cost-only line is its charge (nothing to price at list).
+    """
+    figure = _report_figure(row)
+    if figure is None and on_the_bill(row):
+        figure = Money(0.0, REPORTED_ON_THE_BILL)
+    if figure is None and row.cost_reported is not None and row.tokens == Tokens():
+        figure = Money(float(row.cost_reported), "reported charge (no counters)")
+    return figure
+
+
+def _report_figure(row: UsageRow) -> Money | None:
+    """A provider report's own amount: a usage-report line's gross, a provider day's difference in the API group."""
     if row.invoice is not None:
         return Money(row.invoice.gross, "usage report, gross")
-    if on_the_bill(row):
-        return Money(0.0, REPORTED_ON_THE_BILL)
-    if row.cost_reported is not None and row.tokens == Tokens():  # a cost-only line: nothing to price at list
-        return Money(float(row.cost_reported), "reported charge (no counters)")
+    if row.untracked is not None:
+        return Money(row.untracked.api, UNTRACKED_NOTE)
     return None
 
 

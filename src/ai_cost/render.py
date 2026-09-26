@@ -22,7 +22,8 @@ from .groups import (
     SubscriptionShare,
     VendorGroup,
 )
-from .models import BillSubtotal, BillSummary, Provider, Tokens
+from .models import BillSubtotal, BillSummary, DayComparison, Provider, ProviderSummary, Tokens
+from .remainder import interval, span_text
 from .timeutil import iso
 
 
@@ -265,6 +266,79 @@ def _bill_section(bill: BillSummary) -> list[str]:
     return out
 
 
+_DAY_HEADERS = [
+    "Day",
+    "Provider gross",
+    "Provider net",
+    "Local API",
+    "Local real",
+    "Untracked API",
+    "Untracked real",
+]
+
+
+def _provider_section(summary: ProviderSummary) -> list[str]:
+    """A provider's day reports, exact: each compared day and its differences, the days not compared, the spans without data."""
+    out = [
+        "",
+        f"## Provider report: {summary.provider.value} ({summary.source})",
+        "",
+        "The provider's own figures, exact, against the local records of the same interval. A positive difference is "
+        "booked as untracked (API: gross, real: net); a negative one is only said (ADR-0008).",
+    ]
+    if summary.compared:
+        out += ["", md_table(_DAY_HEADERS, [_compared_row(c) for c in summary.compared])]
+        out += _request_lines(summary.compared)
+    if summary.not_compared:
+        rows = [
+            [interval(c.day), c.why_not, _exact(c.day.gross), _exact(c.day.net), c.day.currency]
+            for c in summary.not_compared
+        ]
+        out += ["", "Days not compared — their amounts, not in the totals:", ""]
+        out += [md_table(["Day", "Why", "Gross", "Net", "Currency"], rows)]
+    out += _rate_lines(summary)
+    out += [f"- no data: {span_text(span)}" for span in summary.missing]
+    out += [f"- could not read: {span_text(span)}" for span in summary.unreadable]
+    return out
+
+
+def _rate_lines(summary: ProviderSummary) -> list[str]:
+    """The provider's own conversions per day: an amount read in another currency is never shown without its rate."""
+    lines = []
+    for compared in summary.days:
+        notes = sorted({line.rate_note for line in compared.day.lines if line.rate_note})
+        if notes:
+            lines.append(f"- {interval(compared.day)} in USD by the provider's own rate: {'; '.join(notes)}")
+    return lines
+
+
+def _compared_row(compared: DayComparison) -> list[Any]:
+    day = compared.day
+    return [
+        interval(day),
+        _exact(day.gross),
+        _exact(day.net),
+        _exact(compared.local_api),
+        _exact(compared.local_real),
+        _exact(compared.api_diff),
+        _exact(compared.real_diff),
+    ]
+
+
+def _request_lines(compared: Sequence[DayComparison]) -> list[str]:
+    """The provider's request count beside the local rows that count requests (the others are counted apart)."""
+    lines = []
+    for c in compared:
+        if c.day.requests is None:
+            continue
+        rest = f", {c.uncounted_rows} local row(s) without a request count" if c.uncounted_rows else ""
+        unknown = f", {c.unknown_rows} of unknown billing" if c.unknown_rows else ""
+        lines.append(
+            f"- {interval(c.day)}: provider {c.day.requests} request(s), local {c.local_requests}{rest}{unknown}"
+        )
+    return ["", *lines] if lines else []
+
+
 def render_markdown(report: Report) -> str:
     """The human report."""
     hours = report.window.hours()
@@ -289,6 +363,8 @@ def render_markdown(report: Report) -> str:
         out += _attribution_section(report.attribution)
     if report.github_bill:
         out += _bill_section(report.github_bill)
+    for summary in report.provider_reports:
+        out += _provider_section(summary)
     if report.real and report.api:
         rows: list[list[Any]] = [
             ["Real (subscriptions share + API keys)", _fmt_usd(report.real.total_usd)],

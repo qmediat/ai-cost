@@ -22,6 +22,12 @@ within 7 days for high-severity issues.
   account's usage report (`GET …/settings/billing/usage`, one call per month the window touches) through the `gh` CLI
   you are already logged into; nothing is kept on disk. `--github` queries GitHub through `gh` for live counts.
   `AI_COST_OFFLINE=1` turns the price check and the usage report off.
+- A provider day report you configure (`providers.<name>.report`) reads that provider's billing, with keys taken from
+  the environment only: xAI's Management API (`XAI_MANAGEMENT_KEY`), your Google billing export through the `bq` CLI
+  you are logged into, Alibaba's BSS API (`ALIBABA_BILL_ACCESS_KEY_ID` / `_SECRET`, signed locally). Nothing is kept
+  on disk; `AI_COST_OFFLINE=1` turns them off.
+- `ai-cost import deepseek <export>` reads the file you name and keeps its days under the state directory
+  (`providers/deepseek.json`): amounts, counters and times, never the account id, a key or a key's name.
 - The statements above describe the core. A plugin you configure (an entry point, the `plugins` list,
   `AI_COST_PLUGINS`, or the marker of a bundled build) is third-party code that runs in this process with its own
   file and network access; review a plugin as you would any other program you run.

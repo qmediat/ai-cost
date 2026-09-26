@@ -76,6 +76,7 @@ prints the shipped prices; the shipped config is the file `install --init-config
 | `providers.openai.default_model` | string | `""` | the model of a Codex rollout that does not name its own (empty = such rows are `unknown`) |
 | `providers.xai.trust_cli_cost` | bool | `true` | `real` uses the Grok CLI's own cost figure for its sessions and review runs; `false` = the list price |
 | `providers.github.bill` | `{"scope": "organization" \| "user", "name": "<account>"}` or `null` | `null` | the account whose usage report prices GitHub: Copilot credits and seats, and Actions of the repositories named with `--github`. Read through `gh` (an organization's report needs an owner or billing manager; a user's shows only a personally bought plan); an enterprise is refused — its report leaves out cost-center usage, name the organization. With it, every other GitHub row is a count and a configured plan whose seats the report bills (`copilot-business` for "Copilot Business") gives way to the report; `doctor` checks that it can be read |
+| `providers.<name>.report` | `{"source": …, <its settings>}`: `import` (DeepSeek), `management-api` + `team` (xAI), `bigquery-export` + `table` [+ `services`] (Google), `bss-api` [+ `products`, `endpoint`] (Alibaba), or `null` | `null` | the provider's own day report the account view compares with the local rows (ADR-0008): a positive difference is an untracked row, a negative one a warning; nothing is read without it |
 | `providers.github.actions_plan_exhausted`, `actions_runner` | bool, `linux` \| `windows` \| `macos` | false, linux | without `bill`: once the month's included minutes are gone, `real` prices `--github` minutes at the list price; the runner of an Actions row that names none. `copilot_plan_exhausted` is no longer read (a Copilot review has no price since 2.6) |
 | `budgets.daily_usd`, `monthly_usd`, `per_provider_daily_usd.<name>` | numbers | 0, 0, `{}` — `daily_usd` / `monthly_usd` 0 = no check; a provider listed in `per_provider_daily_usd` is checked, 0 included (any spend is a breach), a provider left out is not | what `monitor` checks (exit 3 on breach) — API-equivalent figures |
 | `window_default_hours` | number > 0 | 24 | the window when nothing else sets it |
@@ -204,6 +205,57 @@ paste (or a script's, from an export). GitHub needs no reconcile once `providers
 (the cash `reconcile --provider github` compares) + the net of the seat lines (subscription shares, not cash). A gap is something to look at — the window's edges (the console's day may
 not be UTC), a source the tool does not read, a price it applies differently (the API-only group prices a turn's
 aggregated counters, so a turn of several calls never gets a long-context tier) — never a number to hide.
+
+
+### Provider day reports (DeepSeek)
+
+A call no local record shows — a script, another tool, a key used elsewhere — is in the provider's own report. For
+DeepSeek, which has no usage API, its export is imported:
+
+| Step | Do | Verify |
+|---|---|---|
+| 1. Name the source | `"providers": {"deepseek": {"report": {"source": "import"}}}` in your config | `ai-cost doctor` prints a `provider report deepseek` line |
+| 2. Export | DeepSeek platform → Usage → export a date range (a ZIP with `cost-<from>_<to>.csv` and `amount-<from>_<to>.csv`) | the ZIP holds both files |
+| 3. Import | `ai-cost import deepseek <the ZIP>` (CSV files: add `--captured <when you exported>`) | it prints the days added and replaced |
+| 4. Compare | `ai-cost report --all-projects --since <a day start> --until <a later day start>` in the export's own offset | the "Provider report: deepseek" section lists each day with the local amounts and the difference |
+
+- The import refuses an export that does not add up. That covers two accounts, a duplicated row, a cost that its
+  priced amounts do not make, an unknown column or counter, and an export older than the one already stored.
+- Each day keeps the interval the export states: a daylight-saving day is 23 or 25 hours. The time between two
+  days with usage is a zero interval. A later import replaces every stored day its days touch.
+- A day is closed once it had ended when the export was taken; the export's own time is read as the earliest instant
+  it can mean.
+- The export's days keep its offset (the platform wrote `+02:00` in 2026-09). A UTC `daily` file holds one whole only
+  when the export was taken in UTC; otherwise a report over whole days of that offset compares them.
+- A negative day means the local records exceed the provider's figure: a price above the provider's, a call counted
+  twice, or a row of another account. The report says so and books nothing.
+
+
+### Provider day reports read live (xAI, Google, Alibaba)
+
+Each is optional. The config names the source; the key comes from the environment, never from the config.
+
+| Provider | Least privilege | Config | Verify |
+|---|---|---|---|
+| xAI | a management key with billing read access (xAI console → Settings → Management keys), in `XAI_MANAGEMENT_KEY` | `"xai": {"report": {"source": "management-api", "team": "<team id>"}}` | `ai-cost doctor` prints `provider report xai (management-api): newest closed day …` |
+| Google | the Cloud Billing export to BigQuery, enabled by a billing account administrator; the reader needs BigQuery Data Viewer on the dataset and Job User on the project, through the `gcloud` / `bq` login | `"google": {"report": {"source": "bigquery-export", "table": "<project>.<dataset>.gcp_billing_export_v1_<account>", "services": ["Gemini API"]}}` | `bq query` of the table answers; `doctor` prints the line |
+| Alibaba | a RAM user whose only permission is `bssapi:DescribeInstanceBill`, its AccessKey in `ALIBABA_BILL_ACCESS_KEY_ID` / `ALIBABA_BILL_ACCESS_KEY_SECRET` | `"alibaba": {"report": {"source": "bss-api"}}` (`"products": ["<code>"]` narrows, `"endpoint"` changes the host) | `doctor` prints the line |
+
+- **xAI days are UTC days.** A day is closed 24 hours after it ends. xAI documents no delay, so this rule is the
+  tool's.
+- **Google days are UTC days, summed from the hourly export.** A day is closed 72 hours after it ends, because late
+  usage can still arrive.
+  - An account in another currency is converted by Google's own rate on each line, never another.
+  - Credits make the difference between gross and net.
+  - Taxes and other services are listed, never compared.
+- **Alibaba's bill times are UTC+8.** A day is final after 12:00 UTC+8 on the 4th of the next month, when Alibaba
+  finalizes the month. A UTC+8 day never fits a UTC `daily` file: only a report over whole UTC+8 days compares it.
+- **The network is used only when a source is configured**, and never with `AI_COST_OFFLINE=1`. `doctor` then says the
+  source was not asked. A report whose window holds no whole provider day (a few hours, a rolling `monitor` window
+  that crosses midnight) does not ask either: there is no day to compare.
+- **`daily` reads a day again when its provider report was not final**: still open, not read, not asked, or not
+  reached by the export yet. It retries each run for 7 days. A written day is kept only when the new report would
+  lose a provider day it compared.
 
 ## 7. A plugin for a source of your own
 

@@ -53,6 +53,7 @@ from .ops import (
 )
 from .prices_check import apply_check, check_prices, exit_code, merged_registry_json, save_result
 from .process import self_command, transient_warning
+from .providers.deepseek_export import import_export, store_path
 from .reconcile import Reported, run_reconcile
 from .render import plain, render_json, render_markdown, render_text
 from .timeutil import parse_cli_ts
@@ -231,11 +232,25 @@ def _log_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> No
     log.add_argument("--log", type=Path, help="the log file (default: AI_COST_USAGE_LOG or the XDG data dir)")
 
 
+def _import_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    imp = sub.add_parser("import", help="import a provider's usage export as its day report")
+    imp.add_argument("provider", choices=sorted(IMPORTERS), help="the provider whose export this is")
+    imp.add_argument(
+        "path", type=Path, help="the export: its ZIP, or the directory / one of the two CSV files"
+    )
+    imp.add_argument(
+        "--captured",
+        metavar="WHEN",
+        help="when the export was taken (ISO-8601); required for CSV files, which carry no time of their own",
+    )
+
+
 def _selftest_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     selftest = sub.add_parser("selftest", help="run the shipped tests without pytest")
     selftest.add_argument("-v", "--verbose", action="store_true", help="print every passing test too")
 
 
+IMPORTERS = {"deepseek": import_export}  # the providers whose usage export is imported (no usage API)
 _LOG_COUNTERS = LOG_COUNTERS  # one list: the usage log's provider-native counters (+ the thoughts alias)
 _COMMANDS = (
     _report_command,
@@ -246,6 +261,7 @@ _COMMANDS = (
     _reconcile_command,
     _install_command,
     _log_command,
+    _import_command,
     _selftest_command,
 )
 
@@ -623,6 +639,24 @@ def _plugin_tests(plugins: Sequence[Any], emit: Emit, verbose: bool, run: Any) -
     return code
 
 
+def cmd_import(args: argparse.Namespace, paths: Paths) -> int:
+    """Check an export, merge its days into the provider's store, say what changed and which days to rebuild."""
+    captured = parse_cli_ts(args.captured, "--captured") if args.captured else None
+    result = IMPORTERS[args.provider](args.path, paths.state_dir, captured)
+    emit(
+        f"imported {args.provider}: {len(result.added)} day(s) added, {len(result.replaced)} replaced, "
+        f"{result.kept} kept ({store_path(paths.state_dir)})"
+    )
+    if result.dates:
+        dates = ", ".join(d.isoformat() for d in result.dates)
+        emit(f"daily files that can use these days: ai-cost daily --date <date> for {dates}")
+    elif result.added or result.replaced:
+        emit(
+            "these days are not UTC days: no daily file holds one whole — compare them with report --since/--until"
+        )
+    return 0
+
+
 COMMANDS = {
     "report": cmd_report,
     "prices": cmd_prices,
@@ -632,6 +666,7 @@ COMMANDS = {
     "reconcile": cmd_reconcile,
     "install": cmd_install,
     "log": cmd_log,
+    "import": cmd_import,
     "selftest": cmd_selftest,
 }
 

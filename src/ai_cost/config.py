@@ -31,6 +31,7 @@ from .models import (
     Size,
     TokenTierPrice,
 )
+from .providers import SETTINGS, TEXT, ReportSource, sources_of
 from .values import as_object, object_at
 
 JsonDict = dict[str, Any]
@@ -204,6 +205,9 @@ class Config:
     billing_rules: Mapping[str, str] = field(
         default_factory=dict
     )  # every providers.<name>.billing: the rule for that provider's rows without evidence of their own
+    provider_reports: Mapping[str, ReportSource] = field(
+        default_factory=dict
+    )  # every providers.<name>.report source: the provider day reports a report compares with (ADR-0008)
 
     @property
     def anthropic_billing(self) -> str:
@@ -668,6 +672,7 @@ def parse_config(raw: JsonDict, where: str) -> Config:
         outside_scope_clients=_clients(raw, where),
         plugin_settings=_plugin_settings(raw, where),
         billing_rules=_billing_rules(providers, where),
+        provider_reports=_provider_reports(providers, where),
     )
 
 
@@ -727,6 +732,35 @@ def _billing_rules(providers: Mapping[str, Any], where: str) -> Mapping[str, str
         for name, section in providers.items()
         if "billing" in section
     }
+
+
+def _provider_reports(providers: Mapping[str, Any], where: str) -> Mapping[str, ReportSource]:
+    """Every ``providers.<name>.report`` as ``{name: ReportSource}``.
+
+    A source no reader serves, a setting it does not take, or a missing required one is a ConfigError naming it.
+    """
+    found: dict[str, ReportSource] = {}
+    for name, section in providers.items():
+        raw = _section(section, "report", f"{where}: providers.{name}")
+        if raw:
+            found[name] = _report_source(name, raw, f"{where}: providers.{name}.report")
+    return found
+
+
+def _report_source(name: str, raw: Mapping[str, Any], where: str) -> ReportSource:
+    source = _text(raw, "source", where)
+    if source not in sources_of(name):
+        known = ", ".join(sources_of(name)) or "none yet"
+        raise ConfigError(f"{where}: source {source!r} is not read (known: {known})")
+    takes = SETTINGS[(name, source)]
+    unknown = sorted(set(raw) - set(takes) - {"source"})
+    if unknown:
+        raise ConfigError(f"{where}: {source} takes {sorted(takes) or 'no setting'}, not {unknown}")
+    settings: dict[str, str | tuple[str, ...]] = {}
+    for key, (kind, required) in takes.items():
+        if key in raw or required:
+            settings[key] = _text(raw, key, where) if kind == TEXT else _names(raw, key, where)
+    return ReportSource(name, source, settings)
 
 
 def _billing_choice(raw: Mapping[str, Any], where: str) -> str:

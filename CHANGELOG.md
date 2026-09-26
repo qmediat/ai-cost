@@ -3,6 +3,63 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-09-26
+
+### Added
+
+- **Provider day reports** (ADR-0008). A provider's own report of what the account was billed per day is compared
+  with the local records of the same interval.
+  - A positive difference is one `untracked` row per day: the provider's gross minus the local API price in the
+    API-only group, the net minus the local cash in the real group. A row of unknown billing is therefore never
+    counted twice.
+  - A negative difference is a header warning and books nothing.
+  - Only whole, closed days of an account view are compared. A day the window cuts, a day the provider may still add
+    to, a day in a currency without the provider's own rate, or a day whose cash sits on a ledger or settled row is
+    listed with its exact amounts, never apportioned.
+  - The "Provider report" section (JSON `provider_reports`, amounts as text) shows every day with both local amounts,
+    both differences and the provider's request count beside the local one. Monitor entries name the days they left
+    out.
+- `providers.<name>.report` names the source; nothing is read without it. `doctor` prints one line per source: the
+  newest closed day and the capture of the newest import. It also hints the setting for a provider the machine uses
+  without one.
+- `ai-cost import deepseek <export>`: DeepSeek's usage export (the ZIP of `cost-*.csv` and `amount-*.csv`, or the two
+  files with `--captured`) becomes its day report.
+  - The import refuses an export that does not add up: two accounts, a duplicated row, a cost its priced amounts do
+    not make (both directions), an unknown column or counter, or an export older than the days already stored.
+  - The store keeps amounts, counters and times, never the account id, a key or a key's name.
+  - Each day keeps the interval the export states, so a daylight-saving change (a 23 h or 25 h day) imports as it is.
+    The time between two days with usage is a zero interval.
+  - A later import replaces every stored day its days touch, so days never overlap. One import runs at a time (a lock
+    file beside the store; a lock whose process is gone is taken over on POSIX), and the store is replaced through a
+    file of its own, removed when the write fails.
+  - A row of the wrong length, a missing file, or a capture time before the export's own range is refused with that
+    reason.
+  - A stored day that cannot be read is said as an unreadable span; the other days still count, and an import into
+    such a store writes nothing.
+
+- The live provider day readers, each optional, keys from the environment only:
+  - **xAI**: the Management API, per UTC day and line of the team.
+  - **Google**: the Cloud Billing export in BigQuery through `bq`. Exact `NUMERIC` sums per UTC day, converted by each
+    line's own `currency_conversion_rate`, which the report shows beside the day. The configured services' `regular`
+    lines count; taxes and other services are listed.
+  - **Alibaba**: BSS `DescribeInstanceBill` per UTC+8 billing date, signed with ACS3-HMAC-SHA256 in the standard
+    library; final after 12:00 UTC+8 on the 4th of the next month. A line in another currency than USD names it; a
+    day whose usage is billed in several currencies is not summed but said as unreadable, naming them.
+
+  A failed source is an unreadable span; an offline one is said as information. A window that holds no whole
+  provider day asks nothing. An Alibaba day (UTC+8) never fits a UTC `daily` file, nor does a DeepSeek import taken
+  in another zone.
+- `daily` records the providers whose day was not final (`providers_pending`: still open, not read, or not asked; a
+  failed xAI or Google read included). It reads those days again for 7 days. A written day is kept only when the new
+  report cannot read a provider day it compared; a day read but not compared for a local reason replaces it, and a
+  provider that had nothing never holds back what the others add.
+
+### Changed
+
+- The real group's rule for one row is one function (`row_cash`), shared by the real group and the comparison.
+- `reconcile` leaves the untracked rows out of the local count: the command still shows the gap it exists to show.
+- The subscription split of `--attribute` gives the untracked rows no weight.
+
 ## [2.6.0] - 2026-09-26
 
 ### Changed

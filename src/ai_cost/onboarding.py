@@ -11,6 +11,7 @@ import os
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from .collectors.github_bill import BillProbe
 from .collectors.grok_build import SOURCE_NAME as GROK_SOURCE
 from .collectors.grok_build import usage_files
 from .config import Budgets, Config, Paths, PriceBook
-from .models import Billing, Skipped, UsageRow, client_outside
+from .models import Billing, ProviderDays, Skipped, UsageRow, client_outside
 
 SETUP_GUIDE = "https://github.com/qmediat/ai-cost/blob/main/docs/SETUP.md"
 _USAGE_LOG_GUIDE = f"{SETUP_GUIDE}#4-count-your-own-apps-and-mcp-servers"
@@ -162,7 +163,10 @@ NEXT_STEPS = (
     "run on an account plan instead of a key",
     '  3. GitHub Copilot: "providers": {"github": {"bill": {"scope": "organization", "name": "<org>"}}} — the '
     "account's usage report prices it (a review has no price of its own)",
-    f"  4. ai-cost doctor — {_DOCTOR_TODO}",
+    '  4. a provider\'s own day report books what no local record shows: DeepSeek — "providers": {"deepseek": '
+    '{"report": {"source": "import"}}}, then ai-cost import deepseek <its usage export ZIP>; xAI, Google and '
+    "Alibaba are read live (docs/SETUP.md: the key and the least privilege each needs)",
+    f"  5. ai-cost doctor — {_DOCTOR_TODO}",
     f"guide: {SETUP_GUIDE}",
 )
 
@@ -354,6 +358,73 @@ BILL_HINT = (
     'set providers.github.bill = {"scope": "organization" | "user", "name": "<account>"} to read the amounts from '
     "the account's usage report (an owner or billing manager can read an organization's)"
 )
+
+
+REPORT_HINTS = {  # how a provider's own day report is configured, for a provider the machine uses without one (ADR-0008)
+    "deepseek": 'providers.deepseek.report = {"source": "import"}, then ai-cost import deepseek <usage export ZIP>',
+    "xai": 'providers.xai.report = {"source": "management-api", "team": "<team id>"} with XAI_MANAGEMENT_KEY set',
+    "google": 'providers.google.report = {"source": "bigquery-export", "table": "<project.dataset.table>"} (the '
+    "Cloud Billing export, read through bq)",
+    "alibaba": 'providers.alibaba.report = {"source": "bss-api"} with ALIBABA_BILL_ACCESS_KEY_ID / _SECRET set',
+}
+REPORT_CHECK_DAYS = 7  # doctor reads each provider report's last week; an older import leaves it uncovered
+
+
+def provider_report_checks(
+    config: Config, reports: Sequence[ProviderDays], uses: Sequence[ProviderUse], at: datetime
+) -> list[Check]:
+    """One line per configured provider report; a hint for a used provider that could have one."""
+    checks = [_report_check(report, at) for report in reports]
+    used = {use.provider for use in uses}
+    checks += [
+        Check(Mark.INFO, f"{name}: no provider report — {hint} books what no local record shows")
+        for name, hint in sorted(REPORT_HINTS.items())
+        if name in used and name not in config.provider_reports
+    ]
+    return checks
+
+
+def _report_check(report: ProviderDays, at: datetime) -> Check:
+    where = f"provider report {report.provider.value} ({report.source})"
+    problem = _report_problem(report, where)
+    if problem is not None:
+        return problem
+    return _report_state(
+        report, where, at, report.captured or at
+    )  # a source without a capture is a problem above
+
+
+def _report_problem(report: ProviderDays, where: str) -> Check | None:
+    """A source that could not be read, was not asked (offline), or holds nothing yet; ``None`` when it was read."""
+    if report.unreadable:
+        return Check(Mark.PROBLEM, f"{where}: {report.unreadable[0].why}")
+    if report.offline:
+        why = report.missing[0].why if report.missing else "offline (AI_COST_OFFLINE)"
+        return Check(Mark.INFO, f"{where}: {why} — its amounts stay out of the reports while offline")
+    if report.captured is None:
+        return Check(
+            Mark.PROBLEM, f"{where}: nothing imported yet — ai-cost import {report.provider.value} <export>"
+        )
+    return None
+
+
+def _report_state(report: ProviderDays, where: str, at: datetime, captured: datetime) -> Check:
+    """A source that was read: its newest closed day, when its figures were captured, the week's gaps."""
+    closed = [day.start.date().isoformat() for day in report.days if day.closed]
+    newest = closed[-1] if closed else f"none in the last {REPORT_CHECK_DAYS} days"
+    age = (at - captured).days
+    gaps = (
+        f", {len(report.missing)} span(s) of the last {REPORT_CHECK_DAYS} days without data"
+        if report.missing
+        else ""
+    )
+    text = f"{where}: newest closed day {newest}, captured {captured.isoformat(timespec='minutes')}{gaps}"
+    if age > REPORT_CHECK_DAYS:
+        return Check(
+            Mark.INFO,
+            f"{text} — {age} days ago: import a newer export to cover the last {REPORT_CHECK_DAYS} days",
+        )
+    return Check(Mark.OK, text)
 
 
 def github_checks(config: Config, uses: Sequence[ProviderUse], probe: BillProbe | None) -> list[Check]:

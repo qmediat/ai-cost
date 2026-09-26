@@ -69,6 +69,7 @@ Requirements: Python ≥ 3.9 (also under npm, which only starts it). `gh` only f
 | `prices update` | check, then write unambiguous changes to **your** `~/.config/ai-cost/prices.json` |
 | `doctor` | diagnostics: sources found (Claude, Codex, Gemini CLI, Grok Build, the usage log), your plans and how each provider's rows of the last 24 h were billed (a `!!` line names the key to set and the value that fits), plugins, config, prices, both schedules, the newest daily index, the last reconciliation; exit 1 on problems |
 | `daily` | write one UTC day's reports: `global.{md,json}` over every project and `<project dir>.{md,json}` per Claude project touched that day, plus `index.json` — `--date YYYY-MM-DD` (default yesterday), `--out DIR` (default `AI_COST_REPORTS_DIR` or `$XDG_DATA_HOME/ai-cost/reports`), `--quiet`; the job `install --schedule-reports` runs |
+| `import deepseek` | `<export ZIP>` (or the two CSV files with `--captured WHEN`): check DeepSeek's usage export and keep its days as the provider's day report — "Provider day reports" below |
 | `reconcile` | `--provider xai --usd 156.11 [--tokens 80200000] --hours 24` (or `--since/--until`): the local count of one provider against the figure its console shows, gap vs `reconcile.tolerance_pct` (5); exit 1 above it; history in `~/.local/state/ai-cost/reconcile.jsonl` |
 | `monitor` | rolling-window totals (`--hours N`, default the config's `window_default_hours`) → `~/.local/state/ai-cost/history.jsonl` with `--append`; budget check from config, exit 3 on breach; `--history N` |
 | `install` | `--init-config` (writes the config, prints what to put in it), `--schedule DAYS`, `--unschedule`, `--schedule-reports [--at HH:MM]` (the daily job, 06:40 local by default), `--unschedule-reports` |
@@ -183,6 +184,32 @@ fetched: no provider offers one public spend endpoint every user could call, so 
 script's, from an export). A gap is something to look at — the window's edges, a source the tool does not read, a
 price it applies differently — never a number to hide.
 
+## Provider day reports: what no local record shows
+
+A provider's own day report names what the account was billed. The local records can miss a call: a script, another
+tool, a key used elsewhere. For each day the report can hold whole, `ai-cost` compares the provider's figure with the
+local rows of the same interval.
+
+- A positive difference becomes one **untracked** row: the gross amount in the API-only group, the net in the real
+  group.
+- A negative difference is only said: a price above the provider's, a call counted twice, or a row of another
+  account.
+- A day the window cuts, a day the provider may still add to, or a day whose cash sits on other rows is listed with
+  its amounts, never apportioned.
+- Only an account view compares (`--all-projects`, no session filter); a per-project report never does.
+
+The "Provider report" section (JSON `provider_reports`, amounts as text) holds the figures.
+
+xAI (Management API), Google (the BigQuery billing export) and Alibaba (BSS) are read live when their source is
+configured, keys from the environment only (`docs/SETUP.md` lists the least privilege each needs). xAI and Google
+days are UTC days, so `daily` compares them; Alibaba's are UTC+8 days, which a UTC `daily` file never holds whole.
+DeepSeek offers no
+usage API, so its usage export is imported: set `"providers": {"deepseek": {"report": {"source":
+"import"}}}`, then run `ai-cost import deepseek <export ZIP>`. The import checks the export (one account, unique rows,
+each day's cost equal to its priced amounts) and keeps amounts, counters and times, never the account or a key. Its
+days follow the export's offset, so a `report --since … --until …` over whole days compares them; a UTC `daily` file
+compares them only when the export was taken in UTC.
+
 ## JSON contract (`--format json`)
 
 Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`[start, end]`), `window_hours`,
@@ -192,7 +219,12 @@ Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`
 `total_usd`), `vendor` (when items exist), `attribution` (with `--attribute`), `github_bill` (with `providers.github.bill`:
 `account`, `read_at`, `days`, `provisional`, `counted[]` / `left_out[]` (`product`, `sku`, `unit`, `lines`, `quantity`,
 `gross`, `discount`, `net` — amounts as exact text), `outside[]` (days the window only touches), `missing` (months not
-read, with the reason)). A line's `calls` is what it folded in
+read, with the reason)), `provider_reports` (with `providers.<name>.report`: per provider `days[]` —
+`day` (`start`, `end`, `lines[]` with `gross` / `net` / `requests` / `excluded` / `rate_note` — the provider's own
+conversion, e.g. `PLN ÷ 3.75385` —, `closed`, `currency`), `local_api`, `local_real`, `api_diff`, `real_diff` (exact
+text; `null` when not compared), `why_not`, `unknown_rows`, `local_requests`, `uncounted_rows` — plus `missing[]` and
+`unreadable[]` spans with their reason, `offline` (a live source not asked) and `utc_days` (its days are UTC days, so
+`daily` reads a day not final again)). A line's `calls` is what it folded in
 (rows, review runs, Copilot reviews — the `Runs` column) and `model_calls` the API requests its sources reported
 (`Model calls`; 0 where none does); `--detail` adds `rows[]`, where
 `client` is the program that wrote the session (a Codex rollout's `originator`), `cost_reported` is the source's
@@ -200,7 +232,8 @@ own figure for the row: cash for an `api` row (a charge the source reported), th
 source's list-price estimate for a `subscription` row (never counted as cash; the API-equivalent fallback when the
 model has no list price), a part of the session's figure when a session spans several rows; `source` names the
 source that produced the row and `kind` its record shape (`transcript`, `session`, `chat`, `log`, `ledger`,
-`review`, `copilot`, `actions`, `invoice` — a usage-report line, its amounts in `invoice`). Every dataclass property is
+`review`, `copilot`, `actions`, `invoice` — a usage-report line, its amounts in `invoice`, `untracked` — a provider
+day's difference, its amounts in `untracked`). Every dataclass property is
 serialised, so computed totals are always present.
 Changes since 1.0: `window` is an object (the list moved to `window_iso`), `seats` multiply only per-seat plans, an
 unpriced model exits 5 unless `--unpriced skip`.

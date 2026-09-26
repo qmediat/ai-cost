@@ -94,7 +94,8 @@ class RowKind(Enum):
     ``CHAT``: a model message of a chat log. ``LOG``: a line a program wrote to a usage log. ``LEDGER``: a row that
     carries the cash of calls another row already counted (skipped by the API-equivalent group). ``REVIEW``: a
     review run. ``COPILOT`` / ``ACTIONS``: GitHub counts (reviews, minutes). ``INVOICE``: a line of a provider's usage
-    report, carrying its own amounts (``UsageRow.invoice``, ADR-0007).
+    report, carrying its own amounts (``UsageRow.invoice``, ADR-0007). ``UNTRACKED``: what a provider's day report
+    bills beyond the local records of that day (``UsageRow.untracked``, ADR-0008).
     """
 
     TRANSCRIPT = "transcript"
@@ -106,6 +107,7 @@ class RowKind(Enum):
     COPILOT = "copilot"
     ACTIONS = "actions"
     INVOICE = "invoice"
+    UNTRACKED = "untracked"
 
 
 class Size(Enum):
@@ -290,6 +292,141 @@ class BillSummary:
     ] = ()  # YYYY-MM of every month whose report was read: its amounts are the report's
 
 
+@dataclass(frozen=True)
+class ProviderLine:
+    """One label of a provider's day report (a model, a SKU) with its exact amounts (ADR-0008).
+
+    ``gross`` is the usage before anything free or discounted, ``net`` what the account pays; ``excluded`` lines (tax,
+    rounding, other services) are listed and never compared; ``requests`` is the provider's count when it keeps one.
+    """
+
+    label: str
+    gross: Decimal
+    net: Decimal
+    requests: int | None = None
+    excluded: bool = False
+    rate_note: str = (
+        ""  # the provider's own conversion when the account bills another currency (``PLN ÷ 3.80055``)
+    )
+
+
+@dataclass(frozen=True)
+class ProviderDay:
+    """One day of one account as the provider states it (ADR-0008): its own interval, exact lines, whether it is closed.
+
+    ``start``/``end`` are aware instants in the provider's own offset; ``closed`` is the reader's claim, from the
+    provider's own rule, that the day will not grow; ``captured`` is the earliest instant the figures can have been
+    produced; ``currency`` is ``USD`` or names the provider's own conversion.
+    """
+
+    provider: Provider
+    start: datetime
+    end: datetime
+    lines: tuple[ProviderLine, ...]
+    closed: bool
+    captured: datetime
+    source: str
+    currency: str = "USD"
+
+    @property
+    def gross(self) -> Decimal:
+        """The usage the provider bills this day, before anything free or discounted."""
+        return sum((line.gross for line in self.lines if not line.excluded), Decimal(0))
+
+    @property
+    def net(self) -> Decimal:
+        """What the account pays for this day's usage."""
+        return sum((line.net for line in self.lines if not line.excluded), Decimal(0))
+
+    @property
+    def requests(self) -> int | None:
+        """The provider's request count, when every usage line has one."""
+        counts = [line.requests for line in self.lines if not line.excluded]
+        return None if any(c is None for c in counts) else sum(c for c in counts if c is not None)
+
+
+@dataclass(frozen=True)
+class Span:
+    """An interval of provider data a reader could not give, and why (ADR-0008): never a zero."""
+
+    start: datetime
+    end: datetime
+    why: str
+
+
+@dataclass(frozen=True)
+class ProviderDays:
+    """What a reader returns for a window: the days it holds, and the spans it holds nothing for (missing, unreadable)."""
+
+    provider: Provider
+    source: str
+    days: tuple[ProviderDay, ...] = ()
+    # no data: nothing imported there, a live source not asked (offline)
+    missing: tuple[Span, ...] = ()
+    # the newest capture the reader holds (an import's, a live read's time), for doctor
+    captured: datetime | None = None
+    # data that exists but could not be read: a broken store, a refused or failed request
+    unreadable: tuple[Span, ...] = ()
+    # a live source not asked (AI_COST_OFFLINE): its span is missing, not a problem
+    offline: bool = False
+    # the source's days are UTC days, so a UTC `daily` file can hold one whole (xAI, Google, a DeepSeek import taken in
+    # UTC; never Alibaba's UTC+8 days)
+    utc_days: bool = False
+
+
+@dataclass(frozen=True)
+class Untracked:
+    """What a provider day bills beyond the day's local records, per group (ADR-0008); a row's own amounts."""
+
+    day: str  # the provider day, as its interval reads: ``2026-09-21T00:00+02:00/2026-09-22T00:00+02:00``
+    api: float
+    real: float
+
+
+@dataclass(frozen=True)
+class DayComparison:
+    """One provider day against the day's local records (ADR-0008): both differences, or why it was not compared.
+
+    ``local_api`` / ``local_real`` are the day's local amounts in the API and real group; a difference within the float
+    error of the local sum is zero; ``why_not`` is empty for a compared day. ``unknown_rows`` are rows of unknown
+    billing (API priced, no cash); ``local_requests`` sums the rows that count requests, ``uncounted_rows`` the others.
+    """
+
+    day: ProviderDay
+    why_not: str = ""
+    local_api: Decimal | None = None
+    local_real: Decimal | None = None
+    api_diff: Decimal | None = None
+    real_diff: Decimal | None = None
+    unknown_rows: int = 0
+    local_requests: int = 0
+    uncounted_rows: int = 0
+
+
+@dataclass(frozen=True)
+class ProviderSummary:
+    """Everything a report says about one provider's day reports: compared days, the others, the missing spans."""
+
+    provider: Provider
+    source: str
+    days: tuple[DayComparison, ...]
+    missing: tuple[Span, ...] = ()
+    captured: datetime | None = None
+    unreadable: tuple[Span, ...] = ()
+    offline: bool = False
+    utc_days: bool = False
+
+    @property
+    def compared(self) -> tuple[DayComparison, ...]:
+        """The days whose differences were computed."""
+        return tuple(day for day in self.days if not day.why_not)
+
+    @property
+    def not_compared(self) -> tuple[DayComparison, ...]:
+        """The days listed with the reason they were not compared."""
+        return tuple(day for day in self.days if day.why_not)
+
+
 def client_outside(client: str, clients: Sequence[str]) -> bool:
     """Whether a row's client — named, never empty — is one the config puts outside the tracked work."""
     return bool(client) and client in clients
@@ -316,6 +453,7 @@ class UsageRow:
         ""  # the program that wrote the session, as its file names it (a Codex rollout's originator)
     )
     invoice: InvoiceAmounts | None = None  # a usage-report line's own amounts (RowKind.INVOICE)
+    untracked: Untracked | None = None  # a provider day's difference (RowKind.UNTRACKED, ADR-0008)
 
 
 @dataclass(frozen=True)

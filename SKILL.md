@@ -123,6 +123,9 @@ carries an expired `valid_until`.
   `install --schedule-reports [--at HH:MM]` / `--unschedule-reports` manage the job (launchd calendar / cron).
 - `reconcile --provider P --usd X [--tokens N] [--hours N | --since/--until]` — local cash and tokens of `P` vs the
   console figure, gap vs `reconcile.tolerance_pct`; exit 1 above; history `reconcile.jsonl` in the state dir.
+- `import deepseek <export ZIP>` (CSV files: `--captured WHEN`) — DeepSeek's usage export as its day report; with
+  `providers.deepseek.report = {"source": "import"}` every account report compares its whole, closed days with the
+  local rows and books what they do not account for as `untracked` (ADR-0008).
 - `doctor` also prints the Grok Build session count, both schedules, the newest daily index and the last reconcile;
   a torn index or history line is a red line.
 - `selftest [-v]` — the package's tests (`src/ai_cost/tests/`, pytest-compatible) run from the shipped file on

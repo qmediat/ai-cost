@@ -51,6 +51,7 @@ from .models import (
     BillSummary,
     Collected,
     Provider,
+    ProviderSummary,
     RowKind,
     Scope,
     Size,
@@ -62,6 +63,7 @@ from .models import (
 )
 from .onboarding import (
     BILL_HINT,
+    REPORT_CHECK_DAYS,
     Check,
     Mark,
     billing_hint,
@@ -69,6 +71,7 @@ from .onboarding import (
     init_config_lines,
     outside_scope,
     paid_for,
+    provider_report_checks,
     provider_use,
     setup_checks,
     source_checks,
@@ -87,6 +90,8 @@ from .plugins import (
 )
 from .prices_check import auto_check, load_result, state_file
 from .pricing import entry_for
+from .providers import ReadContext, read_reports
+from .remainder import compare, interval, span_text
 from .timeutil import iso, minutes, now, parse_cli_ts
 from .values import merge_skips
 
@@ -366,6 +371,69 @@ def _absorb_bill(gathered: _Gathered, bill: BillSummary | None, per_project: boo
     gathered.warnings += bill_warnings(bill, with_section=not per_project)
     gathered.sources.append(bill_source(bill, per_project))
     gathered.bill = None if per_project else bill
+
+
+# ---- provider day reports (ADR-0008) ------------------------------------------------------------------------------
+
+
+def _compare_providers(
+    request: ReportRequest, paths: Paths, config: Config, book: PriceBook, gathered: _Gathered
+) -> tuple[ProviderSummary, ...]:
+    """Each configured provider's days against the local rows, before anything is dropped as unpriced.
+
+    Only an account view compares: a per-project or one-session report holds part of the account's records, so a
+    difference there would book the rest of the account as untracked. Such a report reads no provider at all — a live
+    source is a request per report, and `daily` writes one per project — and its sources line says why.
+    """
+    if not config.provider_reports:
+        return ()
+    view_why = _view_why(request, paths)
+    if view_why:
+        gathered.sources.append(f"provider reports: not read — {view_why}")
+        return ()
+    reports = read_reports(config.provider_reports, read_context(paths, gathered.window))
+    done = compare(reports, gathered.rows, gathered.window, book, config)
+    gathered.rows += list(done.rows)
+    gathered.warnings += list(done.warnings)
+    gathered.sources += [_report_source(summary) for summary in done.summaries]
+    return done.summaries
+
+
+def read_context(paths: Paths, window: Window) -> ReadContext:
+    """What the provider readers of one report share; the keys are the process environment's."""
+    return ReadContext(paths.state_dir, window, now(), paths.offline, os.environ)
+
+
+def _view_why(request: ReportRequest, paths: Paths) -> str:
+    """Why this report compares no provider day ("" when it is an account view)."""
+    project, all_projects = _default_project(request, paths)
+    if project is not None and not all_projects:
+        return "a per-project report holds part of the account"
+    if request.session and request.session != "all":
+        return "a report of one session holds part of the account"
+    return ""
+
+
+def _report_source(summary: ProviderSummary) -> str:
+    untracked = sum((c.real_diff or 0) > 0 or (c.api_diff or 0) > 0 for c in summary.compared)
+    return (
+        f"provider report {summary.provider.value} ({summary.source}): {len(summary.compared)} day(s) compared, "
+        f"{untracked} with untracked usage, {len(summary.not_compared)} not compared"
+    )
+
+
+def provider_outside(summaries: Sequence[ProviderSummary]) -> tuple[str, ...]:
+    """The provider days a window's totals leave out, exact, and the spans without data."""
+    days = tuple(
+        f"{s.provider.value} {interval(c.day)} ({c.why_not}): gross {c.day.gross:f} {c.day.currency}, "
+        f"net {c.day.net:f} {c.day.currency}"
+        for s in summaries
+        for c in s.not_compared
+    )
+    spans = tuple(
+        f"{s.provider.value} {span_text(span)}" for s in summaries for span in (*s.missing, *s.unreadable)
+    )
+    return days + spans
 
 
 # ---- per-project scope (ADR-0006) -------------------------------------------------------------------------------
@@ -648,7 +716,8 @@ def _drop_unpriced(
     kept: list[UsageRow] = []
     models: dict[str, int] = {}
     for row in gathered.rows:
-        unpriced = entry_for(row, book) is None and row.cost_reported is None
+        own = row.cost_reported is not None or row.untracked is not None  # a figure of its own is its price
+        unpriced = entry_for(row, book) is None and not own
         if unpriced and (list_priced or needs_list_price(row, book, config)):
             name = f"{row.provider.value}/{row.model}"
             models[name] = models.get(name, 0) + 1
@@ -756,8 +825,16 @@ def _unknown_warning(real: RealGroup, rows: Sequence[UsageRow], config: Config) 
     return [
         f"{sum(left.values()) + unfigured} usage row(s) with unknown billing are left out of the real group "
         f"({', '.join(counts)}; the API group prices the ones with tokens) — {fix} a plugin that knows how those "
-        "sessions were paid"
+        f"sessions were paid{_booked_by_report(left, rows)}"
     ]
+
+
+def _booked_by_report(left: Mapping[str, int], rows: Sequence[UsageRow]) -> str:
+    """The providers whose compared days put the charge of those rows into an untracked row: said, never hidden."""
+    booked = sorted({row.provider.value for row in rows if row.kind is RowKind.UNTRACKED} & set(left))
+    if not booked:
+        return ""
+    return f"; on the days a provider report compared ({', '.join(booked)}), their charge is in its untracked row"
 
 
 def _configured_or_warned(config: Config) -> Loaded:
@@ -780,6 +857,7 @@ def build_report(
         loaded = _configured_or_warned(config)
     gathered = _gather(request, paths, config, loaded, book)
     gathered.warnings += loaded.warnings
+    compared = _compare_providers(request, paths, config, book, gathered)
     if request.unpriced == "skip":
         list_priced = "api" in request.groups or bool(request.attribute)
         _drop_unpriced(gathered, book, config, paths.user_prices_file(), list_priced=list_priced)
@@ -801,6 +879,7 @@ def build_report(
         real=real,
         attribution=attribution_group(rows, rules, book, config, window) if rules else None,
         github_bill=gathered.bill,
+        provider_reports=compared,
         api=api_group(rows, book, config) if "api" in request.groups else None,
         vendor=(
             vendor_group(items, config, request.vendor_profile)
@@ -873,7 +952,11 @@ def _doctor_sources(paths: Paths, config: Config, book: PriceBook, line: Line, e
     _render(setup_checks(found, config, book, rows), line, emit)
     request = bill_request(paths, config)
     probe = probe_bill(request) if request is not None else None
-    _render(github_checks(config, provider_use(rows, config.outside_scope_clients), probe), line, emit)
+    uses = provider_use(rows, config.outside_scope_clients)
+    _render(github_checks(config, uses, probe), line, emit)
+    week = Window(now() - timedelta(days=REPORT_CHECK_DAYS), now())
+    reports = read_reports(config.provider_reports, read_context(paths, week))
+    _render(provider_report_checks(config, reports, uses, now()), line, emit)
     _doctor_plugins(paths, config, line, emit)
     user_config = paths.user_config_file()
     emit(
@@ -1052,7 +1135,7 @@ def _writable(path: Path) -> bool:
 
 @dataclass(frozen=True)
 class MonitorEntry:
-    """One history line; ``outside`` names the amounts the totals leave out (GitHub days, unread months)."""
+    """One history line; ``outside`` names the amounts the totals leave out (GitHub and provider days, unread spans)."""
 
     ts: str
     window: tuple[str, str]
@@ -1120,7 +1203,7 @@ def _monitor_entry(report: Report) -> MonitorEntry:
         cash_usd=round(report.real.cash_usd, 4),
         api_usd=round(report.api.total_usd, 4),
         by_provider_api_usd={k: round(v, 4) for k, v in by_provider.items()},
-        outside=bill_outside(report.github_bill),
+        outside=bill_outside(report.github_bill) + provider_outside(report.provider_reports),
     )
 
 

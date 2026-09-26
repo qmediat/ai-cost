@@ -15,6 +15,7 @@ from .models import (
     BillSummary,
     Money,
     Provider,
+    ProviderSummary,
     RowKind,
     Size,
     Skipped,
@@ -23,7 +24,7 @@ from .models import (
     Window,
     WorkItem,
 )
-from .pricing import price
+from .pricing import UNTRACKED_NOTE, price
 
 HOURS_PER_MONTH = 730.0
 
@@ -40,8 +41,10 @@ class Line:
     notes: set[str] = field(default_factory=set)
 
     def add(self, row: UsageRow, money: Money) -> None:
-        """Fold one priced row in; a usage-report line is an amount, not a run."""
-        self.calls += {RowKind.COPILOT: row.tokens.reviews, RowKind.INVOICE: 0}.get(row.kind, 1)
+        """Fold one priced row in; a usage-report line and a provider day's difference are amounts, not runs."""
+        self.calls += {RowKind.COPILOT: row.tokens.reviews, RowKind.INVOICE: 0, RowKind.UNTRACKED: 0}.get(
+            row.kind, 1
+        )
         self.usd += money.usd
         self.tokens = self.tokens.add(row.tokens)
         if money.note:
@@ -199,6 +202,7 @@ class Report:
     vendor: VendorGroup | None
     attribution: AttributionGroup | None = None
     github_bill: BillSummary | None = None  # what the GitHub amounts rest on, exact (ADR-0007)
+    provider_reports: Sequence[ProviderSummary] = ()  # the provider day reports compared, exact (ADR-0008)
 
     @property
     def window_hours(self) -> float:
@@ -323,6 +327,39 @@ REAL_RULES: Mapping[Provider, RealRule] = {
 }
 
 
+UNTRACKED_LABEL = "untracked (provider report)"
+
+
+def row_cash(row: UsageRow, book: PriceBook, config: Config) -> tuple[str, Money] | None:
+    """The real group's line label and cash for one row; ``None`` when the row is no cash of its own.
+
+    Not cash: unknown billing (a figure without a rule is an estimate — a plan session's "what it would have cost"; a
+    source that knows what the key was charged says API), cash settled on another row (a ledger line, a sibling row,
+    the usage report), a seat (a subscription share), a charge record without a figure (unknown, never booked as 0).
+    A ledger row is cash by its own figure whoever the provider is; a provider day's difference by its real amount.
+    """
+    if row.billing in (Billing.UNKNOWN, Billing.API_SETTLED) or is_seat(row):
+        return None
+    if row.kind is RowKind.LEDGER:
+        return _ledger_cash(row)
+    if row.untracked is not None:
+        return UNTRACKED_LABEL, Money(row.untracked.real, UNTRACKED_NOTE)
+    return real_rule(row.provider)(row, book, config)
+
+
+def _ledger_cash(row: UsageRow) -> tuple[str, Money] | None:
+    """A ledger row is cash by its own figure; one without a figure is unknown, never booked as 0."""
+    if row.cost_reported is None:
+        return None
+    return "api-key (ledger)", Money(float(row.cost_reported), "pay-per-token, ledgered")
+
+
+def _unfigured_ledger(row: UsageRow) -> int:
+    """1 for a charge record without a figure (counted, never booked as 0), else 0."""
+    settled = row.billing is Billing.API_SETTLED or is_seat(row)
+    return int(row.kind is RowKind.LEDGER and row.cost_reported is None and not settled)
+
+
 def is_seat(row: UsageRow) -> bool:
     """A usage-report seat line: a subscription share, never usage."""
     return row.invoice is not None and row.invoice.is_seat
@@ -425,20 +462,14 @@ def real_group(rows: Sequence[UsageRow], book: PriceBook, config: Config, window
     unknown: Counter[str] = Counter()
     unfigured = 0
     for row in rows:
-        # Never cash, whatever figure it carries: a figure without a rule is an estimate (a plan session's "what it
-        # would have cost"); a source that knows what the key was charged says API.
         if row.billing is Billing.UNKNOWN:
             unknown[row.provider.value] += 1
             continue
-        if row.billing is Billing.API_SETTLED or is_seat(row):
-            continue  # a ledger line, a sibling row or the usage report carries what was charged; a seat is a share
-        if row.kind is RowKind.LEDGER:  # cash by its own figure, whoever the provider is
-            if row.cost_reported is None:  # a charge record without a figure: unknown, never booked as 0
-                unfigured += 1
-                continue
-            label, money = "api-key (ledger)", Money(float(row.cost_reported), "pay-per-token, ledgered")
-        else:
-            label, money = real_rule(row.provider)(row, book, config)
+        cash = row_cash(row, book, config)
+        if cash is None:
+            unfigured += _unfigured_ledger(row)
+            continue
+        label, money = cash
         lines.setdefault((row.provider, label), Line(row.provider, label)).add(row, money)
     usage = sorted(lines.values(), key=lambda line: -line.usd)
     shares = subscription_shares(config, book, window, rows) + invoice_shares(rows)

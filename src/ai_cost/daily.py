@@ -23,8 +23,9 @@ from typing import Any
 from .config import Config, Paths, PriceBook
 from .errors import ToolError
 from .groups import Report, SubscriptionShare, is_seat
-from .models import Window
+from .models import ProviderSummary, Window
 from .ops import Emit, ReportRequest, bill_unreadable, build_report, ensure_dir
+from .remainder import NOT_CLOSED
 from .render import plain, render_json, render_markdown
 from .timeutil import iso, now
 
@@ -61,6 +62,8 @@ class DailyIndex:
     failures: tuple[str, ...] = ()  # a project whose report or files failed: said on stderr, exit 1
     # The day, when its GitHub usage report was read too soon after it ended or not read: the next run reads it again.
     github_provisional: tuple[str, ...] = ()
+    # The providers whose day report was not closed, not read, or not asked (offline): the next runs read it again.
+    providers_pending: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -297,42 +300,63 @@ def daily_reports(paths: Paths, config: Config, book: PriceBook, day: date, out:
     """The day's reports; first every recent day whose GitHub usage report was not final when written (ADR-0007)."""
     run = _Run(paths, config, book, out, output)
     status = 0
-    for earlier in _provisional_days(out, day, output):
-        status = max(status, _reread(run, earlier))
+    for earlier, written in _provisional_days(out, day, output):
+        status = max(status, _reread(run, earlier, written))
     return max(status, _write_day(run, day))
 
 
-def _reread(run: _Run, earlier: date) -> int:
+def _reread(run: _Run, earlier: date, written: DailyIndex) -> int:
     """Read a not-final day again — only once its usage report can be read, so a lost access costs no rebuild."""
-    failure = bill_unreadable(run.paths, run.config, earlier)
+    failure = bill_unreadable(run.paths, run.config, earlier) if written.github_provisional else ""
     if failure:
         run.output.emit(
             f"daily {earlier}: kept as written — the GitHub usage report cannot be read ({failure})"
         )
         return 0
-    run.output.emit(f"daily {earlier}: its GitHub usage report was not final when written — reading it again")
+    reasons = ["its GitHub usage report"] if written.github_provisional else []
+    reasons += [f"the {name} provider report" for name in written.providers_pending]
+    run.output.emit(f"daily {earlier}: {' and '.join(reasons)} was not final when written — reading it again")
     return _write_day(run, earlier)
 
 
-def _provisional_days(out: Path, day: date, output: Output) -> list[date]:
-    """The last ``REREAD_DAYS`` days before ``day`` whose GitHub part was read too soon or not read (a missed run too)."""
+def _provisional_days(out: Path, day: date, output: Output) -> list[tuple[date, DailyIndex]]:
+    """The last ``REREAD_DAYS`` days before ``day`` whose GitHub or provider part was not final (a missed run too)."""
     found = []
     for index in sorted(out.glob("*/index.json")) if out.is_dir() else []:
         try:
             earlier = date.fromisoformat(index.parent.name)
         except ValueError:
             continue  # not a day directory
-        if 0 < (day - earlier).days <= REREAD_DAYS and _provisional(index, output):
-            found.append(earlier)
+        written = _provisional(index, output) if 0 < (day - earlier).days <= REREAD_DAYS else None
+        if written is not None:
+            found.append((earlier, written))
     return found
 
 
-def _provisional(index: Path, output: Output) -> bool:
+def _provisional(index: Path, output: Output) -> DailyIndex | None:
+    """The written index when its day was not final, else ``None``."""
     try:
-        return bool(read_index(index).github_provisional)
+        written = read_index(index)
     except ToolError as exc:
-        output.err(f"daily: {exc} — not checked for a provisional GitHub usage report")
-        return False
+        output.err(f"daily: {exc} — not checked for a provisional GitHub or provider report")
+        return None
+    return written if written.github_provisional or written.providers_pending else None
+
+
+def providers_pending(report: Report) -> tuple[str, ...]:
+    """The providers whose day report the next runs should read again.
+
+    A day still open, a span not read, not asked (offline) or without data yet (an export that has not reached it) —
+    for a provider whose days are the day's UTC day — a failed read too. One whose days never fit a UTC day (Alibaba's,
+    a DeepSeek import taken in another zone) is never pending: reading it again cannot make it comparable.
+    """
+    pending = []
+    for summary in report.provider_reports:
+        still_open = any(c.why_not == NOT_CLOSED for c in summary.days)
+        unfinished = still_open or summary.unreadable or summary.offline or summary.missing
+        if unfinished and summary.utc_days:
+            pending.append(summary.provider.value)
+    return tuple(pending)
 
 
 def _not_final(report: Report, day: date) -> tuple[str, ...]:
@@ -363,9 +387,13 @@ def _write_day(run: _Run, day: date) -> int:
     directory = run.out / day.isoformat()
     ensure_dir(directory, "reports directory")
     overall = build_report(_request(window, None), run.paths, run.config, run.book)
-    written = (directory / "index.json").is_file()
-    if written and overall.github_bill is not None and overall.github_bill.missing:
-        run.output.emit(f"daily {day}: kept as written — the GitHub usage report could not be read again")
+    keep = (
+        _why_keep(overall, directory / "global.json", run.output)
+        if (directory / "index.json").is_file()
+        else ""
+    )
+    if keep:
+        run.output.emit(f"daily {day}: kept as written — {keep}")
         return 0
     _write_pair(overall, directory / "global")
     built, notes, failures = _build_projects(run.paths, run.config, run.book, window)
@@ -386,10 +414,51 @@ def _write_day(run: _Run, day: date) -> int:
         notes=tuple(notes),
         failures=tuple(failures),
         github_provisional=_not_final(overall, day),
+        providers_pending=providers_pending(overall),
     )
     _write_index(directory / "index.json", index)
     _say_day(day, index, run.output)
     return 1 if failures else 0
+
+
+def _why_keep(overall: Report, written: Path, output: Output) -> str:
+    """Why the written day keeps its files ("" when the new report may replace it).
+
+    A failed read never replaces one that worked: the GitHub usage report that could not be read again, or a provider
+    whose day the written report compared and the new one cannot (unreadable, not asked, no data now). A provider that
+    had nothing before has nothing to lose, so it never holds back what the others add; nor does a written report that
+    cannot be read (said on ``err``), which is no report that worked.
+    """
+    bill = overall.github_bill
+    if bill is not None and bill.missing:
+        return "the GitHub usage report could not be read again"
+    had = compared_providers(written)
+    if had is None:
+        output.err(f"daily: {written} cannot be read — the new report replaces it")
+        had = set()
+    lost = sorted(
+        {s.provider.value for s in overall.provider_reports if s.provider.value in had and _unread(s)}
+    )
+    return f"the provider report of {', '.join(lost)} compared this day before and cannot now" if lost else ""
+
+
+def _unread(summary: ProviderSummary) -> bool:
+    """Whether the new report compares nothing of a provider because its day could not be read.
+
+    A span not read, not asked or without data is a loss. A day read but not compared for a local reason (a ledger
+    row, a row without a price) is what the local records say now: the new report replaces the written one.
+    """
+    return not summary.compared and bool(summary.unreadable or summary.offline or summary.missing)
+
+
+def compared_providers(report_json: Path) -> set[str] | None:
+    """The providers whose day a written report compared; ``None`` when the file cannot be read."""
+    try:
+        data = json.loads(report_json.read_text(encoding="utf-8"))
+        summaries = data.get("provider_reports") or []
+        return {str(s["provider"]) for s in summaries if any(not d.get("why_not") for d in s.get("days", []))}
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        return None
 
 
 def _say_day(day: date, index: DailyIndex, output: Output) -> None:
@@ -424,6 +493,7 @@ def read_index(path: Path) -> DailyIndex:
         own = {**_fields(DailyIndex, data), "window": tuple(data["window"]), "notes": tuple(data["notes"])}
         own["failures"] = tuple(data.get("failures", ()))
         own["github_provisional"] = tuple(data.get("github_provisional", ()))
+        own["providers_pending"] = tuple(data.get("providers_pending", ()))
         return DailyIndex(**{**own, "projects": projects})
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ToolError(f"{path} is not a daily index: {exc.__class__.__name__}: {exc}") from exc

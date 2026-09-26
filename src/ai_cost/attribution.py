@@ -20,7 +20,7 @@ from .groups import (
     real_group,
     subscription_shares,
 )
-from .models import Provider, Scope, TokenTierPrice, UsageRow, Window
+from .models import Provider, RowKind, Scope, TokenTierPrice, UsageRow, Window
 from .pricing import current_price, entry_for
 
 MIXED = "mixed"
@@ -95,8 +95,11 @@ def _subscription_split(
     by_label_provider: dict[str, dict[str, float]] = {}
     for label, rows in labelled.items():
         weights_of = by_label_provider.setdefault(label, {})
+        usage = [
+            row for row in rows if row.kind is not RowKind.UNTRACKED
+        ]  # an account's difference weighs nothing
         for line in api_group(
-            rows, book, config
+            usage, book, config
         ).lines:  # one line per model: every model of a provider counts
             weights_of[line.provider.value] = weights_of.get(line.provider.value, 0.0) + line.usd
     out = dict.fromkeys(labelled, 0.0)

@@ -16,6 +16,7 @@ from dataclasses import dataclass, fields, replace
 
 from .config import Config, Paths, PriceBook
 from .errors import ToolError
+from .groups import UNTRACKED_LABEL
 from .models import Billing, RowKind, Tokens, UsageRow, client_outside
 from .ops import Emit, ReportRequest, append_json_line, build_report
 from .render import plain
@@ -103,8 +104,15 @@ def reconcile(
     whole = replace(request, all_projects=True, groups=("real", "api"), unpriced="skip")
     report = build_report(whole, paths, config, book)
     provider = reported.provider
-    lines = [line for line in (report.real.usage if report.real else []) if line.provider.value == provider]
-    rows = [row for row in report.rows if row.provider.value == provider]
+    lines = [
+        line
+        for line in (report.real.usage if report.real else [])
+        if line.provider.value == provider
+        and line.label != UNTRACKED_LABEL  # the gap this command exists to show
+    ]
+    rows = [
+        row for row in report.rows if row.provider.value == provider and row.kind is not RowKind.UNTRACKED
+    ]
     api_rows = [row for row in rows if _console_bills(row)]
     return Reconciliation(
         provider=provider,
