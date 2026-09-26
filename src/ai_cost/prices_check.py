@@ -316,30 +316,7 @@ def check_prices(book: PriceBook, providers: Sequence[str] | None = None, timeou
         entry.status = f"fetched ({len(texts)} page variant{'s' if len(texts) != 1 else ''})"
         for model, price_entry in book.models.get(provider, {}).items():
             entry.models[model] = match_model(texts, provider, model, price_entry)
-        if provider == Provider.GITHUB:
-            entry.models["copilot-overage"] = _copilot_check(texts, book)
     return result
-
-
-def _copilot_check(texts: Sequence[str], book: PriceBook) -> ModelCheck:
-    want = book.github.overage_usd_per_unit
-    source = book.github.copilot_source  # validated as text by the registry parser, like every other source
-    pages = list(texts)
-    if source:
-        try:
-            pages = fetch_variants(source)
-        except (urllib.error.URLError, OSError, ValueError):
-            pages = []
-    seen: list[float] = []
-    for text in pages:
-        seen = (
-            numbers_near(text, "additional premium request", 300)
-            or numbers_near(text, "additional", 300)
-            or []
-        )
-        if want in seen:
-            return ModelCheck(CheckStatus.CONFIRMED, [want], seen)
-    return ModelCheck(CheckStatus.NOT_FOUND if not seen else CheckStatus.CHANGED, [want], seen)
 
 
 # ---- applying -----------------------------------------------------------------------------------------------------
@@ -351,7 +328,7 @@ def apply_check(result: CheckResult, book: PriceBook, user_file: Path) -> list[t
     applied = []
     for provider_name, prov in result.providers.items():
         for model, check in prov.models.items():
-            if check.status is not CheckStatus.CHANGED or model == "copilot-overage" or len(check.seen) < 2:
+            if check.status is not CheckStatus.CHANGED or len(check.seen) < 2:
                 continue
             try:
                 provider = Provider.of(provider_name)

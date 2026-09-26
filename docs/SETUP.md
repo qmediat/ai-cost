@@ -4,7 +4,8 @@ This is the deterministic path from an empty machine to daily, per-project cost 
 reading this: run the numbered steps in order, run every **Verify** command, and stop at the first one whose output
 does not match — say what you saw instead of improvising. Everything here is idempotent (safe to re-run). Nothing
 here needs our setup: `ai-cost` reads only files on the machine it runs on and sends nothing anywhere; the only
-network use is the optional price-drift check of the vendors' public pricing pages and `--github` through `gh`.
+network use is the optional price-drift check of the vendors' public pricing pages, and — when you ask for it — the
+GitHub account's usage report (`providers.github.bill`) and `--github`, both through `gh`.
 
 Contents: [1. The first 10 minutes](#1-the-first-10-minutes) · [2. What is read, from where](#2-what-is-read-from-where) ·
 [3. Configuration reference](#3-configuration-reference) · [4. Count your own apps and MCP servers](#4-count-your-own-apps-and-mcp-servers) ·
@@ -14,15 +15,16 @@ Contents: [1. The first 10 minutes](#1-the-first-10-minutes) · [2. What is read
 
 ## 1. The first 10 minutes
 
-Requirements: Python ≥ 3.9 (`python3 --version`), a POSIX shell. `gh` only for `--github`; `launchctl` (macOS) or
+Requirements: Python ≥ 3.9 (`python3 --version`), a POSIX shell. `gh` only for GitHub (`providers.github.bill`, `--github`); `launchctl` (macOS) or
 `crontab` for the scheduled jobs.
 
 | step | command | Verify |
 |---|---|---|
-| 1. Get the tool | `pipx install ai-costs` (or `pip install ai-costs`; the distribution is `ai-costs`, the command stays `ai-cost`). From npm: `npm install -g ai-costs` — the same program, started with the Python ≥ 3.9 on the machine (`AI_COST_PYTHON` names another); install it globally rather than through `npx` when you schedule jobs, so they keep pointing at a file that stays. Or one executable file, no dependencies: download `ai-cost` from the release page of github.com/qmediat/ai-cost, `chmod +x ai-cost`, put it on `PATH` (for example `~/.local/bin/ai-cost`). From a checkout: `python3 scripts/build.py src dist/ai-cost` writes `dist/ai-cost` | `ai-cost --version` prints `ai-cost 2.5.0` (or newer) |
+| 1. Get the tool | `pipx install ai-costs` (or `pip install ai-costs`; the distribution is `ai-costs`, the command stays `ai-cost`). From npm: `npm install -g ai-costs` — the same program, started with the Python ≥ 3.9 on the machine (`AI_COST_PYTHON` names another); install it globally rather than through `npx` when you schedule jobs, so they keep pointing at a file that stays. Or one executable file, no dependencies: download `ai-cost` from the release page of github.com/qmediat/ai-cost, `chmod +x ai-cost`, put it on `PATH` (for example `~/.local/bin/ai-cost`). From a checkout: `python3 scripts/build.py src dist/ai-cost` writes `dist/ai-cost` | `ai-cost --version` prints `ai-cost 2.6.0` (or newer) |
 | 2. Prove it works offline | `ai-cost selftest` — the shipped tests run from the file itself against synthetic data in a temp directory; no network, no secrets | last line `ai-cost selftest: N passed, 0 failed` (N ≥ 299) |
 | 3. Write your config | `ai-cost install --init-config` → `~/.config/ai-cost/config.json` (`AI_COST_CONFIG_DIR` moves it). The file ships with **no subscriptions on purpose**: an example plan would be counted as money you paid. Add yours (step 4) | `written /…/config.json`, then the next steps (the keys below) and the link to this guide |
 | 4. Tell it what you pay for | edit `subscriptions` — one object per plan you pay: `{"plan": "<name from ai-cost prices show>", "seats": 1, "covers": ["anthropic"], "attribution": "time"}`. `covers` names the provider(s) the plan pays for (`anthropic`, `openai`, `github-copilot`, `github-actions`, …); `attribution` is `time` (window hours ÷ 730 of the monthly fee), `full` (the whole fee) or `none`. Then set `providers.<name>.billing` to `subscription` for a provider your plan pays (`anthropic` for a Claude plan, `openai` when Codex runs on a ChatGPT plan), `api` for one you pay per token, `mixed` when the files must decide (a Codex rollout that names its ChatGPT plan is placed on it; some sessions — Codex desktop ones among them — name none and stay unknown under `mixed`). Gemini CLI and Grok Build files do not say it either: `google` and `xai` default to `api` (an API key); signed in with an account plan instead, set `subscription` and add that plan (a plan the registry lacks, a free tier too, goes into your `prices.json` `plans`) | `ai-cost doctor` prints `ok  subscription <plan> ×<seats>` per plan, one `<provider>: N row(s) in the last 24 h — … (providers.<provider>.billing = …)` line per provider you used, and no `!!` line |
+| 4b. If you pay for GitHub Copilot | set `providers.github.bill` to the account that pays: `{"scope": "organization", "name": "<org>"}` (or `"user"` for a personally bought plan). Its usage report prices Copilot to the credit — a review has no price of its own — and states the seats; `gh` must be logged in as an owner or billing manager of that organization | `ai-cost doctor` prints `ok  GitHub usage report (organization <org>): readable, newest day with lines <date>` |
 | 5. See what is on disk | `ai-cost doctor` — every source found with its count, plugins, config, prices, both schedules | `doctor: all good` (a `--` line is informational: a source you do not use, a job not installed) |
 | 6. First report | `ai-cost report --hours 24 --all-projects --group real,api --format table --unpriced skip` | a `# AI cost report — … (24.0 h)` header, `Sources: …` naming what was found, sections 1 (real) and 2 (API-only) |
 | 7. Per project | `cd` into a project and run `ai-cost report --hours 24`, or `ai-cost report --project /path/to/project --hours 24` | the header lists `--project …: N row(s) … left out` / `… included` lines: what could and could not be placed (§5) |
@@ -39,7 +41,7 @@ Where things live (override in the environment when your CLIs do):
 | usage log your programs write | `$XDG_DATA_HOME/ai-cost/usage.jsonl` (`~/.local/share/ai-cost/usage.jsonl`) | `AI_COST_USAGE_LOG`, more files in config `usage_logs` |
 | daily reports | `$XDG_DATA_HOME/ai-cost/reports/<date>/` | `AI_COST_REPORTS_DIR`, `daily --out DIR` |
 | Claude Code, Codex CLI, Gemini CLI, Grok Build CLI homes | `~/.claude`, `~/.codex`, `~/.gemini`, `~/.grok` | `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME` (the CLIs' own variables) |
-| network | the price-drift check and `--github` only | `AI_COST_OFFLINE=1` disables the check |
+| network | the price-drift check, the GitHub usage report (`providers.github.bill`) and `--github` only | `AI_COST_OFFLINE=1` disables the check and the usage report (its amounts are then missing, said in the report) |
 
 ## 2. What is read, from where
 
@@ -50,7 +52,8 @@ Where things live (override in the environment when your CLIs do):
 | Gemini CLI | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (`.json` in older versions) | model message (`type: "gemini"`, one per `id`) | none — `providers.google.billing` | the folder, mapped to its path through `~/.gemini/projects.json` (by name, or by the sha256 older versions used) |
 | Grok Build CLI | `~/.grok/sessions/<cwd, URL-encoded>/<session>/usage.json` | turn × model (`turns[].modelUsage`) | none — `providers.xai.billing`; the CLI's own cost (`costUsdTicks / 1e10`) is used by `real` under `providers.xai.trust_cli_cost` (default true) | the session directory's name, decoded |
 | usage log | `$XDG_DATA_HOME/ai-cost/usage.jsonl` + config `usage_logs` | one JSON line = one request (§4) | the line's `billing` (`api` by default when it has tokens or a cost) | none; `session` / `ref` can name a CLI session, and the row then takes that session's scope |
-| GitHub (opt-in) | `gh` API: Copilot reviews submitted in the window, Actions billable minutes | review / run | a plan that covers `github-copilot` / `github-actions`, or the `copilot_plan_exhausted` / `actions_plan_exhausted` switches | none |
+| GitHub usage report (opt-in: `providers.github.bill`) | `gh api <organizations\|users>/<name>/settings/billing/usage?year&month` — once per month the window touches | line of the report (UTC day × product × SKU × repository) of a day that lies whole inside the window and has ended; Copilot always, Actions only for a repository named with `--github` | the report's own amounts: API-only = gross, real = net, a seat (`UserMonths`) = a subscription share; the days the window only touches, the other products and the months not read are listed in the report's "GitHub usage report" section with exact amounts | `<organization>/<repository>` (or the organization) — not a directory, so `--project` leaves them out |
+| GitHub counts (opt-in: `--github owner/repo`) | `gh` API: Copilot reviews submitted in the window, Actions billable minutes (`/timing`) | review / run | a Copilot review is a count (it has no price); minutes: a plan that covers `github-actions` or `actions_plan_exhausted` — and with `providers.github.bill` set every such row is a count (the usage report has the amounts) | none |
 | plugins | whatever they read (§7) | as they say | as they say | as they say |
 
 A row's billing comes first from its file (a named plan, a log line's `billing`), then from `providers.<name>.billing`,
@@ -72,7 +75,8 @@ prints the shipped prices; the shipped config is the file `install --init-config
 | `providers.anthropic.cache_ttl_default` | `5m` \| `1h` | `1h` | the tier of a legacy unsplit cache write |
 | `providers.openai.default_model` | string | `""` | the model of a Codex rollout that does not name its own (empty = such rows are `unknown`) |
 | `providers.xai.trust_cli_cost` | bool | `true` | `real` uses the Grok CLI's own cost figure for its sessions and review runs; `false` = the list price |
-| `providers.github.copilot_plan_exhausted`, `actions_plan_exhausted`, `actions_runner` | bool, bool, `linux` \| `windows` \| `macos` | false, false, linux | once the month's included credits / minutes are gone, `real` prices GitHub rows per unit; the runner OS when a run's timing is unknown |
+| `providers.github.bill` | `{"scope": "organization" \| "user", "name": "<account>"}` or `null` | `null` | the account whose usage report prices GitHub: Copilot credits and seats, and Actions of the repositories named with `--github`. Read through `gh` (an organization's report needs an owner or billing manager; a user's shows only a personally bought plan); an enterprise is refused — its report leaves out cost-center usage, name the organization. With it, every other GitHub row is a count and a configured plan whose seats the report bills (`copilot-business` for "Copilot Business") gives way to the report; `doctor` checks that it can be read |
+| `providers.github.actions_plan_exhausted`, `actions_runner` | bool, `linux` \| `windows` \| `macos` | false, linux | without `bill`: once the month's included minutes are gone, `real` prices `--github` minutes at the list price; the runner of an Actions row that names none. `copilot_plan_exhausted` is no longer read (a Copilot review has no price since 2.6) |
 | `budgets.daily_usd`, `monthly_usd`, `per_provider_daily_usd.<name>` | numbers | 0, 0, `{}` — `daily_usd` / `monthly_usd` 0 = no check; a provider listed in `per_provider_daily_usd` is checked, 0 included (any spend is a breach), a provider left out is not | what `monitor` checks (exit 3 on breach) — API-equivalent figures |
 | `window_default_hours` | number > 0 | 24 | the window when nothing else sets it |
 | `reconcile.tolerance_pct` | number ≥ 0 | 5 | the gap `reconcile` accepts, in percent of the reported figure |
@@ -195,7 +199,9 @@ list price) and the tokens it billed (every counter once), the reported figures,
 `reconcile.tolerance_pct`, a note when rows of unknown billing are in the tokens but not in the cash, and a verdict.
 Exit 0 within tolerance, 1 above it; every run is appended to `<state>/reconcile.jsonl` and `doctor` shows the last.
 Nothing is fetched: no provider offers one public spend endpoint every user could call, so the figure is yours to
-paste (or a script's, from an export). A gap is something to look at — the window's edges (the console's day may
+paste (or a script's, from an export). GitHub needs no reconcile once `providers.github.bill` is set: the report's
+"GitHub usage report" section is the account's own report, to the last digit — real = the net of the usage lines
+(the cash `reconcile --provider github` compares) + the net of the seat lines (subscription shares, not cash). A gap is something to look at — the window's edges (the console's day may
 not be UTC), a source the tool does not read, a price it applies differently (the API-only group prices a turn's
 aggregated counters, so a turn of several calls never gets a long-context tier) — never a number to hide.
 

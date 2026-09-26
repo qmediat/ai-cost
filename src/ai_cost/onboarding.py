@@ -20,6 +20,7 @@ from .collectors.codex import SOURCE_NAME as CODEX_SOURCE
 from .collectors.codex import rollout_files
 from .collectors.gemini_cli import SOURCE_NAME as GEMINI_SOURCE
 from .collectors.gemini_cli import session_files
+from .collectors.github_bill import BillProbe
 from .collectors.grok_build import SOURCE_NAME as GROK_SOURCE
 from .collectors.grok_build import usage_files
 from .config import Budgets, Config, Paths, PriceBook
@@ -159,7 +160,9 @@ NEXT_STEPS = (
     '  2. "providers": <name>.billing wherever the session files cannot say how you paid — Claude Code always '
     '("anthropic": "subscription" on a Claude plan, "api" on an API key), Gemini CLI and Grok Build when they '
     "run on an account plan instead of a key",
-    f"  3. ai-cost doctor — {_DOCTOR_TODO}",
+    '  3. GitHub Copilot: "providers": {"github": {"bill": {"scope": "organization", "name": "<org>"}}} — the '
+    "account's usage report prices it (a review has no price of its own)",
+    f"  4. ai-cost doctor — {_DOCTOR_TODO}",
     f"guide: {SETUP_GUIDE}",
 )
 
@@ -340,11 +343,47 @@ def uncovered(providers: Iterable[str], config: Config, book: PriceBook | None =
 
 
 def paid_for(provider: str, config: Config, book: PriceBook | None) -> bool:
-    """A plan pays for the provider — for GitHub also a switch saying the plan's included allowance is used up."""
+    """A plan pays for the provider — for GitHub also its usage report (``bill``) or the Actions allowance switch."""
     if not uncovered([provider], config, book):
         return True
     github = config.github
-    return provider == "github" and (github.copilot_plan_exhausted or github.actions_plan_exhausted)
+    return provider == "github" and (github.bill is not None or github.actions_plan_exhausted)
+
+
+BILL_HINT = (
+    'set providers.github.bill = {"scope": "organization" | "user", "name": "<account>"} to read the amounts from '
+    "the account's usage report (an owner or billing manager can read an organization's)"
+)
+
+
+def github_checks(config: Config, uses: Sequence[ProviderUse], probe: BillProbe | None) -> list[Check]:
+    """Retired GitHub keys, the usage report's readability, or — without one — that Copilot is only counted."""
+    checks = [
+        Check(
+            Mark.PROBLEM,
+            f"{key}: no longer read (a Copilot review has no price since 2.6) — remove it; {BILL_HINT}",
+        )
+        for key in config.github.retired
+    ]
+    if probe is not None:
+        checks.append(_probe_check(probe))
+    elif any(use.provider == "github" for use in uses):
+        checks.append(Check(Mark.INFO, f"github: Copilot reviews are counted, not priced — {BILL_HINT}"))
+    return checks
+
+
+def _probe_check(probe: BillProbe) -> Check:
+    where = f"GitHub usage report ({probe.account.label})"
+    if probe.offline:
+        return Check(
+            Mark.INFO, f"{where}: {probe.failure} — GitHub amounts stay out of the reports while offline"
+        )
+    if probe.failure:
+        return Check(
+            Mark.PROBLEM, f"{where}: not readable — {probe.failure}; GitHub amounts stay out of the reports"
+        )
+    newest = probe.newest.isoformat() if probe.newest else "no line yet this month"
+    return Check(Mark.OK, f"{where}: readable, newest day with lines {newest}")
 
 
 def setup_checks(

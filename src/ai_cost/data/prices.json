@@ -309,12 +309,6 @@
     },
     "github": {
       "source": "https://docs.github.com/en/copilot/get-started/plans",
-      "copilot": {
-        "units_per_code_review": 13,
-        "overage_usd_per_unit": 0.04,
-        "source": "https://docs.github.com/en/copilot/managing-copilot/monitoring-usage-and-entitlements/about-premium-requests",
-        "notes": "Copilot code review consumes 13 premium requests / AI credits per review since 2026-06-01; overage $0.04 each."
-      },
       "actions": {
         "source": "https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions",
         "usd_per_minute": {

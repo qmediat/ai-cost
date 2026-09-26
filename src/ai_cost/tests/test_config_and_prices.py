@@ -25,7 +25,7 @@ from ..config import (
     parse_pricebook,
 )
 from ..errors import ConfigError
-from ..models import CheckStatus, PeakOffpeakPrice, Provider, TokenTierPrice
+from ..models import BillAccount, BillScope, CheckStatus, PeakOffpeakPrice, Provider, TokenTierPrice
 from ..ops import doctor
 from ..prices_check import (
     USER_AGENT,
@@ -536,7 +536,7 @@ def test_alias_and_peak_hour_shapes_are_config_errors(tmp_path: Path) -> None:
 
 def test_flags_must_be_booleans_and_budgets_non_negative() -> None:
     quoted = builtin_config()
-    quoted["providers"]["github"] = {"copilot_plan_exhausted": "false"}
+    quoted["providers"]["github"] = {"actions_plan_exhausted": "false"}
     negative = builtin_config()
     negative["budgets"]["daily_usd"] = -1
     seat = builtin_prices()
@@ -547,7 +547,7 @@ def test_flags_must_be_booleans_and_budgets_non_negative() -> None:
         parse_pricebook(null_flag, {}, "prices").plans["claude-pro"].per_seat is False
     ), "null = absent = default"
     cases: list[tuple[Callable[[], object], str]] = [
-        (lambda: parse_config(quoted, "cfg"), "copilot_plan_exhausted"),
+        (lambda: parse_config(quoted, "cfg"), "actions_plan_exhausted"),
         (lambda: parse_config(negative, "cfg"), "daily_usd"),
         (lambda: parse_pricebook(seat, {}, "prices"), "per_seat"),
     ]
@@ -560,16 +560,16 @@ def test_flags_must_be_booleans_and_budgets_non_negative() -> None:
             raise AssertionError(f"{word}: expected a ConfigError")
 
 
-def test_the_copilot_check_survives_a_null_provider_override() -> None:
-    from ..prices_check import _copilot_check
+def test_the_price_check_has_no_copilot_price_to_look_for() -> None:
+    from ..prices_check import check_prices
 
     book = parse_pricebook(builtin_prices(), {"providers": {"github": None}}, "prices")
     assert book.raw["providers"][
         "github"
     ], "null = absent: the base provider (and its source URL) stays in raw"
-    with mock.patch("ai_cost.prices_check.fetch_variants", side_effect=OSError("offline")):
-        check = _copilot_check(["no prices here"], book)
-    assert check.status is CheckStatus.NOT_FOUND
+    with mock.patch("ai_cost.prices_check.fetch_variants", return_value=["additional premium request $0.04"]):
+        result = check_prices(book, ["github"])
+    assert result.providers["github"].models == {}, "a Copilot review has no price since 2.6 (ADR-0007)"
 
 
 def test_huge_and_infinite_numbers_are_config_errors() -> None:
@@ -1023,15 +1023,40 @@ def test_a_reclaim_in_progress_elsewhere_wins_and_a_crashed_one_expires(tmp_path
     assert lock.read_text() == str(os.getpid()) and not marker.exists()
 
 
-def test_a_non_string_copilot_source_is_a_config_error(tmp_path: Path) -> None:
-    try:
-        parse_pricebook(builtin_prices(), {"providers": {"github": {"copilot": {"source": 5}}}}, "prices")
-    except ConfigError as exc:
-        assert "copilot" in str(exc) and "source" in str(exc)
-    else:
-        raise AssertionError("5 is not a URL")
-    shipped = builtin_prices()["providers"]["github"]["copilot"].get("source", "")
-    assert parse_pricebook(builtin_prices(), {}, "prices").github.copilot_source == shipped
+def test_a_copilot_price_left_in_a_user_prices_file_is_not_read() -> None:
+    old = {"providers": {"github": {"copilot": {"units_per_code_review": 13, "overage_usd_per_unit": 0.04}}}}
+    book = parse_pricebook(builtin_prices(), old, "prices")
+    assert "copilot" not in builtin_prices()["providers"]["github"], "the package ships no Copilot price"
+    assert not hasattr(book.github, "overage_usd_per_unit"), "nothing prices a review"
+
+
+def test_the_usage_report_account_is_parsed_and_checked() -> None:
+    raw = builtin_config()
+    assert parse_config(raw, "cfg").github.bill is None, "the package names no account"
+    raw["providers"]["github"]["bill"] = {"scope": "organization", "name": "acme-corp"}
+    bill = parse_config(raw, "cfg").github.bill
+    assert bill == BillAccount(BillScope.ORGANIZATION, "acme-corp")
+    assert bill.endpoint == "organizations/acme-corp/settings/billing/usage"
+    for wrong, word in (
+        ({"scope": "team", "name": "acme"}, "scope"),
+        ({"scope": "user", "name": "a b"}, "name"),
+        ({"scope": "user"}, "name"),
+        ("acme", "bill"),
+    ):
+        raw["providers"]["github"]["bill"] = wrong
+        try:
+            parse_config(raw, "cfg")
+        except ConfigError as exc:
+            assert word in str(exc), str(exc)
+        else:
+            raise AssertionError(f"{wrong!r}: expected a ConfigError")
+
+
+def test_a_retired_github_key_is_listed_not_read() -> None:
+    raw = builtin_config()
+    assert parse_config(raw, "cfg").github.retired == ()
+    raw["providers"]["github"]["copilot_plan_exhausted"] = True
+    assert parse_config(raw, "cfg").github.retired == ("providers.github.copilot_plan_exhausted",)
 
 
 def test_prices_update_writes_under_a_null_provider_override(tmp_path: Path) -> None:

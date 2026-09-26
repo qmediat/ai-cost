@@ -22,9 +22,9 @@ from typing import Any
 
 from .config import Config, Paths, PriceBook
 from .errors import ToolError
-from .groups import Report, SubscriptionShare
+from .groups import Report, SubscriptionShare, is_seat
 from .models import Window
-from .ops import Emit, ReportRequest, build_report, ensure_dir
+from .ops import Emit, ReportRequest, bill_unreadable, build_report, ensure_dir
 from .render import plain, render_json, render_markdown
 from .timeutil import iso, now
 
@@ -59,6 +59,8 @@ class DailyIndex:
     projects: tuple[ProjectReport, ...]
     notes: tuple[str, ...]
     failures: tuple[str, ...] = ()  # a project whose report or files failed: said on stderr, exit 1
+    # The day, when its GitHub usage report was read too soon after it ended or not read: the next run reads it again.
+    github_provisional: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -208,7 +210,7 @@ def _build_projects(
         except ToolError as exc:
             failures.append(f"{folder.name}: {exc}")
             continue
-        if not report.rows:
+        if not [row for row in report.rows if not is_seat(row)]:  # a usage-report seat alone is no usage
             notes.append(f"{folder.name}: {_empty_reason(report)}")
             continue
         built.append(_Built(folder, path, report))
@@ -286,15 +288,87 @@ def _write_projects(built: list[_Built], directory: Path) -> tuple[list[ProjectR
     return reports, failures
 
 
+REREAD_DAYS = (
+    7  # how far back a not-final day is read again; an older one keeps its mark (daily --date re-reads it)
+)
+
+
 def daily_reports(paths: Paths, config: Config, book: PriceBook, day: date, out: Path, output: Output) -> int:
-    """Write the day's global report, one per project and the index; exit 1 when a project failed (said on ``err``)."""
-    emit, err = output.emit, output.err
+    """The day's reports; first every recent day whose GitHub usage report was not final when written (ADR-0007)."""
+    run = _Run(paths, config, book, out, output)
+    status = 0
+    for earlier in _provisional_days(out, day, output):
+        status = max(status, _reread(run, earlier))
+    return max(status, _write_day(run, day))
+
+
+def _reread(run: _Run, earlier: date) -> int:
+    """Read a not-final day again — only once its usage report can be read, so a lost access costs no rebuild."""
+    failure = bill_unreadable(run.paths, run.config, earlier)
+    if failure:
+        run.output.emit(
+            f"daily {earlier}: kept as written — the GitHub usage report cannot be read ({failure})"
+        )
+        return 0
+    run.output.emit(f"daily {earlier}: its GitHub usage report was not final when written — reading it again")
+    return _write_day(run, earlier)
+
+
+def _provisional_days(out: Path, day: date, output: Output) -> list[date]:
+    """The last ``REREAD_DAYS`` days before ``day`` whose GitHub part was read too soon or not read (a missed run too)."""
+    found = []
+    for index in sorted(out.glob("*/index.json")) if out.is_dir() else []:
+        try:
+            earlier = date.fromisoformat(index.parent.name)
+        except ValueError:
+            continue  # not a day directory
+        if 0 < (day - earlier).days <= REREAD_DAYS and _provisional(index, output):
+            found.append(earlier)
+    return found
+
+
+def _provisional(index: Path, output: Output) -> bool:
+    try:
+        return bool(read_index(index).github_provisional)
+    except ToolError as exc:
+        output.err(f"daily: {exc} — not checked for a provisional GitHub usage report")
+        return False
+
+
+def _not_final(report: Report, day: date) -> tuple[str, ...]:
+    """The day, when its GitHub usage report was read too soon, could not be read, or had lines it could not read."""
+    bill = report.github_bill
+    unsure = bill is not None and (bill.provisional or bill.missing or bill.unreadable_lines)
+    return (day.isoformat(),) if unsure else ()
+
+
+@dataclass(frozen=True)
+class _Run:
+    """What every day of one ``daily`` run shares."""
+
+    paths: Paths
+    config: Config
+    book: PriceBook
+    out: Path
+    output: Output
+
+
+def _write_day(run: _Run, day: date) -> int:
+    """Write the day's global report, one per project and the index; exit 1 when a project failed (said on ``err``).
+
+    A day already written whose usage report cannot be read now keeps its files — a re-read or a hand-run
+    ``daily --date``: a failed read never replaces one that worked.
+    """
     window = day_window(day)
-    directory = out / day.isoformat()
+    directory = run.out / day.isoformat()
     ensure_dir(directory, "reports directory")
-    overall = build_report(_request(window, None), paths, config, book)
+    overall = build_report(_request(window, None), run.paths, run.config, run.book)
+    written = (directory / "index.json").is_file()
+    if written and overall.github_bill is not None and overall.github_bill.missing:
+        run.output.emit(f"daily {day}: kept as written — the GitHub usage report could not be read again")
+        return 0
     _write_pair(overall, directory / "global")
-    built, notes, failures = _build_projects(paths, config, book, window)
+    built, notes, failures = _build_projects(run.paths, run.config, run.book, window)
     _share_plans(built)
     projects, write_failures = _write_projects(built, directory)
     failures += write_failures
@@ -311,17 +385,22 @@ def daily_reports(paths: Paths, config: Config, book: PriceBook, day: date, out:
         projects=tuple(projects),
         notes=tuple(notes),
         failures=tuple(failures),
+        github_provisional=_not_final(overall, day),
     )
     _write_index(directory / "index.json", index)
-    emit(
-        f"daily {day}: real {real:.2f} USD, api-only {api:.2f} USD, {len(overall.rows)} row(s), "
-        f"{len(projects)} project(s) → {directory}"
-    )
-    for note in notes:
-        emit(f"  note: {note}")
-    for failure in failures:
-        err(f"daily {day}: FAIL {failure}")
+    _say_day(day, index, run.output)
     return 1 if failures else 0
+
+
+def _say_day(day: date, index: DailyIndex, output: Output) -> None:
+    output.emit(
+        f"daily {day}: real {index.real_usd:.2f} USD, api-only {index.api_usd:.2f} USD, {index.rows} row(s), "
+        f"{len(index.projects)} project(s) → {index.directory}"
+    )
+    for note in index.notes:
+        output.emit(f"  note: {note}")
+    for failure in index.failures:
+        output.err(f"daily {day}: FAIL {failure}")
 
 
 def _write_index(path: Path, index: DailyIndex) -> None:
@@ -344,6 +423,7 @@ def read_index(path: Path) -> DailyIndex:
         projects = tuple(ProjectReport(**_fields(ProjectReport, item)) for item in data["projects"])
         own = {**_fields(DailyIndex, data), "window": tuple(data["window"]), "notes": tuple(data["notes"])}
         own["failures"] = tuple(data.get("failures", ()))
+        own["github_provisional"] = tuple(data.get("github_provisional", ()))
         return DailyIndex(**{**own, "projects": projects})
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ToolError(f"{path} is not a daily index: {exc.__class__.__name__}: {exc}") from exc

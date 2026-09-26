@@ -8,14 +8,16 @@ import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
 from .. import cli
 from .. import ops as ops_module
+from ..collectors.github_bill import BillProbe
 from ..config import Config, PriceBook, builtin_config, load_config, load_pricebook, parse_config
 from ..groups import real_group
-from ..models import Billing, Provider, RowKind, Tokens, UsageRow
+from ..models import BillAccount, Billing, BillScope, Provider, RowKind, Tokens, UsageRow
 from ..onboarding import (
     SETUP_GUIDE,
     START_HERE,
@@ -25,6 +27,7 @@ from ..onboarding import (
     ProviderUse,
     SourceFiles,
     budget_check,
+    github_checks,
     init_config_lines,
     provider_use,
     setup_checks,
@@ -62,7 +65,7 @@ def _config(
     rules: dict[str, str],
     plans: list[dict[str, object]] | None = None,
     outside: tuple[str, ...] = (),
-    **github: bool,
+    **github: object,
 ) -> Config:
     raw = builtin_config()
     raw["subscriptions"] = plans or []
@@ -305,15 +308,30 @@ def test_doctor_names_a_project_directory_it_cannot_read(tmp_path: Path) -> None
     assert len(said) == 1 and "1 directory(ies) under it cannot be read" in said[0], lines
 
 
-def test_the_report_header_counts_the_github_allowance_switch_as_paid(tmp_path: Path) -> None:
+def test_the_report_header_counts_the_usage_report_and_the_allowance_switch_as_paid(tmp_path: Path) -> None:
     paths = paths_in(tmp_path)
     paths.user_config_dir.mkdir(parents=True)
     paths.user_config_file().write_text("{}")
     book = _book()
     unpaid = _config({"github": "subscription"})
     assert [w for w in ops_module._config_warnings(paths, unpaid, book) if "covers github" in w]
-    switched = _config({"github": "subscription"}, copilot_plan_exhausted=True)
-    assert ops_module._config_warnings(paths, switched, book) == []
+    for paid in ({"actions_plan_exhausted": True}, {"bill": {"scope": "organization", "name": "acme"}}):
+        assert (
+            ops_module._config_warnings(paths, _config({"github": "subscription"}, **paid), book) == []
+        ), paid
+
+
+def test_a_retired_github_key_is_said_in_the_header_and_by_doctor(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    paths.user_config_dir.mkdir(parents=True)
+    paths.user_config_file().write_text("{}")
+    retired = _config({}, copilot_plan_exhausted=True)
+    said = ops_module._config_warnings(paths, retired, _book())
+    assert [
+        w for w in said if w.startswith("providers.github.copilot_plan_exhausted is no longer read")
+    ], said
+    problems = _problem_texts(github_checks(retired, [], None))
+    assert [t for t in problems if t.startswith("providers.github.copilot_plan_exhausted: no longer read")]
 
 
 def test_a_plan_with_covers_pays_only_for_what_they_name() -> None:
@@ -325,11 +343,25 @@ def test_a_plan_with_covers_pays_only_for_what_they_name() -> None:
     ], "covers given: the registry does not add"
 
 
-def test_github_rows_on_a_plan_are_paid_for_by_the_used_up_allowance_switch() -> None:
+def test_github_rows_on_a_plan_are_paid_for_by_the_usage_report_or_the_allowance_switch() -> None:
     rows = [_row(Provider.GITHUB, Billing.SUBSCRIPTION)]
     unpaid = _problem_texts(setup_checks([], _config({}), _book(), rows))
     assert [t for t in unpaid if t.startswith("github: used on a plan")], unpaid
-    assert _problem_texts(setup_checks([], _config({}, copilot_plan_exhausted=True), _book(), rows)) == []
+    for paid in ({"actions_plan_exhausted": True}, {"bill": {"scope": "user", "name": "someone"}}):
+        assert _problem_texts(setup_checks([], _config({}, **paid), _book(), rows)) == [], paid
+
+
+def test_doctor_says_whether_the_usage_report_can_be_read() -> None:
+    account = BillAccount(BillScope.ORGANIZATION, "acme")
+    config = _config({}, bill={"scope": "organization", "name": "acme"})
+    good = github_checks(config, [], BillProbe(account, "", date(2026, 9, 25)))
+    assert [(c.mark, c.text) for c in good] == [
+        (Mark.OK, "GitHub usage report (organization acme): readable, newest day with lines 2026-09-25")
+    ]
+    bad = github_checks(config, [], BillProbe(account, "HTTP 404: no access"))
+    assert bad[0].mark is Mark.PROBLEM and "not readable — HTTP 404: no access" in bad[0].text
+    counted = github_checks(_config({}), provider_use([_row(Provider.GITHUB, Billing.SUBSCRIPTION)]), None)
+    assert [c.mark for c in counted] == [Mark.INFO] and "counted, not priced" in counted[0].text
 
 
 def test_doctor_says_when_the_state_dir_cannot_be_written(tmp_path: Path) -> None:

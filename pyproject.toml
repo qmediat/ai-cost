@@ -1,6 +1,6 @@
 [project]
 name = "ai-costs"
-version = "2.5.0"
+version = "2.6.0"
 description = "What a block of AI-assisted work cost: real, API-only equivalent, vendor quote — from the usage already on disk"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,7 +37,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ai_cost = ["data/*.json"]
+ai_cost = ["data/*.json", "tests/data/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal
 from enum import Enum
 from typing import ClassVar, Union
 
@@ -92,7 +93,8 @@ class RowKind(Enum):
     ``TRANSCRIPT``: an assistant message of a chat transcript on disk. ``SESSION``: a turn of a CLI session log.
     ``CHAT``: a model message of a chat log. ``LOG``: a line a program wrote to a usage log. ``LEDGER``: a row that
     carries the cash of calls another row already counted (skipped by the API-equivalent group). ``REVIEW``: a
-    review run. ``COPILOT`` / ``ACTIONS``: GitHub per-unit rows.
+    review run. ``COPILOT`` / ``ACTIONS``: GitHub counts (reviews, minutes). ``INVOICE``: a line of a provider's usage
+    report, carrying its own amounts (``UsageRow.invoice``, ADR-0007).
     """
 
     TRANSCRIPT = "transcript"
@@ -103,6 +105,7 @@ class RowKind(Enum):
     REVIEW = "review"
     COPILOT = "copilot"
     ACTIONS = "actions"
+    INVOICE = "invoice"
 
 
 class Size(Enum):
@@ -187,6 +190,106 @@ class Scope:
         return tuple(key for key in (self.branch, self.workspace, self.pr) if key)
 
 
+SEAT_UNIT = "UserMonths"  # the usage-report unit of a seat: a subscription, not usage (ADR-0007)
+ELAPSED_RUNNER = (
+    "elapsed"  # the runner key of a run's wall-clock minutes when /timing gave none: never priced
+)
+
+
+@dataclass(frozen=True)
+class InvoiceAmounts:
+    """One line of a provider's usage report as the report states it (ADR-0007): summed, never computed.
+
+    ``gross`` is the usage before anything included in a plan, ``discount`` what the plan covered, ``net`` what is
+    billed; ``day`` is the report's UTC day.
+    """
+
+    day: date
+    unit: str
+    quantity: float
+    unit_price: float
+    gross: float
+    discount: float
+    net: float
+
+    @property
+    def is_seat(self) -> bool:
+        """A seat line: its net amount is a subscription share, not usage."""
+        return self.unit == SEAT_UNIT
+
+
+class BillScope(Enum):
+    """Whose usage report ``providers.github.bill`` names; the value is the REST path's singular.
+
+    No enterprise: its report leaves out the usage assigned to cost centers unless asked per cost center (ADR-0007).
+    """
+
+    ORGANIZATION = "organization"
+    USER = "user"
+
+
+@dataclass(frozen=True)
+class BillAccount:
+    """The GitHub account whose usage report prices the GitHub rows (``providers.github.bill``)."""
+
+    scope: BillScope
+    name: str
+
+    @property
+    def endpoint(self) -> str:
+        """The REST path of its itemized usage report."""
+        return f"{self.scope.value}s/{self.name}/settings/billing/usage"
+
+    @property
+    def label(self) -> str:
+        """How warnings name it: ``organization acme``."""
+        return f"{self.scope.value} {self.name}"
+
+
+@dataclass(frozen=True)
+class BillSubtotal:
+    """The exact sum of one product / SKU / unit of a usage report over the lines it covers (ADR-0007)."""
+
+    product: str
+    sku: str
+    unit: str
+    lines: int
+    quantity: Decimal | None  # None when a line stated no quantity
+    gross: Decimal
+    discount: Decimal
+    net: Decimal
+
+
+@dataclass(frozen=True)
+class OutsideDay:
+    """A UTC day the window touches but does not hold whole (or that is not over): its exact amounts, not in totals."""
+
+    day: date
+    why: str
+    lines: int
+    gross: Decimal
+    discount: Decimal
+    net: Decimal
+
+
+@dataclass(frozen=True)
+class BillSummary:
+    """What a report's GitHub amounts rest on: the report's own figures, exact, and what they leave out."""
+
+    account: str
+    read_at: datetime
+    days: tuple[date, ...]  # the whole UTC days in the totals
+    provisional: tuple[date, ...]  # of those, the ones read less than SETTLE_HOURS after they ended
+    counted: tuple[BillSubtotal, ...]
+    left_out: tuple[BillSubtotal, ...]  # other products, and Actions of repositories not named with --github
+    outside: tuple[OutsideDay, ...]
+    missing: tuple[str, ...]  # months that could not be read, with the reason
+    unreadable_lines: int = 0
+    months_read: tuple[
+        str, ...
+    ] = ()  # YYYY-MM of every month whose report was read: its amounts are the report's
+
+
 def client_outside(client: str, clients: Sequence[str]) -> bool:
     """Whether a row's client — named, never empty — is one the config puts outside the tracked work."""
     return bool(client) and client in clients
@@ -212,6 +315,7 @@ class UsageRow:
     client: str = (
         ""  # the program that wrote the session, as its file names it (a Codex rollout's originator)
     )
+    invoice: InvoiceAmounts | None = None  # a usage-report line's own amounts (RowKind.INVOICE)
 
 
 @dataclass(frozen=True)
@@ -260,14 +364,11 @@ class PeakOffpeakPrice:
 
 @dataclass(frozen=True)
 class PerUnitPrice:
-    """Per-unit prices: Copilot credits per review and their overage, Actions minutes per runner OS, web search."""
+    """Per-unit prices: Actions minutes per runner OS, web search (a Copilot review has no price, ADR-0007)."""
 
-    units_per_review: int = 0
-    overage_usd_per_unit: float = 0.0
     usd_per_minute: Mapping[str, float] = field(default_factory=dict)
     public_repos_free: bool = True
     web_search_per_1000: float = 0.0
-    copilot_source: str = ""  # where the Copilot overage price is published; empty = only the provider page
 
 
 PriceEntry = Union[TokenTierPrice, PeakOffpeakPrice, PerUnitPrice]

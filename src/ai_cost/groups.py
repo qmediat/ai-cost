@@ -10,7 +10,19 @@ from typing import Callable
 
 from .config import Config, PriceBook, Staffing, VendorProfile
 from .errors import ConfigError, PricingError
-from .models import Billing, Money, Provider, RowKind, Size, Skipped, Tokens, UsageRow, Window, WorkItem
+from .models import (
+    Billing,
+    BillSummary,
+    Money,
+    Provider,
+    RowKind,
+    Size,
+    Skipped,
+    Tokens,
+    UsageRow,
+    Window,
+    WorkItem,
+)
 from .pricing import price
 
 HOURS_PER_MONTH = 730.0
@@ -28,8 +40,8 @@ class Line:
     notes: set[str] = field(default_factory=set)
 
     def add(self, row: UsageRow, money: Money) -> None:
-        """Fold one priced row in."""
-        self.calls += row.tokens.reviews if row.kind is RowKind.COPILOT else 1
+        """Fold one priced row in; a usage-report line is an amount, not a run."""
+        self.calls += {RowKind.COPILOT: row.tokens.reviews, RowKind.INVOICE: 0}.get(row.kind, 1)
         self.usd += money.usd
         self.tokens = self.tokens.add(row.tokens)
         if money.note:
@@ -186,6 +198,7 @@ class Report:
     api: ApiGroup | None
     vendor: VendorGroup | None
     attribution: AttributionGroup | None = None
+    github_bill: BillSummary | None = None  # what the GitHub amounts rest on, exact (ADR-0007)
 
     @property
     def window_hours(self) -> float:
@@ -209,7 +222,7 @@ def api_group(rows: Sequence[UsageRow], book: PriceBook, config: Config) -> ApiG
     """
     lines: dict[tuple[Provider, str], Line] = {}
     for row in rows:
-        if row.kind is RowKind.LEDGER:
+        if row.kind is RowKind.LEDGER or is_seat(row):  # a seat is a subscription: no pay-per-use equivalent
             continue
         line = lines.setdefault((row.provider, row.model), Line(row.provider, row.model))
         line.add(row, price(row, book, config))
@@ -239,19 +252,25 @@ def _rule_openai(row: UsageRow, book: PriceBook, config: Config) -> tuple[str, M
 
 
 def _rule_github(row: UsageRow, book: PriceBook, config: Config) -> tuple[str, Money]:
-    """A plan row is within the allowance until the config says it is exhausted; a pay-per-use row is cash."""
+    """A usage-report line is what it bills (net); with the report set, anything else is a count (ADR-0007).
+
+    Without ``providers.github.bill``: a figure is cash; ``--github`` Actions minutes of a plan are within the
+    allowance until the config says it is exhausted; a Copilot review is a count either way.
+    """
+    return row.model, _github_money(row, book, config)
+
+
+def _github_money(row: UsageRow, book: PriceBook, config: Config) -> Money:
+    if row.invoice is not None:
+        return Money(row.invoice.net, "usage report, net")
     if row.cost_reported is not None:
-        return row.model, Money(float(row.cost_reported), "source-reported")
-    if row.billing is Billing.API:  # a plugin's or a logged row that says it paid per use
-        return row.model, price(row, book, config)
-    exhausted = (
-        config.github.copilot_plan_exhausted
-        if row.kind is RowKind.COPILOT
-        else config.github.actions_plan_exhausted
+        return Money(float(row.cost_reported), "source-reported")
+    within = row.kind is RowKind.ACTIONS and not config.github.actions_plan_exhausted
+    return (
+        Money(0.0, "within plan allowance")
+        if within and row.billing is not Billing.API
+        else price(row, book, config)
     )
-    if exhausted:
-        return row.model, price(row, book, config)
-    return row.model, Money(0.0, "within plan allowance")
 
 
 def _rule_xai(row: UsageRow, book: PriceBook, config: Config) -> tuple[str, Money]:
@@ -304,9 +323,56 @@ REAL_RULES: Mapping[Provider, RealRule] = {
 }
 
 
-def subscription_shares(config: Config, book: PriceBook, window: Window) -> list[SubscriptionShare]:
-    """Attribution ``time``: window hours / 730; ``full``: the whole month; ``none``: nothing."""
+def is_seat(row: UsageRow) -> bool:
+    """A usage-report seat line: a subscription share, never usage."""
+    return row.invoice is not None and row.invoice.is_seat
+
+
+INVOICE_ATTRIBUTION = "invoice"  # a share the usage report states, not one prorated from a configured plan
+REPLACED_BY_THE_BILL = "replaced by the seats of the GitHub usage report"
+
+
+def billed_plans(rows: Sequence[UsageRow]) -> set[str]:
+    """The plan names the usage report bills seats of: its SKU in the price list's spelling.
+
+    Copilot Business → copilot-business. Only such a plan gives way to the report; any other GitHub plan (a personal
+    one the organization's report does not bill) stays as configured.
+    """
+    return {row.model.lower().replace(" ", "-") for row in rows if is_seat(row)}
+
+
+def invoice_shares(rows: Sequence[UsageRow]) -> list[SubscriptionShare]:
+    """The seat lines of a usage report, one share per SKU: the net they bill, the user-months in the note.
+
+    The report states amounts to nine decimals, so a sum rounded to nine is the report's own figure, not an estimate.
+    """
+    by_sku: dict[tuple[str, str], list[UsageRow]] = {}
+    for row in rows:
+        if is_seat(row):
+            by_sku.setdefault((row.provider.value, row.model), []).append(row)
+    shares = []
+    for (provider, sku), seats in sorted(by_sku.items()):
+        amounts = [row.invoice for row in seats if row.invoice is not None]
+        months = round(sum(line.quantity for line in amounts), 9)
+        net = round(sum(line.net for line in amounts), 9)
+        prices = sorted(
+            {line.unit_price for line in amounts}
+        )  # a price change inside the window: every price said
+        monthly = prices[0] if len(prices) == 1 else 0.0
+        note = f"{months} user-months at {' / '.join(str(p) for p in prices)} USD, from the usage report"
+        shares.append(SubscriptionShare(sku, provider, 0, monthly, INVOICE_ATTRIBUTION, net, note))
+    return shares
+
+
+def subscription_shares(
+    config: Config, book: PriceBook, window: Window, rows: Sequence[UsageRow] = ()
+) -> list[SubscriptionShare]:
+    """Attribution ``time``: window hours / 730; ``full``: the whole month; ``none``: nothing.
+
+    A plan whose seats the usage report bills in ``rows`` stays listed at 0: the report states them (ADR-0007).
+    """
     hours = window.hours()
+    billed = billed_plans(rows)
     shares = []
     for sub in config.subscriptions:
         plan = book.plans.get(sub.plan)
@@ -324,6 +390,13 @@ def subscription_shares(config: Config, book: PriceBook, window: Window) -> list
             )
             continue
         monthly = plan.monthly_usd * (sub.seats if plan.per_seat else 1)
+        if sub.plan in billed:
+            shares.append(
+                SubscriptionShare(
+                    sub.plan, plan.provider, sub.seats, monthly, sub.attribution, 0.0, REPLACED_BY_THE_BILL
+                )
+            )
+            continue
         usd = {"full": monthly, "none": 0.0}.get(sub.attribution, monthly * hours / HOURS_PER_MONTH)
         shares.append(SubscriptionShare(sub.plan, plan.provider, sub.seats, monthly, sub.attribution, usd))
     return shares
@@ -357,9 +430,9 @@ def real_group(rows: Sequence[UsageRow], book: PriceBook, config: Config, window
         if row.billing is Billing.UNKNOWN:
             unknown[row.provider.value] += 1
             continue
-        if row.billing is Billing.API_SETTLED:
-            continue  # a ledger line or a sibling row carries what the key was charged
-        if row.kind is RowKind.LEDGER:  # a ledger row is cash by its own figure, whoever the provider is
+        if row.billing is Billing.API_SETTLED or is_seat(row):
+            continue  # a ledger line, a sibling row or the usage report carries what was charged; a seat is a share
+        if row.kind is RowKind.LEDGER:  # cash by its own figure, whoever the provider is
             if row.cost_reported is None:  # a charge record without a figure: unknown, never booked as 0
                 unfigured += 1
                 continue
@@ -368,7 +441,7 @@ def real_group(rows: Sequence[UsageRow], book: PriceBook, config: Config, window
             label, money = real_rule(row.provider)(row, book, config)
         lines.setdefault((row.provider, label), Line(row.provider, label)).add(row, money)
     usage = sorted(lines.values(), key=lambda line: -line.usd)
-    shares = subscription_shares(config, book, window)
+    shares = subscription_shares(config, book, window, rows) + invoice_shares(rows)
     return RealGroup(shares, usage, sum(unknown.values()) + unfigured, dict(unknown), unfigured)
 
 

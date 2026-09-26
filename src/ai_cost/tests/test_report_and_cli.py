@@ -1363,8 +1363,8 @@ def test_live_github_rows_without_a_plan_are_said_in_the_header(tmp_path: Path) 
         bare = build_report(request, paths, replace(config, subscriptions=()), book)
         lookalike = replace(config, subscriptions=(Subscription(plan="x", covers=("githubish",)),))
         unrelated = build_report(request, paths, lookalike, book)
-    assert not any("no subscription covers github" in w for w in covered.warnings)
-    assert any("no subscription covers github" in w for w in bare.warnings), bare.warnings
+    assert not any("live GitHub rows are counts" in w for w in covered.warnings)
+    assert any("live GitHub rows are counts" in w for w in bare.warnings), bare.warnings
     assert any(
-        "no subscription covers github" in w for w in unrelated.warnings
+        "live GitHub rows are counts" in w for w in unrelated.warnings
     ), "a cover is github or github-<product>, never a name that starts with the letters"

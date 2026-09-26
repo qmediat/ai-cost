@@ -51,8 +51,11 @@ background price check.
    subscriptions (Claude plan, ChatGPT plan, Copilot, GitHub). Say both numbers; the subscriptions are sunk cost,
    the cash is marginal. Rows whose billing is unknown are priced in `api` only; the header counts them.
 2. **API-only** = the same tokens at list price without any plan. It is what an API-key-only setup would have paid
-   and the fair number to compare with a vendor. Copilot reviews are priced at the per-credit overage, Actions
-   minutes only for private repos.
+   and the fair number to compare with a vendor. GitHub: with `providers.github.bill`, the account's usage report
+   at gross (Copilot credits; Actions of the repositories named with `--github`) — its exact figures are in the
+   report's "GitHub usage report" section; without it a Copilot review is a count with no price (never quote one)
+   and Actions billable minutes are priced only for private repos. The GitHub amounts cover only the UTC days that
+   lie whole inside the window; say the days the header lists outside the totals.
 3. **Vendor** = three options, each a range (band min–max): junior (cheap rate, more time, senior review on top),
    mid (the blended rate quotes are built on), senior (fastest, highest rate). Quote the senior and mid ranges,
    mention the junior calendar. State the profile and that band sizing is a proxy when `--items` was not given.
@@ -87,8 +90,9 @@ background price check.
   `{"plan": <a name from ai-cost prices show>, "seats": N, "covers": ["anthropic"], "attribution": "time"}`; and
   `providers.<name>.billing` wherever the session files cannot say how a session was paid — Claude Code always
   (`anthropic`: `subscription` on a Claude plan, `api` on an API key), Gemini CLI (`google`) and Grok Build (`xai`)
-  when they run on an account plan instead of their default `api` key; `providers.github.copilot_plan_exhausted` once
-  the month's Copilot credits are gone. Then `ai-cost doctor`: every `!!` line names the key still missing and the
+  when they run on an account plan instead of their default `api` key; `providers.github.bill` =
+  `{"scope": "organization", "name": <org>}` (or `"user"`) when they pay for GitHub Copilot — its usage report prices
+  Copilot to the credit (a review has no price of its own). Then `ai-cost doctor`: every `!!` line names the key still missing and the
   value that fits — work them off until `doctor: all good`. A `--` line is information: a CLI with no files is
   one the user does not run, unless they say they do — then its home is elsewhere and the line names the variable.
 

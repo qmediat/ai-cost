@@ -15,10 +15,13 @@ within 7 days for high-severity issues.
 
 - Reads only files on the machine it runs on: your own CLI transcripts and session logs, the usage log your programs
   write, and your configuration. Nothing is sent anywhere; there is no telemetry and no account.
-- The network is touched in two cases only. The price drift check fetches the vendors' public pricing pages,
+- The network is touched in three cases only. The price drift check fetches the vendors' public pricing pages,
   identifying itself as `ai-cost/<version>`: on request (`prices check` / `prices update`), on the schedule you
   install, and by default in the background when a report finds the last check older than `auto_check_days`
-  (7; set it to 0 to disable). `--github` queries GitHub through the `gh` CLI you are already logged into.
+  (7; set it to 0 to disable). When you name a GitHub account in `providers.github.bill`, every report reads that
+  account's usage report (`GET …/settings/billing/usage`, one call per month the window touches) through the `gh` CLI
+  you are already logged into; nothing is kept on disk. `--github` queries GitHub through `gh` for live counts.
+  `AI_COST_OFFLINE=1` turns the price check and the usage report off.
 - The statements above describe the core. A plugin you configure (an entry point, the `plugins` list,
   `AI_COST_PLUGINS`, or the marker of a bundled build) is third-party code that runs in this process with its own
   file and network access; review a plugin as you would any other program you run.

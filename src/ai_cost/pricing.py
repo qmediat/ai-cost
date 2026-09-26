@@ -13,6 +13,8 @@ from typing import Callable
 from .config import Config, PriceBook
 from .errors import PricingError
 from .models import (
+    ELAPSED_RUNNER,
+    Billing,
     Money,
     PeakOffpeakPrice,
     PerUnitPrice,
@@ -193,25 +195,41 @@ def price_peak_offpeak(row: UsageRow, entry: PriceEntry, book: PriceBook, config
     return Money(usd, "peak" if peak else "off-peak")
 
 
+REPORTED_ON_THE_BILL = "a count: the amount is in the GitHub usage report (providers.github.bill)"
+NO_PRICE = "a count: a Copilot review has no price — providers.github.bill reads the amounts"
+
+
+def on_the_bill(row: UsageRow) -> bool:
+    """A GitHub row whose amount the read usage report holds (``settled_by`` marked it ``API_SETTLED``): a count."""
+    return row.provider == Provider.GITHUB and row.invoice is None and row.billing is Billing.API_SETTLED
+
+
+def _minutes_said(name: str, minutes: float, rates: Mapping[str, float]) -> str:
+    if name in rates:
+        return f"{name} {minutes:.0f} min"
+    if name == ELAPSED_RUNNER:
+        return f"{minutes:.0f} min elapsed without a billable time (no /timing): not priced"
+    return f"{name} {minutes:.0f} min: no list price for this runner, not priced"
+
+
+def _minutes_price(by_os: Mapping[str, float], rates: Mapping[str, float]) -> Money:
+    """Billable minutes of a runner the price list names; other minutes (an elapsed time, an unknown runner) unpriced."""
+    usd = sum(minutes * rates[name] for name, minutes in by_os.items() if name in rates)
+    return Money(usd, ", ".join(_minutes_said(name, minutes, rates) for name, minutes in by_os.items()))
+
+
 def price_per_unit(row: UsageRow, entry: PriceEntry, book: PriceBook, config: Config) -> Money:
-    """GitHub: Copilot reviews × credits × overage price; Actions minutes × per-OS rate (public repos free)."""
+    """GitHub counts: a Copilot review has no price (ADR-0007); Actions billable minutes × the per-runner list price."""
     assert isinstance(entry, PerUnitPrice)
     tokens = row.tokens
     if row.kind is RowKind.COPILOT:
-        units = tokens.reviews * entry.units_per_review
-        return Money(
-            units * entry.overage_usd_per_unit, f"{tokens.reviews} reviews × {entry.units_per_review} credits"
-        )
+        return Money(0.0, REPORTED_ON_THE_BILL if config.github.bill is not None else NO_PRICE)
     if not tokens.billable and entry.public_repos_free:
         return Money(0.0, "public repo, minutes free")
     rates = entry.usd_per_minute
     if tokens.by_os:
-        usd = sum(
-            minutes * rates.get(name, rates.get("linux", 0.0)) for name, minutes in tokens.by_os.items()
-        )
-        return Money(usd, ", ".join(f"{name} {minutes:.0f} min" for name, minutes in tokens.by_os.items()))
-    per_minute = rates.get(config.github.actions_runner, rates.get("linux", 0.0))
-    return Money(tokens.minutes * per_minute, f"{tokens.minutes:.0f} min")
+        return _minutes_price(tokens.by_os, rates)
+    return _minutes_price({config.github.actions_runner: tokens.minutes}, rates)
 
 
 PRICERS: Mapping[type, Pricer] = {
@@ -228,10 +246,25 @@ def entry_for(row: UsageRow, book: PriceBook) -> PriceEntry | None:
     return book.entry(row.provider, row.model)
 
 
-def price(row: UsageRow, book: PriceBook, config: Config) -> Money:
-    """List price of one row; reported cost when unpriced or when the row has no counters to price; else ``PricingError``."""
+def _own_figure(row: UsageRow, config: Config) -> Money | None:
+    """A row whose amount is not a list price: a usage-report line, a GitHub count under a report, a cost-only line."""
+    if row.invoice is not None:
+        return Money(row.invoice.gross, "usage report, gross")
+    if on_the_bill(row):
+        return Money(0.0, REPORTED_ON_THE_BILL)
     if row.cost_reported is not None and row.tokens == Tokens():  # a cost-only line: nothing to price at list
         return Money(float(row.cost_reported), "reported charge (no counters)")
+    return None
+
+
+def price(row: UsageRow, book: PriceBook, config: Config) -> Money:
+    """List price of one row; reported cost when unpriced or when the row has no counters to price; else ``PricingError``.
+
+    A usage-report line is its own list price: the gross amount, before anything a plan includes (ADR-0007).
+    """
+    own = _own_figure(row, config)
+    if own is not None:
+        return own
     entry = entry_for(row, book)
     if entry is None:
         if row.cost_reported is not None:

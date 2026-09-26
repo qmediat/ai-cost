@@ -12,7 +12,14 @@ from dataclasses import dataclass
 
 from .config import Config, PriceBook
 from .errors import UsageError
-from .groups import AttributionGroup, AttributionLine, api_group, real_group, subscription_shares
+from .groups import (
+    AttributionGroup,
+    AttributionLine,
+    api_group,
+    invoice_shares,
+    real_group,
+    subscription_shares,
+)
 from .models import Provider, Scope, TokenTierPrice, UsageRow, Window
 from .pricing import current_price, entry_for
 
@@ -93,7 +100,8 @@ def _subscription_split(
         ).lines:  # one line per model: every model of a provider counts
             weights_of[line.provider.value] = weights_of.get(line.provider.value, 0.0) + line.usd
     out = dict.fromkeys(labelled, 0.0)
-    for share in subscription_shares(config, book, window):
+    every_row = [row for rows in labelled.values() for row in rows]
+    for share in subscription_shares(config, book, window, every_row) + invoice_shares(every_row):
         weights = {label: usd.get(share.provider, 0.0) for label, usd in by_label_provider.items()}
         total = sum(weights.values())
         if total <= 0:

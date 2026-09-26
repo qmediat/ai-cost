@@ -13,8 +13,10 @@ from typing import Any
 from unittest import mock
 
 from .. import cli, ops
+from .. import daily as daily_module
+from ..collectors.github_bill import BillResult
 from ..collectors.grok_build import TICKS_PER_USD
-from ..config import Config, Paths, PriceBook
+from ..config import Config, GithubSettings, Paths, PriceBook
 from ..daily import (
     DailyIndex,
     Output,
@@ -26,7 +28,7 @@ from ..daily import (
     read_index,
 )
 from ..errors import ToolError, UsageError
-from ..models import Tokens
+from ..models import BillAccount, BillScope, BillSummary, Tokens
 from ..ops import (
     DAILY_CADENCE,
     DAILY_JOB,
@@ -514,3 +516,189 @@ def test_reconcile_says_rows_of_clients_outside_scope_apart_from_the_rule_to_set
     assert any(
         "1 row(s) of unknown billing" in t and "set providers.openai.billing" in t for t in mixed
     ), mixed
+
+
+def _billed(paths: Paths) -> tuple[Config, PriceBook]:
+    _transcript(paths, paths.claude_home.parent / "proj", "p1", str(paths.claude_home.parent / "proj"))
+    config, book = defaults(paths)
+    return replace(config, github=GithubSettings(bill=BillAccount(BillScope.ORGANIZATION, "acme"))), book
+
+
+def _bill(days: tuple[date, ...], provisional: tuple[date, ...], missing: tuple[str, ...] = ()) -> BillResult:
+    return BillResult(summary=BillSummary("organization acme", BASE, days, provisional, (), (), (), missing))
+
+
+def _readable(reason: str = "") -> Any:
+    """``daily`` asks whether the report can be read before a re-read: here it can (or not, with ``reason``)."""
+    return mock.patch.object(daily_module, "bill_unreadable", return_value=reason)
+
+
+def test_a_day_whose_github_usage_report_was_read_too_soon_is_rewritten_by_the_next_run(
+    tmp_path: Path,
+) -> None:
+    paths = paths_in(tmp_path)
+    config, book = _billed(paths)
+    lines: list[str] = []
+    output = Output(lines.append, lines.append)
+    with mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), (DAY,))):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, output)
+    assert read_index(paths.reports_dir / DAY.isoformat() / "index.json").github_provisional == (
+        DAY.isoformat(),
+    )
+    later = DAY + timedelta(days=3)  # a missed run in between: the day is still found
+    with _readable(), mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), ())):
+        daily_reports(paths, config, book, later, paths.reports_dir, output)
+        assert read_index(paths.reports_dir / DAY.isoformat() / "index.json").github_provisional == ()
+        reread = f"daily {DAY}: its GitHub usage report was not final when written — reading it again"
+        assert lines.count(reread) == 1
+        daily_reports(paths, config, book, later, paths.reports_dir, output)
+    assert lines.count(reread) == 1, "a final day is not read again"
+
+
+def test_a_failed_reread_keeps_the_day_as_written_and_tries_again_next_run(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    config, book = _billed(paths)
+    lines: list[str] = []
+    output = Output(lines.append, lines.append)
+    with mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), (DAY,))):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, output)
+    written = (paths.reports_dir / DAY.isoformat() / "global.json").read_text()
+    unread = _bill((), (), ("2026-09: gh is not installed",))
+    with _readable(), mock.patch.object(ops, "collect_bill", return_value=unread):
+        daily_reports(paths, config, book, DAY + timedelta(days=1), paths.reports_dir, output)
+    assert (
+        paths.reports_dir / DAY.isoformat() / "global.json"
+    ).read_text() == written, "a failed read replaces nothing"
+    assert f"daily {DAY}: kept as written — the GitHub usage report could not be read again" in lines
+    assert read_index(paths.reports_dir / DAY.isoformat() / "index.json").github_provisional == (
+        DAY.isoformat(),
+    )
+    next_day = read_index(paths.reports_dir / (DAY + timedelta(days=1)).isoformat() / "index.json")
+    assert next_day.github_provisional == (
+        (DAY + timedelta(days=1)).isoformat(),
+    ), "an unread day is not final"
+
+
+def test_a_scheduled_job_carries_the_installing_shells_path(tmp_path: Path) -> None:
+    line = ops.job_cron_line(
+        DAILY_JOB, DAILY_CADENCE, ["ai-cost", "daily"], tmp_path / "log", "/opt/homebrew/bin:/usr/bin"
+    )
+    assert " PATH=/opt/homebrew/bin:/usr/bin ai-cost daily >> " in line
+    plist = ops._plist(
+        DAILY_JOB, DAILY_CADENCE, ["ai-cost", "daily"], tmp_path / "log", "/opt/homebrew/bin:/usr/bin"
+    )
+    assert (
+        "<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin</string></dict>"
+        in plist
+    )
+    assert "EnvironmentVariables" not in ops._plist(DAILY_JOB, DAILY_CADENCE, ["ai-cost"], tmp_path / "log")
+
+
+def test_doctor_flags_a_daily_job_that_cannot_find_gh_for_the_usage_report(tmp_path: Path) -> None:
+    lines: list[str] = []
+    problems: list[str] = []
+
+    def line(good: bool, text: str) -> None:
+        (lines if good else problems).append(text)
+
+    with (
+        mock.patch.object(ops, "schedule_installed", return_value=True),
+        mock.patch.object(ops, "job_has_path", return_value=False),
+    ):
+        ops._doctor_daily_job(line, lines.append, bill=True)
+        ops._doctor_daily_job(line, lines.append, bill=False)
+    assert len(problems) == 1 and "installed without a PATH" in problems[0]
+    assert lines == [
+        "  ok  scheduled daily reports: installed"
+    ], "without a usage report the PATH does not matter"
+
+
+def test_a_project_with_only_the_usage_reports_seat_is_no_project_of_the_day(tmp_path: Path) -> None:
+    from ..collectors.github_bill import BillResult
+    from ..config import GithubSettings
+    from ..models import (
+        BillAccount,
+        Billing,
+        BillScope,
+        InvoiceAmounts,
+        Provider,
+        RowKind,
+        Scope,
+        Tokens,
+        UsageRow,
+    )
+
+    paths = paths_in(tmp_path)
+    _transcript(paths, tmp_path / "idle", "i1", str(tmp_path / "idle"), tokens=0)  # touched, no usage
+    config, book = defaults(paths)
+    config = replace(config, github=GithubSettings(bill=BillAccount(BillScope.ORGANIZATION, "acme")))
+    seat = UsageRow(
+        Provider.GITHUB,
+        "Copilot Business",
+        RowKind.INVOICE,
+        BASE,
+        "acme@day",
+        Billing.SUBSCRIPTION,
+        Tokens(),
+        scope=Scope(),
+        source="github-bill",
+        invoice=InvoiceAmounts(DAY, "UserMonths", 0.066666666, 19.0, 1.266666654, 0.0, 1.266666654),
+    )
+    lines: list[str] = []
+    with mock.patch.object(ops, "collect_bill", return_value=BillResult(rows=[seat])):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, Output(lines.append, lines.append))
+    index = read_index(paths.reports_dir / DAY.isoformat() / "index.json")
+    assert index.projects == () and any(
+        "idle: no usage rows in the day" in note for note in index.notes
+    ), index
+
+
+def test_a_not_final_day_is_read_again_only_recently_and_only_when_the_report_can_be_read(
+    tmp_path: Path,
+) -> None:
+    from ..daily import REREAD_DAYS
+
+    paths = paths_in(tmp_path)
+    config, book = _billed(paths)
+    lines: list[str] = []
+    output = Output(lines.append, lines.append)
+    with mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), (DAY,))):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, output)
+    with (
+        _readable("HTTP 404"),
+        mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), (DAY,))) as built,
+    ):
+        daily_reports(paths, config, book, DAY + timedelta(days=1), paths.reports_dir, output)
+    assert f"daily {DAY}: kept as written — the GitHub usage report cannot be read (HTTP 404)" in lines
+    assert built.call_count >= 1 and not any(line.startswith(f"daily {DAY}: its GitHub") for line in lines)
+    far = DAY + timedelta(days=REREAD_DAYS + 1)
+    with _readable(), mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), (DAY,))):
+        daily_reports(paths, config, book, far, paths.reports_dir, output)
+    assert not any(
+        line.startswith(f"daily {DAY}: its GitHub") for line in lines
+    ), "older than the bound: not read"
+
+
+def test_a_hand_run_of_a_written_day_during_an_outage_keeps_it(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    config, book = _billed(paths)
+    lines: list[str] = []
+    output = Output(lines.append, lines.append)
+    with mock.patch.object(ops, "collect_bill", return_value=_bill((DAY,), ())):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, output)
+    written = (paths.reports_dir / DAY.isoformat() / "global.json").read_text()
+    with mock.patch.object(ops, "collect_bill", return_value=_bill((), (), ("2026-09: HTTP 503",))):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, output)
+    assert (paths.reports_dir / DAY.isoformat() / "global.json").read_text() == written
+    assert f"daily {DAY}: kept as written — the GitHub usage report could not be read again" in lines
+
+
+def test_a_day_with_unreadable_report_lines_is_not_final(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    config, book = _billed(paths)
+    short = BillResult(summary=BillSummary("organization acme", BASE, (DAY,), (), (), (), (), (), 1))
+    with mock.patch.object(ops, "collect_bill", return_value=short):
+        daily_reports(paths, config, book, DAY, paths.reports_dir, Output(lambda _: None, lambda _: None))
+    assert read_index(paths.reports_dir / DAY.isoformat() / "index.json").github_provisional == (
+        DAY.isoformat(),
+    )

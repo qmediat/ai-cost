@@ -3,6 +3,47 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-09-26
+
+### Changed
+
+- **A Copilot code review has no price.** Since 2026-06-01 GitHub bills Copilot in AI credits (0.01 USD each) and does
+  not disclose the review model: every review consumes its own number of credits. The constant 13 × 0.04 USD = 0.52
+  USD a review (the old premium-request rule) is gone from the price list, the price check and the pricing; a
+  Copilot review row is a count. The amounts come from the account's usage report (below).
+- `providers.github.copilot_plan_exhausted` is no longer read; a config that still sets it gets a header warning and
+  a `doctor` problem naming `providers.github.bill`.
+- Actions minutes of `--github`: a run without `/timing` shows its elapsed time under `elapsed` and is never priced
+  (it is not what GitHub bills); a runner the price list does not name is not priced at the Linux rate any more.
+
+### Added
+
+- **`providers.github.bill`** — `{"scope": "organization" | "user", "name": "<account>"}`: every report reads the
+  account's usage report through `gh` (`…/settings/billing/usage`, one call per month the window touches, nothing
+  kept on disk) and prices GitHub from it: Copilot credits (API-only = gross, real = net) and seats (a subscription
+  share, replacing a configured plan whose seats it bills, `copilot-business` for "Copilot Business"), and the
+  Actions of the repositories named with `--github`. Only the UTC days that lie whole inside the window and have
+  ended enter the totals; the others are listed with their exact amounts, never prorated. With `bill` set, every
+  other GitHub row of a month whose report was read (a count, a plugin's row, a logged charge) is settled by it, so
+  nothing is booked twice; a month that could not be read settles nothing (a failed read never zeroes an amount). An
+  enterprise is refused: its report leaves out the usage assigned to cost centers — name the organization.
+- `--github` Actions minutes are one row per repository and UTC day of the runs' start (the usage report bills per
+  day), no longer one row for the whole window.
+- The report's **"GitHub usage report"** section and JSON `github_bill`: the report's own figures, exact (amounts as
+  text in JSON) — the counted subtotals per product / SKU / unit, what is left out, the days outside the totals, the
+  months not read and why.
+- `doctor` reads the account's report once: readable with its newest day, or the reason (404: who can read it).
+- A day read less than 12 h after it ended is provisional (GitHub updates Actions storage within 6 to 12 hours):
+  `daily` records it — and a day whose report could not be read — in `index.json` (`github_provisional`), and every
+  later run reads each such day of the last 7 again once the report can be read; a day already written keeps its
+  files whenever its report cannot be read (a re-read or a hand-run `daily --date`). `monitor` lists the
+  GitHub amounts its window leaves out in the new `outside` field of its history line.
+- Scheduled jobs (launchd, cron) carry the PATH of the shell that installs them: launchd's own finds no Homebrew
+  `gh`. With `providers.github.bill` set, `doctor` flags a daily job installed before 2.6 — run
+  `ai-cost install --schedule-reports` again.
+- Header warnings: Copilot reviews counted but not priced (no usage report), a configured GitHub plan booked beside
+  the seats the report bills, and a `github.copilot` block left in the user's prices file.
+
 ## [2.5.0] - 2026-09-26
 
 ### Changed

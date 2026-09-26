@@ -146,7 +146,7 @@ def test_github_failed_queries_are_skipped_not_zero(tmp_path: Path) -> None:
     original = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{folder}{os.pathsep}{original}"
     try:
-        collected = collect_github(["acme/private"], WINDOW, "linux")
+        collected = collect_github(["acme/private"], WINDOW)
     finally:
         os.environ["PATH"] = original
     assert collected.rows == []
@@ -165,7 +165,7 @@ def test_github_misshapen_json_is_unknown_not_zero(tmp_path: Path) -> None:
     original = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{folder}{os.pathsep}{original}"
     try:
-        collected = collect_github(["acme/private"], WINDOW, "linux")
+        collected = collect_github(["acme/private"], WINDOW)
     finally:
         os.environ["PATH"] = original
     assert collected.rows == [] and len(collected.skipped) == 2
@@ -183,7 +183,7 @@ def test_github_failed_review_lookup_skips_the_repository(tmp_path: Path) -> Non
     original = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{folder}{os.pathsep}{original}"
     try:
-        collected = collect_github(["acme/private"], WINDOW, "linux")
+        collected = collect_github(["acme/private"], WINDOW)
     finally:
         os.environ["PATH"] = original
     assert [r.model for r in collected.rows] == [
@@ -197,14 +197,14 @@ def test_github_reviews_and_billable_minutes(tmp_path: Path) -> None:
     original = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{folder}{os.pathsep}{original}"
     try:
-        collected = collect_github(["acme/private"], WINDOW, "windows")
+        collected = collect_github(["acme/private"], WINDOW)
     finally:
         os.environ["PATH"] = original
     actions = next(r for r in collected.rows if r.model == "actions")
     copilot = next(r for r in collected.rows if r.model == "copilot-code-review")
     assert copilot.tokens.reviews == 1, "only reviews submitted inside the window"
-    assert actions.tokens.by_os == {"linux": 3.5, "macos": 1.0, "windows": 2.0} and actions.tokens.billable
-    assert any("no /timing" in s.reason for s in collected.skipped)
+    assert actions.tokens.by_os == {"linux": 3.5, "macos": 1.0, "elapsed": 2.0} and actions.tokens.billable
+    assert any("no /timing — elapsed time shown, not priced" in s.reason for s in collected.skipped)
 
 
 def test_bad_usage_is_a_counted_skip(tmp_path: Path) -> None:
@@ -550,22 +550,26 @@ def test_a_malformed_timing_block_is_a_counted_skip_with_elapsed_time_used() -> 
     }
     skipped: list[Skipped] = []
     with mock.patch.object(github_module, "gh", return_value=json.dumps({"billable": {"UBUNTU": "oops"}})):
-        minutes = github_module._minutes("o/r", [run], WINDOW, "linux", skipped)
-    assert round(minutes["linux"], 3) == 3.0 and skipped and "malformed /timing" in skipped[0].reason, (
+        minutes = github_module._minutes("o/r", [run], WINDOW, skipped)
+    assert (
+        round(minutes[WINDOW.start.date()]["elapsed"], 3) == 3.0
+        and skipped
+        and "malformed /timing" in skipped[0].reason
+    ), (
         minutes,
         skipped,
     )
     skipped.clear()
     stringy = json.dumps({"billable": {"UBUNTU": {"total_ms": "1e9"}}})
     with mock.patch.object(github_module, "gh", return_value=stringy):
-        github_module._minutes("o/r", [run], WINDOW, "linux", skipped)
+        github_module._minutes("o/r", [run], WINDOW, skipped)
     assert skipped and "total_ms is not a non-negative number" in skipped[0].reason, skipped
     for bad in (False, "", -5, float("inf"), float("nan"), 10**400):
         skipped.clear()
         with mock.patch.object(
             github_module, "gh", return_value=json.dumps({"billable": {"UBUNTU": {"total_ms": bad}}})
         ):
-            github_module._minutes("o/r", [run], WINDOW, "linux", skipped)
+            github_module._minutes("o/r", [run], WINDOW, skipped)
         assert skipped and "not a non-negative number" in skipped[0].reason, (bad, skipped)
     assert "total_ms is not a non-negative number below" in skipped[0].reason
 
@@ -615,7 +619,7 @@ def test_a_run_without_timing_or_elapsed_time_is_a_counted_loss() -> None:
     with mock.patch.object(
         github_module, "gh", return_value=json_module.dumps({"billable": {"UBUNTU": "oops"}})
     ):
-        assert github_module._minutes("o/r", [run], WINDOW, "linux", skipped) == {}
+        assert github_module._minutes("o/r", [run], WINDOW, skipped) == {}
     assert (
         skipped and "run not counted" in skipped[0].reason and "malformed /timing" in skipped[0].reason
     ), skipped
@@ -629,7 +633,7 @@ def test_a_run_without_a_created_at_is_a_counted_loss() -> None:
 
     skipped: list[Skipped] = []
     with mock.patch.object(github_module, "gh", return_value="{}"):
-        assert github_module._minutes("o/r", [{"databaseId": 9}], WINDOW, "linux", skipped) == {}
+        assert github_module._minutes("o/r", [{"databaseId": 9}], WINDOW, skipped) == {}
     assert skipped and "no createdAt" in skipped[0].reason, skipped
 
 
@@ -668,3 +672,29 @@ def test_a_rule_never_bills_a_client_outside_scope(tmp_path: Path) -> None:
         "sid-exec": Billing.API,
         "sid-app-plan": Billing.SUBSCRIPTION,
     }, "the rule is for the tracked work; a plan the file names still counts"
+
+
+def test_github_actions_minutes_are_one_row_per_utc_day_of_the_runs(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+    from unittest import mock
+
+    from ..collectors import github as github_module
+    from ..models import Skipped, Window
+
+    across = Window(
+        datetime(2026, 8, 31, 22, tzinfo=timezone.utc), datetime(2026, 9, 1, 2, tzinfo=timezone.utc)
+    )
+    runs = [
+        {"databaseId": 1, "createdAt": "2026-08-31T23:00:00Z", "updatedAt": "2026-08-31T23:05:00Z"},
+        {"databaseId": 2, "createdAt": "2026-09-01T01:00:00Z", "updatedAt": "2026-09-01T01:03:00Z"},
+    ]
+    skipped: list[Skipped] = []
+    with mock.patch.object(
+        github_module, "gh", return_value=None
+    ):  # no /timing: elapsed minutes, never priced
+        rows = github_module._actions_rows("acme/widgets", across, skipped, runs, "true")
+    assert [(row.at.isoformat() if row.at else "", row.tokens.by_os) for row in rows] == [
+        ("2026-08-31T22:00:00+00:00", {"elapsed": 5.0}),
+        ("2026-09-01T00:00:00+00:00", {"elapsed": 3.0}),
+    ], "each day's minutes are settled by that day's month of the usage report"
+    assert github_module._actions_rows("acme/widgets", across, skipped, [], "true")[0].tokens.minutes == 0

@@ -15,14 +15,15 @@ Grok Build CLI, your own scripts and applications, or anything a plugin can read
 | group | question it answers | how |
 |---|---|---|
 | **real** | What did *you* pay? | Subscriptions prorated to the window + pay-per-token API keys at list price. No promos, no negotiated discounts. |
-| **api** | What would the same tokens cost on pay-per-use APIs alone, as if no subscription existed? | Every token at the provider's list price, cache tiers applied the way the APIs bill. GitHub included: Copilot code reviews at the per-credit overage, Actions minutes at the per-minute price (private repos). |
+| **api** | What would the same tokens cost on pay-per-use APIs alone, as if no subscription existed? | Every token at the provider's list price, cache tiers applied the way the APIs bill. GitHub included: the account's usage report at gross — Copilot credits, and Actions of the repositories you name (a Copilot review has no price of its own). |
 | **vendor** | What would an outside firm have quoted for the same scope? | Effort bands per item × three staffing options (junior / mid / senior differ in rate *and* in time, juniors get senior review), packaged with an integration allowance, minimum size and rounding. |
 
 It is a Python 3 package (stdlib only) shipped as one executable file: a zipapp that
 `python3 scripts/build.py src dist/ai-cost` builds from `src/ai_cost/`, tests included. It reads what is already on disk — Claude Code
 transcripts, Codex CLI rollouts, Gemini CLI sessions, Grok Build CLI sessions, the usage log any program can write —
 and whatever a plugin adds. Nothing is sent anywhere. The network is used only when asked for: the optional price-drift check reads the
-vendors' public pricing pages, and `--github` queries GitHub through `gh` for live counts.
+vendors' public pricing pages, a GitHub account named in `providers.github.bill` has its usage report read through `gh`,
+and `--github` queries GitHub through `gh` for live counts.
 
 ```
 $ ai-cost report --session latest
@@ -55,7 +56,7 @@ ai-cost install --schedule-reports   # yesterday's global + per-project reports 
 ai-cost doctor                   # sources, your plans, how each provider was billed, prices, schedules — every !! line names what is missing
 ```
 
-Requirements: Python ≥ 3.9 (also under npm, which only starts it). `gh` only for `--github`.
+Requirements: Python ≥ 3.9 (also under npm, which only starts it). `gh` only for `--github` and `providers.github.bill`.
 
 ## Commands
 
@@ -97,7 +98,8 @@ could not place. A git worktree is its own project. `--all-projects` and `--sess
 | Gemini CLI sessions | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (older versions: `.json`) | one row per model message (streamed repeats of one message id counted once); `input` includes `cached`, `thoughts` are billed as output. `~/.gemini/projects.json` maps the folder (a name, or the sha256 of the path in older versions) to the working directory |
 | Grok Build CLI sessions | `~/.grok/sessions/<working directory, URL-encoded>/<session>/usage.json` (`GROK_HOME` overrides the home) | one row per turn and model: `inputTokens` (includes `cachedReadTokens`), `outputTokens` + `reasoningTokens` as output, `modelCalls` as the requests, `costUsdTicks / 1e10` as the CLI's own cost estimate — `real` uses it when `providers.xai.trust_cli_cost` (default), `api` prices at list; billing follows `providers.xai.billing` |
 | usage log | `$XDG_DATA_HOME/ai-cost/usage.jsonl` (`AI_COST_USAGE_LOG` overrides; more files in config `usage_logs`) | one JSON line per request that any program writes — `ai-cost log` or the schema below; provider-native counters, `cost` when the program knows it, `event_id` read once |
-| GitHub (optional) | `gh` | Copilot reviews submitted inside the window, Actions **billable** minutes per runner OS (`/actions/runs/{id}/timing`, elapsed time as fallback), private/public |
+| GitHub usage report (optional) | `gh api <organizations\|users>/<name>/settings/billing/usage` (`providers.github.bill`) | one row per report line of the UTC days that lie whole inside the window and have ended: Copilot credits (API-only = gross, real = net) and seats (a subscription share), Actions of the repositories named with `--github`; the other days and products with their exact amounts in the report's "GitHub usage report" section (JSON `github_bill`, amounts as text) — never prorated, never estimated |
+| GitHub counts (optional) | `gh` (`--github owner/repo`) | Copilot reviews submitted inside the window (a count: a review has no price), Actions **billable** minutes per runner OS (`/actions/runs/{id}/timing`; a run without it shows its elapsed time, never priced), private/public |
 | plugins | whatever they read | see below |
 
 A row's billing comes first from what its source saw (a named plan, a log line's `billing` key), then from the
@@ -185,8 +187,12 @@ price it applies differently — never a number to hide.
 
 Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`[start, end]`), `window_hours`,
 `row_count`, `sources`, `warnings`, `skipped` (`[{source, path, reason}]`), `prices_checked_at`, `real`
-(`subscriptions[]`, `usage[]`, `cash_usd`, `subscription_usd`, `total_usd`, `unknown_billing`, `unknown_by_provider`, `unfigured_ledger`), `api` (`lines[]`,
-`total_usd`), `vendor` (when items exist), `attribution` (with `--attribute`). A line's `calls` is what it folded in
+(`subscriptions[]` — a share the usage report states has `attribution` `invoice`, `seats` 0 and its user-months in
+`note` —, `usage[]`, `cash_usd`, `subscription_usd`, `total_usd`, `unknown_billing`, `unknown_by_provider`, `unfigured_ledger`), `api` (`lines[]`,
+`total_usd`), `vendor` (when items exist), `attribution` (with `--attribute`), `github_bill` (with `providers.github.bill`:
+`account`, `read_at`, `days`, `provisional`, `counted[]` / `left_out[]` (`product`, `sku`, `unit`, `lines`, `quantity`,
+`gross`, `discount`, `net` — amounts as exact text), `outside[]` (days the window only touches), `missing` (months not
+read, with the reason)). A line's `calls` is what it folded in
 (rows, review runs, Copilot reviews — the `Runs` column) and `model_calls` the API requests its sources reported
 (`Model calls`; 0 where none does); `--detail` adds `rows[]`, where
 `client` is the program that wrote the session (a Codex rollout's `originator`), `cost_reported` is the source's
@@ -194,7 +200,8 @@ own figure for the row: cash for an `api` row (a charge the source reported), th
 source's list-price estimate for a `subscription` row (never counted as cash; the API-equivalent fallback when the
 model has no list price), a part of the session's figure when a session spans several rows; `source` names the
 source that produced the row and `kind` its record shape (`transcript`, `session`, `chat`, `log`, `ledger`,
-`review`, `copilot`, `actions`). Every dataclass property is serialised, so computed totals are always present.
+`review`, `copilot`, `actions`, `invoice` — a usage-report line, its amounts in `invoice`). Every dataclass property is
+serialised, so computed totals are always present.
 Changes since 1.0: `window` is an object (the list moved to `window_iso`), `seats` multiply only per-seat plans, an
 unpriced model exits 5 unless `--unpriced skip`.
 
@@ -203,7 +210,9 @@ unpriced model exits 5 unless `--unpriced skip`.
 `~/.config/ai-cost/config.json` (`install --init-config` writes it from the shipped defaults,
 [`src/ai_cost/data/config.json`](https://github.com/qmediat/ai-cost/blob/main/src/ai_cost/data/config.json); it ships no subscriptions, add yours) — subscriptions
 (plan, seats, attribution `time` | `full` | `none`), provider billing switches (`providers.<name>.billing`, the rule for that provider's rows that carry no billing evidence of their own — a plugin's xai or deepseek rows follow it as the built-in sources follow `anthropic.billing`,
-`openai.billing`, `google.billing` for Gemini CLI sessions, `github.copilot_plan_exhausted`, `xai.trust_cli_cost` — a
+`openai.billing`, `google.billing` for Gemini CLI sessions, `github.bill` — `{"scope": "organization" | "user", "name": …}`,
+the account whose usage report prices GitHub (an owner or billing manager can read it; with it, every other GitHub row
+is a count), `github.actions_plan_exhausted` for `--github` minutes without one, `xai.trust_cli_cost` — a
 positive CLI-reported cost is the row's
 cash, 0 or absent means the CLI did not price the run and the list price applies), budgets for `monitor` (daily / monthly 0 by
 default = no check; a provider listed with 0 = any spend is a breach), item sizing thresholds,
@@ -234,7 +243,7 @@ and [`references/vendor-pricing.md`](https://github.com/qmediat/ai-cost/blob/mai
 
 `src/ai_cost/` is the package: `models.py` (the typed data — `UsageRow`, `Tokens`, `Window`, `WorkItem`, `Report`),
 `pricing.py` (one pricer per price shape, chosen from a dispatch table), `groups.py` (real / api / vendor),
-`collectors/` (one module per built-in source — `claude`, `codex`, `gemini_cli`, `grok_build`, `github`, `usage_log` — each
+`collectors/` (one module per built-in source — `claude`, `codex`, `gemini_cli`, `grok_build`, `github`, `github_bill`, `usage_log` — each
 returning `Collected` rows plus counted `Skipped` records), `plugins.py` (the source / enricher protocol and
 discovery), `config.py` with `data/{prices,config}.json`, `prices_check.py`, `ops.py` (report assembly and the
 per-project scope, doctor, monitor, the scheduled jobs), `daily.py`, `reconcile.py`, `render.py`, `cli.py`. The design note and

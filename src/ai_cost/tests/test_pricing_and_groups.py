@@ -2,15 +2,37 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..config import Config, PriceBook, Subscription
+from ..attribution import attribution_group, parse_rules
+from ..config import Config, GithubSettings, PriceBook, Subscription
 from ..errors import ConfigError, PricingError
-from ..groups import api_group, real_group, subscription_shares, vendor_group
-from ..models import Billing, Provider, RowKind, Size, Tokens, UsageRow, WorkItem
-from ..pricing import is_peak, price
+from ..groups import (
+    INVOICE_ATTRIBUTION,
+    REPLACED_BY_THE_BILL,
+    api_group,
+    real_group,
+    subscription_shares,
+    vendor_group,
+)
+from ..models import (
+    BillAccount,
+    Billing,
+    BillScope,
+    InvoiceAmounts,
+    Money,
+    Provider,
+    RowKind,
+    Scope,
+    Size,
+    Tokens,
+    UsageRow,
+    WorkItem,
+)
+from ..pricing import NO_PRICE, REPORTED_ON_THE_BILL, is_peak, price
 from ..timeutil import parse_ts
 from .fixtures import BASE, WINDOW, defaults, paths_in
 
@@ -189,12 +211,13 @@ def test_deepseek_peak_calendar(tmp_path: Path) -> None:
     )
 
 
-def test_copilot_and_actions_per_unit(tmp_path: Path) -> None:
+def test_a_copilot_review_is_a_count_and_actions_minutes_keep_their_list_price(tmp_path: Path) -> None:
     config, book = _setup(tmp_path)
     reviews = _row(
         Provider.GITHUB, "copilot-code-review", Tokens(reviews=3), RowKind.COPILOT, Billing.SUBSCRIPTION
     )
-    assert abs(price(reviews, book, config).usd - 3 * 13 * 0.04) < 1e-9
+    assert price(reviews, book, config) == Money(0.0, NO_PRICE), "no price (ADR-0007), and no report read"
+    assert price(reviews, book, _billed(config)) == Money(0.0, REPORTED_ON_THE_BILL)
     private = _row(
         Provider.GITHUB,
         "actions",
@@ -207,6 +230,14 @@ def test_copilot_and_actions_per_unit(tmp_path: Path) -> None:
         Provider.GITHUB, "actions", Tokens(minutes=100, billable=False), RowKind.ACTIONS, Billing.SUBSCRIPTION
     )
     assert price(public, book, config).usd == 0
+    settled = replace(private, ref="ACME/widgets", billing=Billing.API_SETTLED)
+    assert price(settled, book, config) == Money(0.0, REPORTED_ON_THE_BILL), "the read report has them"
+    unknown = replace(private, tokens=Tokens(by_os={"ubuntu_arm": 30.0, "elapsed": 4.0}, billable=True))
+    said = price(unknown, book, config)
+    assert said.usd == 0 and said.note == (
+        "ubuntu_arm 30 min: no list price for this runner, not priced, "
+        "4 min elapsed without a billable time (no /timing): not priced"
+    )
 
 
 def test_unpriced_model_uses_reported_cost_or_fails_loud(tmp_path: Path) -> None:
@@ -266,7 +297,7 @@ def test_api_group_prices_every_call_and_skips_the_ledger(tmp_path: Path) -> Non
     openai = next(line for line in group.lines if line.provider == Provider.OPENAI)
     assert openai.calls == 2, "rollouts carry every Codex call; the ledger would double count"
     copilot = next(line for line in group.lines if line.provider == Provider.GITHUB)
-    assert copilot.calls == 3 and abs(copilot.usd - 3 * 13 * 0.04) < 1e-9
+    assert copilot.calls == 3 and copilot.usd == 0, "three reviews counted, none priced"
 
 
 def test_real_group_rules(tmp_path: Path) -> None:
@@ -289,11 +320,12 @@ def test_real_group_config_switches(tmp_path: Path) -> None:
         **{
             **config.__dict__,
             "subscriptions": (Subscription("claude-pro", seats=2, attribution="full"),),
-            "github": config.github.__class__(copilot_plan_exhausted=True),
+            "github": config.github.__class__(actions_plan_exhausted=True),
         }
     )
     group = real_group(_rows(), book, switched, WINDOW)
-    assert next(line for line in group.usage if line.provider == Provider.GITHUB).usd > 0
+    copilot = next(line for line in group.usage if line.provider == Provider.GITHUB)
+    assert copilot.usd == 0, "a Copilot review is a count whatever the switches say"
     flat_or_seat = book.plans["claude-pro"].per_seat
     assert group.subscription_usd == (40 if flat_or_seat else 20), "seats count only on a per-seat plan"
     assert subscription_shares(switched, book, WINDOW)[0].attribution == "full"
@@ -445,15 +477,8 @@ def test_the_xai_rule_follows_the_row_and_trusts_an_apps_own_cost(tmp_path: Path
     assert rule(estimate, book, distrust)[1].usd != 0.3, "the list price when not"
 
 
-def test_a_ledger_row_without_a_figure_is_unknown_and_a_github_row_follows_its_billing(
-    tmp_path: Path,
-) -> None:
-    from dataclasses import replace
-
-    from ..groups import real_group, real_rule
-    from .fixtures import WINDOW, defaults, paths_in
-
-    config, book = defaults(paths_in(tmp_path))
+def test_a_ledger_row_without_a_figure_is_unknown(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
     ledger = UsageRow(
         provider=Provider.of("acme"),
         model="m",
@@ -469,7 +494,10 @@ def test_a_ledger_row_without_a_figure_is_unknown_and_a_github_row_follows_its_b
     assert real.unknown_billing == 1 and [line.usd for line in real.usage] == [
         0.4
     ], "no figure: counted, never 0"
-    github = UsageRow(
+
+
+def _logged_review() -> UsageRow:
+    return UsageRow(
         provider=Provider.GITHUB,
         model="copilot-code-review",
         kind=RowKind.COPILOT,
@@ -479,14 +507,57 @@ def test_a_ledger_row_without_a_figure_is_unknown_and_a_github_row_follows_its_b
         billing=Billing.SUBSCRIPTION,
         tokens=Tokens(reviews=2),
     )
+
+
+def test_a_github_row_is_a_count_a_charge_or_minutes_by_its_own_evidence(tmp_path: Path) -> None:
+    from ..groups import real_rule
+
+    config, book = _setup(tmp_path)
+    github = _logged_review()
     rule = real_rule(Provider.GITHUB)
-    assert rule(github, book, config)[1].usd == 0.0, "a plan row within the allowance"
+    assert rule(github, book, config)[1].usd == 0.0, "a count"
     assert (
         rule(replace(github, cost_reported=0.35), book, config)[1].usd == 0.35
     ), "a reported charge is the charge"
+    assert rule(replace(github, billing=Billing.API), book, config)[1].usd == 0, "still a count: no price"
+    minutes = replace(github, model="actions", kind=RowKind.ACTIONS, tokens=Tokens(minutes=10, billable=True))
+    assert rule(minutes, book, config)[1] == Money(0.0, "within plan allowance")
     assert (
-        rule(replace(github, billing=Billing.API), book, config)[1].usd > 0
-    ), "an explicit pay-per-use row is cash"
+        rule(replace(minutes, billing=Billing.API), book, config)[1].usd > 0
+    ), "pay-per-use minutes are cash"
+
+
+def test_a_github_row_the_read_report_settles_is_never_booked(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
+    charged = replace(_logged_review(), cost_reported=0.35, tokens=Tokens(), billing=Billing.API_SETTLED)
+    ledger = replace(charged, kind=RowKind.LEDGER)
+    assert api_group([charged], book, config).total_usd == 0, "the report's gross has it"
+    assert real_group([charged, ledger], book, config, WINDOW).cash_usd == 0
+    unsettled = replace(ledger, billing=Billing.API)
+    assert (
+        real_group([unsettled], book, config, WINDOW).cash_usd == 0.35
+    ), "without a read report the ledger is cash"
+
+
+def test_only_a_month_the_report_was_read_for_settles_a_github_row() -> None:
+    from ..collectors.github_bill import settled_by
+    from ..models import BillSummary
+
+    acme = BillAccount(BillScope.ORGANIZATION, "acme")
+    read = BillSummary("organization acme", BASE, (), (), (), (), (), (), 0, (f"{BASE:%Y-%m}",))
+    unread = replace(read, months_read=(), missing=(f"{BASE:%Y-%m}: HTTP 404",))
+    minutes = _row(
+        Provider.GITHUB, "actions", Tokens(minutes=5, billable=True), RowKind.ACTIONS, Billing.SUBSCRIPTION
+    )
+    assert settled_by(replace(minutes, ref="ACME/widgets"), read, acme)
+    assert not settled_by(replace(minutes, ref="ACME/widgets"), unread, acme), "a failed read settles nothing"
+    assert not settled_by(
+        replace(minutes, ref="elsewhere/tool"), read, acme
+    ), "another owner's report is not read"
+    assert settled_by(
+        replace(_logged_review(), cost_reported=0.35), read, acme
+    ), "a logged charge: the report has it"
+    assert not settled_by(_row(Provider.XAI, "grok-4.6", Tokens(input=1)), read, acme)
 
 
 def test_a_provider_id_is_checked_on_every_construction_path() -> None:
@@ -522,3 +593,92 @@ def test_an_unknown_billing_row_is_never_cash_whatever_figure_it_carries(tmp_pat
     assert real.usage == [] and real.unknown_billing == 2, "a figure without a rule is an estimate, not cash"
     known = real_group([replace(row, billing=Billing.API)], book, config, WINDOW)
     assert [line.usd for line in known.usage] == [0.4], "a source that knows the key was charged says API"
+
+
+def _invoice(
+    sku: str, unit: str, quantity: float, gross: float, discount: float, workspace: str = ""
+) -> UsageRow:
+    amounts = InvoiceAmounts(
+        date(2026, 9, 24), unit, quantity, 0.01, gross, discount, round(gross - discount, 9)
+    )
+    return UsageRow(
+        Provider.GITHUB,
+        sku,
+        RowKind.INVOICE,
+        BASE,
+        f"{workspace}@2026-09-24",
+        Billing.SUBSCRIPTION if amounts.is_seat else Billing.API,
+        Tokens(),
+        scope=Scope(workspace=workspace),
+        source="github-bill",
+        invoice=amounts,
+    )
+
+
+def _billed(config: Config) -> Config:
+    return replace(config, github=GithubSettings(bill=BillAccount(BillScope.ORGANIZATION, "acme")))
+
+
+def test_a_usage_report_line_is_gross_as_if_nothing_were_included_and_net_as_billed(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
+    credits = _invoice("Copilot AI Credits", "AICredits", 119.057793, 1.19057793, 0.5, "acme/widgets")
+    assert price(credits, book, config) == Money(1.19057793, "usage report, gross")
+    api = api_group([credits], book, config).lines[0]
+    assert (api.label, api.usd, api.calls) == ("Copilot AI Credits", 1.19057793, 0), "an amount, not a run"
+    real = real_group([credits], book, config, WINDOW).usage[0]
+    assert real.usd == 0.69057793 and real.notes == {"usage report, net"}
+
+
+def test_a_seat_line_is_a_subscription_share_and_never_usage(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
+    seats = [
+        replace(_invoice("Copilot Business", "UserMonths", 0.066666666, 1.266666654, 0.0), ref=str(n))
+        for n in range(3)
+    ]
+    assert api_group(seats, book, config).lines == [], "a seat has no pay-per-use equivalent"
+    real = real_group(seats, book, _billed(config), WINDOW)
+    assert real.usage == [] and real.cash_usd == 0
+    share = next(s for s in real.subscriptions if s.attribution == INVOICE_ATTRIBUTION)
+    assert (share.plan, share.provider, share.usd) == ("Copilot Business", "github", 3.799999962)
+    assert share.note.startswith("0.199999998 user-months"), "the report's own figure, nine decimals"
+
+
+def test_a_configured_plan_gives_way_only_to_the_seats_the_usage_report_bills(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
+    planned = replace(config, subscriptions=(Subscription("copilot-business"), Subscription("copilot-pro")))
+    seat = _invoice("Copilot Business", "UserMonths", 0.066666666, 1.266666654, 0.0)
+    assert all(s.usd > 0 for s in subscription_shares(planned, book, WINDOW)), "no report read: prorated"
+    business, pro = subscription_shares(_billed(planned), book, WINDOW, [seat])
+    assert (business.usd, business.note) == (0.0, REPLACED_BY_THE_BILL), "the report bills these seats"
+    assert pro.usd > 0, "a personal plan the organization's report does not bill stays as configured"
+
+
+def test_attribution_splits_the_invoice_seats_like_a_plan(tmp_path: Path) -> None:
+    config, book = _setup(tmp_path)
+    rows = [
+        _invoice("Copilot AI Credits", "AICredits", 100, 1.0, 0.0, "acme/widgets"),
+        _invoice("Copilot AI Credits", "AICredits", 300, 3.0, 0.0, "acme/gadgets"),
+        _invoice("Copilot Business", "UserMonths", 0.066666666, 1.266666654, 0.0),
+    ]
+    rules = parse_rules(["widgets=/widgets$", "gadgets=/gadgets$"])
+    config = replace(config, subscriptions=())  # the seats alone: no configured plan shares the split
+    group = attribution_group(rows, rules, book, _billed(config), WINDOW)
+    by_label = {line.label: line for line in group.lines}
+    assert (
+        abs(by_label["widgets"].subscription_usd - 1.266666654 / 4) < 1e-12
+    ), "a quarter of the GitHub usage"
+    whole = real_group(rows, book, _billed(config), WINDOW).total_usd
+    assert abs(group.total_real_usd - whole) < 1e-12, "the lines sum to the real total, the seats included"
+
+
+def test_a_seat_price_change_inside_the_window_is_said_not_zeroed(tmp_path: Path) -> None:
+    from ..render import _real_section
+
+    config, book = _setup(tmp_path)
+    old = _invoice("Copilot Business", "UserMonths", 0.066666666, 1.266666654, 0.0)
+    assert old.invoice is not None
+    new = replace(old, ref="later", invoice=replace(old.invoice, unit_price=21.0))
+    real = real_group([old, new], book, replace(_billed(config), subscriptions=()), WINDOW)
+    share = next(s for s in real.subscriptions if s.attribution == INVOICE_ATTRIBUTION)
+    assert share.monthly_usd == 0.0 and "at 0.01 / 21.0 USD" in share.note
+    assert "| Copilot Business | — | — | invoice |" in "\n".join(_real_section(real, 24.0))

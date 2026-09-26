@@ -11,6 +11,7 @@ import copy
 import json
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
@@ -20,6 +21,8 @@ from typing import Any, TypeVar
 
 from .errors import ConfigError
 from .models import (
+    BillAccount,
+    BillScope,
     PeakOffpeakPrice,
     PerUnitPrice,
     PriceEntry,
@@ -145,11 +148,14 @@ class VendorProfile:
 
 @dataclass(frozen=True)
 class GithubSettings:
-    """Plan-state switches for the GitHub lines of the real group."""
+    """Where the GitHub amounts come from (``bill``, ADR-0007) and how ``--github`` Actions minutes are priced without it."""
 
-    copilot_plan_exhausted: bool = False
+    bill: BillAccount | None = None
     actions_plan_exhausted: bool = False
     actions_runner: str = "linux"
+    retired: tuple[
+        str, ...
+    ] = ()  # keys the config still sets that are no longer read (said in the report header)
 
 
 @dataclass(frozen=True)
@@ -232,6 +238,9 @@ class PriceBook:
     plans: Mapping[str, Plan]
     peak_hours_utc: tuple[tuple[int, int], ...]
     raw: JsonDict = field(default_factory=dict, compare=False, repr=False)
+    retired: tuple[
+        str, ...
+    ] = ()  # keys of the user's prices file that are no longer read (said in the header)
 
     def entry(self, provider: Provider, model: str) -> PriceEntry | None:
         """The price entry for a model; a dated id (``claude-opus-5-20261001``) resolves to its prefix."""
@@ -583,12 +592,40 @@ def _sizing(raw: Mapping[str, Any], where: str) -> Sizing:
     )
 
 
+RETIRED_GITHUB_KEYS = (
+    "copilot_plan_exhausted",
+)  # a Copilot review has no price since ai-cost 2.6 (ADR-0007)
+_ACCOUNT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def _bill(github: Mapping[str, Any], where: str) -> BillAccount | None:
+    """``providers.github.bill``: ``{"scope": organization|user, "name": …}``; absent or null = none."""
+    raw = _section(github, "bill", where)
+    if not raw:
+        return None
+    scope = _text(raw, "scope", f"{where}.bill")
+    if scope == "enterprise":
+        raise ConfigError(
+            f"{where}.bill: an enterprise report leaves out the usage assigned to cost centers — name the "
+            'organization instead ("scope": "organization")'
+        )
+    try:
+        kind = BillScope(scope)
+    except ValueError:
+        raise ConfigError(f"{where}.bill: scope must be organization or user, not {scope!r}") from None
+    name = _text(raw, "name", f"{where}.bill")
+    if not _ACCOUNT_NAME.fullmatch(name):
+        raise ConfigError(f"{where}.bill: name {name!r} is not a GitHub account name")
+    return BillAccount(kind, name)
+
+
 def _github_settings(providers: Mapping[str, Any], where: str) -> GithubSettings:
     github = _section(providers, "github", f"{where}: providers")
     return GithubSettings(
-        copilot_plan_exhausted=_flag(github, "copilot_plan_exhausted", f"{where}: providers.github", False),
+        bill=_bill(github, f"{where}: providers.github"),
         actions_plan_exhausted=_flag(github, "actions_plan_exhausted", f"{where}: providers.github", False),
         actions_runner=_text_or(github, "actions_runner", "linux", f"{where}: providers.github"),
+        retired=tuple(f"providers.github.{key}" for key in RETIRED_GITHUB_KEYS if key in github),
     )
 
 
@@ -822,15 +859,11 @@ def _plans(raw: Mapping[str, Any], where: str = "prices: plans") -> dict[str, Pl
 
 
 def _github(raw: Mapping[str, Any], where: str = "prices: github") -> PerUnitPrice:
-    copilot = _section(raw, "copilot", where)
     actions = _section(raw, "actions", where)
     minutes = _section(actions, "usd_per_minute", f"{where}.actions")
     return PerUnitPrice(
-        units_per_review=_integer(copilot, "units_per_code_review", f"{where}.copilot", 0),
-        overage_usd_per_unit=_number(copilot, "overage_usd_per_unit", f"{where}.copilot", 0),
         usd_per_minute={k: _number(minutes, k, f"{where}.actions.usd_per_minute") for k in minutes},
         public_repos_free=_flag(actions, "public_repos_free", f"{where}.actions", True),
-        copilot_source=_text_or(copilot, "source", "", f"{where}.copilot"),
         web_search_per_1000=_number(raw, "web_search_per_1000", where, 0),
     )
 
@@ -932,6 +965,7 @@ def parse_pricebook(base: JsonDict, over: JsonDict, where: str) -> PriceBook:
     github_raw["web_search_per_1000"] = tools.get("web_search_per_1000", 0)
     deepseek = _merged_provider(base_providers, over_providers, "deepseek", where)
     merged = _effective_registry(base, over, removed_plans)
+    github_over = _section(over_providers, "github", f"{where} (user file): providers")
     return PriceBook(
         checked_at=_date(merged, "checked_at", where) or date(2000, 1, 1),
         auto_check_days=_capped(
@@ -943,4 +977,5 @@ def parse_pricebook(base: JsonDict, over: JsonDict, where: str) -> PriceBook:
         plans=_plans(_section(merged, "plans", where), f"{where}: plans"),
         peak_hours_utc=_hour_pairs(deepseek, "peak_hours_utc", f"{where}: providers.deepseek"),
         raw=merged,
+        retired=("providers.github.copilot",) if "copilot" in github_over else (),
     )

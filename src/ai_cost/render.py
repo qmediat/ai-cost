@@ -8,11 +8,22 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from datetime import date, datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-from .groups import ApiGroup, AttributionGroup, Line, RealGroup, Report, VendorGroup
-from .models import Provider, Tokens
+from .groups import (
+    INVOICE_ATTRIBUTION,
+    ApiGroup,
+    AttributionGroup,
+    Line,
+    RealGroup,
+    Report,
+    SubscriptionShare,
+    VendorGroup,
+)
+from .models import BillSubtotal, BillSummary, Provider, Tokens
+from .timeutil import iso
 
 
 def _fmt_usd(value: float) -> str:
@@ -60,6 +71,13 @@ def tokens_brief(tokens: Tokens) -> str:
     return ", ".join(parts)
 
 
+def _share_cells(share: SubscriptionShare) -> list[Any]:
+    """A share's row; one the usage report states has no seat count and, after a price change, no single price."""
+    invoice = share.attribution == INVOICE_ATTRIBUTION
+    monthly = "—" if invoice and not share.monthly_usd else _fmt_usd(share.monthly_usd)
+    return [share.plan, "—" if invoice else share.seats, monthly, share.attribution, _fmt_usd(share.usd)]
+
+
 def _real_section(group: RealGroup, hours: float) -> list[str]:
     lines = [
         "",
@@ -69,10 +87,7 @@ def _real_section(group: RealGroup, hours: float) -> list[str]:
         "",
         md_table(
             ["Subscription", "Seats", "Monthly USD", "Attribution", "Share USD"],
-            [
-                [s.plan, s.seats, _fmt_usd(s.monthly_usd), s.attribution, _fmt_usd(s.usd)]
-                for s in group.subscriptions
-            ],
+            [_share_cells(s) for s in group.subscriptions],
         ),
         "",
         md_table(
@@ -99,7 +114,7 @@ def _api_section(group: ApiGroup) -> list[str]:
         "",
         f"## 2. API-only cost (as if no subscription existed): {_fmt_usd(group.total_usd)} USD",
         "",
-        "Every token at the provider's pay-per-use list price (cache tiers applied, since that is how the APIs bill). Copilot reviews at the overage price per credit; Actions minutes at the per-minute price for private repos.",
+        "Every token at the provider's pay-per-use list price (cache tiers applied, since that is how the APIs bill). GitHub: the usage report's gross amounts (before included credits and minutes); without one a Copilot review is a count and Actions billable minutes are at the per-minute list price.",
         "",
         md_table(
             ["Provider", "Model", "Runs", "Model calls", "Tokens", "USD", "Notes"],
@@ -196,6 +211,60 @@ def _attribution_section(group: AttributionGroup) -> list[str]:
     ]
 
 
+def _exact(value: Decimal | None) -> str:
+    return "?" if value is None else format(value, "f")
+
+
+def _subtotal_rows(sums: Sequence[BillSubtotal]) -> list[list[Any]]:
+    return [
+        [
+            s.product,
+            s.sku,
+            s.unit,
+            s.lines,
+            _exact(s.quantity),
+            _exact(s.gross),
+            _exact(s.discount),
+            _exact(s.net),
+        ]
+        for s in sums
+    ]
+
+
+_SUBTOTAL_HEADERS = ["Product", "SKU", "Unit", "Lines", "Quantity", "Gross USD", "Included USD", "Net USD"]
+
+
+def _bill_section(bill: BillSummary) -> list[str]:
+    """The usage report's own figures, exact: what the GitHub lines above sum, what they leave out, what is missing."""
+    span = (
+        f"{bill.days[0].isoformat()}..{bill.days[-1].isoformat()} ({len(bill.days)})" if bill.days else "none"
+    )
+    out = [
+        "",
+        f"## GitHub usage report ({bill.account})",
+        "",
+        f"Read {iso(bill.read_at)}. Whole UTC days in the totals: {span}. The report's own figures, exact; "
+        "the API-only group sums the gross amounts, the real group the net (seats as subscription shares).",
+    ]
+    if bill.counted:
+        out += ["", md_table(_SUBTOTAL_HEADERS, _subtotal_rows(bill.counted))]
+    if bill.left_out:
+        out += [
+            "",
+            "Left out of the whole days (not AI-assisted work, or Actions of a repository not named with --github):",
+        ]
+        out += ["", md_table(_SUBTOTAL_HEADERS, _subtotal_rows(bill.left_out))]
+    if bill.outside:
+        rows = [
+            [d.day.isoformat(), d.why, d.lines, _exact(d.gross), _exact(d.discount), _exact(d.net)]
+            for d in bill.outside
+        ]
+        out += ["", "Days the window only touches — their counted lines, not in the totals:", ""]
+        out += [md_table(["Day", "Why", "Lines", "Gross USD", "Included USD", "Net USD"], rows)]
+    out += ["", *(f"- not read: {month}" for month in bill.missing)] if bill.missing else []
+    return out
+
+
 def render_markdown(report: Report) -> str:
     """The human report."""
     hours = report.window.hours()
@@ -218,6 +287,8 @@ def render_markdown(report: Report) -> str:
         out += _vendor_section(report.vendor)
     if report.attribution:
         out += _attribution_section(report.attribution)
+    if report.github_bill:
+        out += _bill_section(report.github_bill)
     if report.real and report.api:
         rows: list[list[Any]] = [
             ["Real (subscriptions share + API keys)", _fmt_usd(report.real.total_usd)],
@@ -242,6 +313,7 @@ def render_text(report: Report) -> str:
 
 
 _SCALAR_CONVERTERS: list[tuple[type, Callable[[Any], Any]]] = [
+    (Decimal, lambda v: format(v, "f")),  # an amount of a usage report, exact as text
     (Enum, lambda v: v.value),
     (datetime, lambda v: v.isoformat()),
     (date, lambda v: v.isoformat()),

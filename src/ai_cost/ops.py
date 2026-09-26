@@ -15,7 +15,7 @@ import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, cast
 
@@ -24,14 +24,34 @@ from .attribution import attribution_group, parse_rules
 from .collectors import BUILTIN, collect_claude, collect_github, find_session_files
 from .collectors.claude import SOURCE_NAME as CLAUDE_SOURCE
 from .collectors.files import or_skip
+from .collectors.github_bill import (
+    BillError,
+    BillRequest,
+    bill_source,
+    bill_warnings,
+    collect_bill,
+    fetch_month,
+    probe_bill,
+    settled_by,
+)
 from .collectors.usage_log import log_files
 from .config import MAX_WINDOW_HOURS, Config, Paths, PriceBook
 from .errors import ToolError, UsageError
-from .groups import RealGroup, Report, api_group, needs_list_price, real_group, vendor_group
+from .groups import (
+    INVOICE_ATTRIBUTION,
+    RealGroup,
+    Report,
+    api_group,
+    needs_list_price,
+    real_group,
+    vendor_group,
+)
 from .models import (
     Billing,
+    BillSummary,
     Collected,
     Provider,
+    RowKind,
     Scope,
     Size,
     Skipped,
@@ -41,9 +61,11 @@ from .models import (
     client_outside,
 )
 from .onboarding import (
+    BILL_HINT,
     Check,
     Mark,
     billing_hint,
+    github_checks,
     init_config_lines,
     outside_scope,
     paid_for,
@@ -217,6 +239,7 @@ class _Gathered:
     warnings: list[str]
     skipped: list[Skipped]
     book: PriceBook | None = None
+    bill: BillSummary | None = None  # the GitHub usage report's exact figures, when one was read
 
 
 def _default_project(request: ReportRequest, paths: Paths) -> tuple[Path | None, bool]:
@@ -265,10 +288,14 @@ def _gather(
     gathered.rows += [row for row in claude.rows if window.contains(row.at)]
     if request.github:  # before the plugins, so their enrichers see every row — the live GitHub rows included
         _gather_github(request, config, book, gathered)
+    bill = _gather_bill(request, paths, config, gathered)
     _collect_sources(request, paths, config, loaded, gathered)
     gathered.rows = _inherit_scope_by_ref(gathered.rows)
+    per_project = False
     if project is not None and not all_projects:  # the sources' raw working directories, before any enricher
         _keep_project_rows(gathered, project)
+        per_project = True
+    _absorb_bill(gathered, bill, per_project, config)
     _enrich_rows(request, paths, config, loaded, gathered)
     gathered.rows = _with_billing_rules(gathered.rows, config)
     return gathered
@@ -277,17 +304,68 @@ def _gather(
 def _gather_github(
     request: ReportRequest, config: Config, book: PriceBook | None, gathered: _Gathered
 ) -> None:
-    """The live GitHub rows of ``--github``, and a warning when no plan or allowance switch says how they are paid."""
-    live = collect_github(list(request.github), gathered.window, config.github.actions_runner)
+    """The live GitHub counts of ``--github``, and a warning when nothing says how they are paid."""
+    live = collect_github(list(request.github), gathered.window)
     gathered.rows += live.rows
     if live.rows and not paid_for("github", config, book):
         gathered.warnings.append(
-            "live GitHub rows are plan rows and no subscription covers github: Copilot reviews and Actions "
-            "minutes cost nothing here — add the plan, or set providers.github.copilot_plan_exhausted / "
-            "actions_plan_exhausted"
+            "live GitHub rows are counts: a Copilot review has no price and Actions minutes of a plan cost nothing "
+            f"here — {BILL_HINT}"
         )
     merge_skips(gathered.skipped, list(live.skipped))
     gathered.sources.append(f"github ({', '.join(request.github)})")
+
+
+def bill_request(paths: Paths, config: Config, repos: Sequence[str] = ()) -> BillRequest | None:
+    """The configured usage report, read now; ``repos`` (``--github``) are the ones whose Actions lines count."""
+    if config.github.bill is None:
+        return None
+    return BillRequest(config.github.bill, now(), paths.offline, frozenset(repo.lower() for repo in repos))
+
+
+def bill_unreadable(paths: Paths, config: Config, day: date) -> str:
+    """Why the usage report of ``day``'s month cannot be read now ("" when it can, or when none is configured)."""
+    reading = bill_request(paths, config)
+    if reading is None:
+        return ""
+    try:
+        fetch_month(
+            reading, day.year, day.month
+        )  # kept for the process: the build that follows reads it again free
+    except BillError as exc:
+        return str(exc)
+    return ""
+
+
+def _gather_bill(
+    request: ReportRequest, paths: Paths, config: Config, gathered: _Gathered
+) -> BillSummary | None:
+    """The usage report's rows of the window's whole days; its exact summary for the header (ADR-0007)."""
+    reading = bill_request(paths, config, request.github)
+    if reading is None:
+        return None
+    bill = collect_bill(reading, gathered.window)
+    gathered.rows += bill.rows
+    merge_skips(gathered.skipped, bill.skipped)
+    return bill.summary
+
+
+def _absorb_bill(gathered: _Gathered, bill: BillSummary | None, per_project: bool, config: Config) -> None:
+    """The header lines, the sources line and the section.
+
+    A per-project report keeps only the report's seats: its usage lines name repositories, not directories, so the
+    account's figures belong to an --all-projects report.
+    """
+    if bill is None or config.github.bill is None:
+        return
+    account = config.github.bill
+    gathered.rows = [
+        replace(row, billing=Billing.API_SETTLED) if settled_by(row, bill, account) else row
+        for row in gathered.rows
+    ]
+    gathered.warnings += bill_warnings(bill, with_section=not per_project)
+    gathered.sources.append(bill_source(bill, per_project))
+    gathered.bill = None if per_project else bill
 
 
 # ---- per-project scope (ADR-0006) -------------------------------------------------------------------------------
@@ -586,7 +664,11 @@ def _drop_unpriced(
 
 
 def _config_warnings(paths: Paths, config: Config, book: PriceBook) -> list[str]:
-    """Without a user config the subscriptions are the package defaults; with one, every plan rule needs its plan."""
+    """The retired keys, then the config: without a user one the package defaults; with one, a plan per plan rule."""
+    return [*_retired(paths, config, book), *_config_state(paths, config, book)]
+
+
+def _config_state(paths: Paths, config: Config, book: PriceBook) -> list[str]:
     if paths.user_config_file().exists():
         on_plan = sorted(name for name, rule in config.billing_rules.items() if rule == "subscription")
         return [
@@ -603,14 +685,50 @@ def _config_warnings(paths: Paths, config: Config, book: PriceBook) -> list[str]
     return [f"no user config — subscriptions are the defaults ({plans}); run `ai-cost install --init-config`"]
 
 
+def _retired(paths: Paths, config: Config, book: PriceBook) -> list[str]:
+    """The keys the user's files still set that 2.6 no longer reads: a Copilot review has no price (ADR-0007)."""
+    said = [
+        f"{key} is no longer read (a Copilot review has no price since 2.6): {BILL_HINT}"
+        for key in config.github.retired
+    ]
+    return said + [
+        f"{key} in {paths.user_prices_file()} is no longer read (a Copilot review has no price since 2.6) — remove it"
+        for key in book.retired
+    ]
+
+
 def _billing_warnings(real: RealGroup | None, rows: Sequence[UsageRow], config: Config) -> list[str]:
-    """Rows of unknown billing are priced by the API group only.
+    """Copilot counts without a usage report, and rows of unknown billing (priced by the API group only).
 
     Those of clients outside scope are said as such; the rest are counted per provider with the rule to set.
     """
+    counted = _copilot_counted(rows, config) + _plans_beside_seats(real)
     if real is None or not real.unknown_billing:
+        return counted
+    return counted + _outside_warning(outside_scope(rows, config)) + _unknown_warning(real, rows, config)
+
+
+def _plans_beside_seats(real: RealGroup | None) -> list[str]:
+    """A configured GitHub plan still booked while the usage report states seats: said, the user decides."""
+    shares = real.subscriptions if real is not None else ()
+    seats = sorted({s.plan for s in shares if s.attribution == INVOICE_ATTRIBUTION})
+    kept = sorted(
+        s.plan for s in shares if s.provider == "github" and s.attribution != INVOICE_ATTRIBUTION and s.usd
+    )
+    if not seats or not kept:
         return []
-    return _outside_warning(outside_scope(rows, config)) + _unknown_warning(real, rows, config)
+    return [
+        f"subscription {', '.join(kept)} stays booked beside the seats the GitHub usage report bills "
+        f"({', '.join(seats)}) — remove it from subscriptions if those seats replaced it"
+    ]
+
+
+def _copilot_counted(rows: Sequence[UsageRow], config: Config) -> list[str]:
+    """Copilot reviews without a usage report: counted, never priced — said, so a total is never read as complete."""
+    reviews = sum(row.tokens.reviews for row in rows if row.kind is RowKind.COPILOT)
+    if not reviews or config.github.bill is not None:
+        return []
+    return [f"{reviews} Copilot review(s) counted, not priced (a review has no price) — {BILL_HINT}"]
 
 
 def _outside_warning(clients: Mapping[str, int]) -> list[str]:
@@ -663,13 +781,8 @@ def build_report(
     gathered = _gather(request, paths, config, loaded, book)
     gathered.warnings += loaded.warnings
     if request.unpriced == "skip":
-        _drop_unpriced(
-            gathered,
-            book,
-            config,
-            paths.user_prices_file(),
-            list_priced="api" in request.groups or bool(request.attribute),
-        )
+        list_priced = "api" in request.groups or bool(request.attribute)
+        _drop_unpriced(gathered, book, config, paths.user_prices_file(), list_priced=list_priced)
     gathered.warnings += _config_warnings(paths, config, book)
     items = _vendor_items(request, gathered, config)
     window, rows = gathered.window, gathered.rows
@@ -687,6 +800,7 @@ def build_report(
         rows=rows,
         real=real,
         attribution=attribution_group(rows, rules, book, config, window) if rules else None,
+        github_bill=gathered.bill,
         api=api_group(rows, book, config) if "api" in request.groups else None,
         vendor=(
             vendor_group(items, config, request.vendor_profile)
@@ -742,7 +856,7 @@ def doctor(paths: Paths, config: Config, book: PriceBook, emit: Emit) -> int:
     emit(f"ai-cost {__version__} doctor")
     _doctor_sources(paths, config, book, line, emit)
     _doctor_prices(book, line)
-    _doctor_state(paths, line, emit)
+    _doctor_state(paths, line, emit, config.github.bill is not None)
     emit(f"doctor: {'all good' if problems == 0 else f'{problems} issue(s)'}")
     return 0 if problems == 0 else 1
 
@@ -757,6 +871,9 @@ def _doctor_sources(paths: Paths, config: Config, book: PriceBook, line: Line, e
     if report is not None:
         _doctor_skipped(report, line)
     _render(setup_checks(found, config, book, rows), line, emit)
+    request = bill_request(paths, config)
+    probe = probe_bill(request) if request is not None else None
+    _render(github_checks(config, provider_use(rows, config.outside_scope_clients), probe), line, emit)
     _doctor_plugins(paths, config, line, emit)
     user_config = paths.user_config_file()
     emit(
@@ -838,7 +955,7 @@ def _doctor_prices(book: PriceBook, line: Line) -> None:
                 )
 
 
-def _doctor_state(paths: Paths, line: Line, emit: Emit) -> None:
+def _doctor_state(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> None:
     """The last price check, the state directory, the tools and the scheduled jobs."""
     last = load_result(paths)
     emit(
@@ -853,7 +970,7 @@ def _doctor_state(paths: Paths, line: Line, emit: Emit) -> None:
     else:
         line(False, f"state dir {state} is not writable — AI_COST_STATE_DIR, or fix the permissions")
     _doctor_tools(emit)
-    _doctor_reports(paths, line, emit)
+    _doctor_reports(paths, line, emit, bill)
 
 
 def _doctor_tools(emit: Emit) -> None:
@@ -861,7 +978,7 @@ def _doctor_tools(emit: Emit) -> None:
     has_gh = shutil.which("gh") is not None
     emit(
         ("  ok  " if has_gh else "  --  ")
-        + f"gh {'present' if has_gh else 'absent'} (needed only for --github)"
+        + f"gh {'present' if has_gh else 'absent'} (needed only for --github and providers.github.bill)"
     )
     emit(
         ("  ok  " if schedule_installed() else "  --  ")
@@ -869,17 +986,29 @@ def _doctor_tools(emit: Emit) -> None:
     )
 
 
-def _doctor_reports(paths: Paths, line: Line, emit: Emit) -> None:
-    """The daily-report job and what it last wrote, the last reconciliation: absent is informational, torn is red."""
-    from .daily import newest_index_file, read_index  # both modules build on this one: imported here only
-    from .reconcile import last_reconciliation
-
+def _doctor_daily_job(line: Line, emit: Emit, bill: bool) -> None:
+    """The daily-report job: absent is information; one installed before 2.6 cannot find gh for the usage report."""
     installed = schedule_installed(DAILY_JOB)
+    if installed and bill and not job_has_path(DAILY_JOB):
+        line(
+            False,
+            "scheduled daily reports: installed without a PATH — the job cannot find gh to read the "
+            "GitHub usage report; run ai-cost install --schedule-reports again",
+        )
+        return
     emit(
         ("  ok  " if installed else "  --  ")
         + "scheduled daily reports: "
         + ("installed" if installed else "not installed (ai-cost install --schedule-reports)")
     )
+
+
+def _doctor_reports(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> None:
+    """The daily-report job and what it last wrote, the last reconciliation: absent is informational, torn is red."""
+    from .daily import newest_index_file, read_index  # both modules build on this one: imported here only
+    from .reconcile import last_reconciliation
+
+    _doctor_daily_job(line, emit, bill)
     index = newest_index_file(paths.reports_dir)
     if index is None:
         emit(f"  --  daily reports: none yet in {paths.reports_dir} (ai-cost daily)")
@@ -923,7 +1052,7 @@ def _writable(path: Path) -> bool:
 
 @dataclass(frozen=True)
 class MonitorEntry:
-    """One history line."""
+    """One history line; ``outside`` names the amounts the totals leave out (GitHub days, unread months)."""
 
     ts: str
     window: tuple[str, str]
@@ -932,6 +1061,18 @@ class MonitorEntry:
     cash_usd: float
     api_usd: float
     by_provider_api_usd: dict[str, float]
+    outside: tuple[str, ...] = ()
+
+
+def bill_outside(bill: BillSummary | None) -> tuple[str, ...]:
+    """The GitHub amounts a window's totals leave out, exact: the days it only touches and the months not read."""
+    if bill is None:
+        return ()
+    days = tuple(
+        f"github {day.day.isoformat()} ({day.why}): net {day.net:f} USD, gross {day.gross:f}"
+        for day in bill.outside
+    )
+    return days + tuple(f"github {month}" for month in bill.missing)
 
 
 def month_to_date(paths: Paths, config: Config, book: PriceBook, at: datetime) -> float:
@@ -979,6 +1120,7 @@ def _monitor_entry(report: Report) -> MonitorEntry:
         cash_usd=round(report.real.cash_usd, 4),
         api_usd=round(report.api.total_usd, 4),
         by_provider_api_usd={k: round(v, 4) for k, v in by_provider.items()},
+        outside=bill_outside(report.github_bill),
     )
 
 
@@ -1113,10 +1255,14 @@ def cron_line(days: int, argv: Sequence[str], log: Path) -> str:
     return job_cron_line(PRICES_JOB, Cadence(days=days), argv, log)
 
 
-def job_cron_line(job: Job, cadence: Cadence, argv: Sequence[str], log: Path) -> str:
-    """A job's crontab line, quoted for the shell and tagged so it can be found and removed."""
+def job_cron_line(job: Job, cadence: Cadence, argv: Sequence[str], log: Path, search_path: str = "") -> str:
+    """A job's crontab line, quoted for the shell and tagged so it can be found and removed.
+
+    ``search_path`` is the PATH of the shell that installed it: cron's own finds neither ``gh`` nor a Homebrew tool.
+    """
     command = shlex.join(list(argv))
-    return f"{_cron_when(cadence)} {command} >> {shlex.quote(str(log))} 2>&1 {cron_tag(job)}"
+    env = f"PATH={shlex.quote(search_path)} " if search_path else ""
+    return f"{_cron_when(cadence)} {env}{command} >> {shlex.quote(str(log))} 2>&1 {cron_tag(job)}"
 
 
 def _crontab_write(text: str) -> bool:
@@ -1145,6 +1291,16 @@ def schedule_installed(job: Job = PRICES_JOB) -> bool:
     return cron_has_entry(_crontab(), job)
 
 
+def job_has_path(job: Job) -> bool:
+    """Whether the registered job carries a PATH of its own (installed by 2.6 or later)."""
+    if is_macos():
+        try:
+            return "<key>PATH</key>" in plist_path(job).read_text()
+        except OSError:
+            return False
+    return any(" PATH=" in line for line in _crontab().splitlines() if _is_our_cron_line(line, job))
+
+
 def describe_cadence(cadence: Cadence) -> str:
     """``every 3 day(s)`` or ``daily at 06:40``."""
     if cadence.days:
@@ -1162,15 +1318,22 @@ def _launchd_when(cadence: Cadence) -> str:
     )
 
 
-def _plist(job: Job, cadence: Cadence, argv: Sequence[str], log: Path) -> str:
+def _plist(job: Job, cadence: Cadence, argv: Sequence[str], log: Path, search_path: str = "") -> str:
+    """The launchd agent; ``search_path`` (the installing shell's PATH) replaces launchd's bare /usr/bin:/bin one."""
     program = "".join(f"<string>{html.escape(arg)}</string>" for arg in argv)
     out = html.escape(str(log))
+    env = (
+        f"  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{html.escape(search_path)}</string></dict>\n"
+        if search_path
+        else ""
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
         '<plist version="1.0"><dict>\n'
         f"  <key>Label</key><string>ai-cost.{job.label}</string>\n"
         f"  <key>ProgramArguments</key><array>{program}</array>\n"
+        f"{env}"
         f"  {_launchd_when(cadence)}\n"
         f"  <key>StandardOutPath</key><string>{out}</string><key>StandardErrorPath</key><string>{out}</string>\n"
         "  <key>RunAtLoad</key><false/>\n"
@@ -1188,9 +1351,12 @@ def install_job(paths: Paths, job: Job, cadence: Cadence, command: Sequence[str]
     ensure_dir(paths.state_dir, "state directory")
     log = paths.state_dir / job.log_name
     argv = [*command, *job.argv_tail]
+    search_path = os.environ.get("PATH", "")  # the job finds what this shell finds (gh for the usage report)
     if is_macos():
-        return _install_agent(_plist(job, cadence, argv, log), describe_cadence(cadence), emit, job)
-    lines = [*cron_without_entry(_crontab(), job), job_cron_line(job, cadence, argv, log)]
+        return _install_agent(
+            _plist(job, cadence, argv, log, search_path), describe_cadence(cadence), emit, job
+        )
+    lines = [*cron_without_entry(_crontab(), job), job_cron_line(job, cadence, argv, log, search_path)]
     if not _crontab_write("\n".join(lines) + "\n"):
         emit("crontab write failed — is crontab installed and allowed for this user?")
         return 1
