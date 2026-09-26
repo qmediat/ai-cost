@@ -4,8 +4,10 @@ name: Publish
 # oldest and newest supported Python, the shipped file's selftest) → build (sdist, wheel, the zipapp and the
 # single-file skill as artifacts) → publish to PyPI through Trusted Publishing (no token: the `pypi` environment's
 # OIDC identity; configure the publisher on pypi.org for this repository and this workflow file) → GitHub Release
-# with the zipapp and the skill attached, notes from the CHANGELOG section. Every step is resumable: a file already
-# on PyPI is skipped (a partial upload is completed), an existing release is updated. `workflow_dispatch` with `tag` releases an existing
+# with the zipapp, the skill and the npm tarball attached, notes from the CHANGELOG section → npm: the package
+# ai-costs (the same zipapp, a Node launcher) STAGED with provenance until a maintainer approves it on npmjs.com.
+# Every step is resumable: a file already on PyPI is skipped (a partial upload is completed), an existing release is
+# updated, a version already public on npm is skipped. `workflow_dispatch` with `tag` releases an existing
 # tag with this workflow definition. Actions are pinned to full commit SHAs; Dependabot keeps the pins current.
 
 on:
@@ -78,6 +80,18 @@ jobs:
       - run: python -m pip install --upgrade pip build
       - run: python -m build --outdir dist
       - run: python scripts/build.py src dist/ai-cost && cp standalone/SKILL.md dist/ai-cost-SKILL.md
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: The npm package ai-costs (the same zipapp, started by a Node launcher) as a tarball
+        run: |
+          if [ ! -f scripts/npm_package.py ]; then
+            echo "::notice ::this tag predates the npm package: no npm tarball"
+            exit 0
+          fi
+          python scripts/npm_package.py "$RUNNER_TEMP/npm" --zipapp dist/ai-cost
+          (cd "$RUNNER_TEMP/npm" && npm pack --pack-destination "$GITHUB_WORKSPACE/dist")
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
@@ -136,4 +150,94 @@ jobs:
           else
             gh release create "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
           fi
-          gh release upload "$TAG" dist/ai-cost dist/ai-cost-SKILL.md dist/*.whl dist/*.tar.gz --clobber
+          assets=(dist/ai-cost dist/ai-cost-SKILL.md dist/*.whl dist/*.tar.gz)
+          if compgen -G 'dist/ai-costs-*.tgz' > /dev/null; then assets+=(dist/ai-costs-*.tgz); fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
+
+  npm:
+    name: Stage ai-costs on npm (Trusted Publishing)
+    needs: [build, pypi]
+    runs-on: ubuntu-latest
+    # The trusted publisher on npmjs.com names this environment; the environment deploys from tags v* and the protected
+    # branch main only (a tag run, or a workflow_dispatch re-release from main): a run from any other branch stages nothing.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      # No dependency cache in the release build (npm's Trusted Publishing guidance).
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      # Staged publishing needs npm 11.15.0+; the release installs ONE exact version and checks that the PATH runs it.
+      # Dependabot does not see this pin: raise it by hand within npm 11.
+      - name: npm 11.20.0 (staged publishing, Trusted Publishing)
+        env:
+          NPM_PIN: 11.20.0
+        run: |
+          npm install -g --ignore-scripts "npm@$NPM_PIN"
+          v="$(npm --version)"
+          if [ "$v" != "$NPM_PIN" ]; then
+            echo "::error ::npm $v runs, npm $NPM_PIN was installed — the pinned npm is not on the PATH"
+            exit 1
+          fi
+          echo "npm $v"
+      # Staged, never published directly: the version waits on npmjs.com until a maintainer approves it with 2FA. npm has
+      # no pending trusted publisher, so the package's FIRST version is published by hand from the release's tarball
+      # (then its trusted publisher is added on npmjs.com): until the package exists this step says so and stays green.
+      # Any other failure to look the package up is an error, never a skip.
+      # A re-run skips a version that is already public; npm does not document a second stage of a version that waits
+      # for approval — approve or reject that one before re-running.
+      - name: Stage on npm unless this version is public or the package does not exist yet
+        run: |
+          if ! compgen -G 'dist/ai-costs-*.tgz' > /dev/null; then
+            echo "::notice ::no npm tarball (a tag that predates the npm package): nothing to stage"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/pkg" && tar -xzf dist/ai-costs-*.tgz -C "$RUNNER_TEMP/pkg"
+          cd "$RUNNER_TEMP/pkg/package"
+          name="$(node -p "require('./package.json').name")"
+          v="$(node -p "require('./package.json').version")"
+          if [ "$(npm view "$name@$v" version 2>/dev/null)" = "$v" ]; then
+            echo "$name@$v is already on npm; skipping"
+            exit 0
+          fi
+          if ! npm view "$name" name > "$RUNNER_TEMP/view.log" 2>&1; then
+            if grep -q E404 "$RUNNER_TEMP/view.log"; then
+              {
+                echo "### $name is not on npm yet — its first version is published by hand"
+                echo "Download \`$name-$v.tgz\` from the GitHub Release of this tag, then \`npm publish $name-$v.tgz --access public\` (npm login, 2FA), then add the trusted publisher on npmjs.com (package → Settings → Trusted Publisher: qmediat/ai-cost, publish.yml, environment npm, staged publishing only)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice ::$name is not on npm yet: publish $name-$v.tgz by hand once, then add the trusted publisher"
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/view.log"
+            echo "::error ::cannot look $name up on npm (not a 404): nothing staged"
+            exit 1
+          fi
+          status=0
+          npm stage publish --provenance --access public --ignore-scripts > "$RUNNER_TEMP/stage.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/stage.log"
+          {
+            if [ "$status" = 0 ]; then
+              echo "### $name@$v is staged — not public until a maintainer approves it"
+              echo "Approve with 2FA: https://www.npmjs.com/package/$name → **Staged Packages** → **Approve**, or \`npm stage approve <stage-id>\` — after checking that \`npm stage download <stage-id>\` has the sha256 of \`$name-$v.tgz\` on the GitHub Release."
+            else
+              echo "### Staging $name@$v FAILED (exit $status)"
+              echo "An authentication error (E401, E403, ENEEDAUTH) means npm could not exchange this run's identity: the trusted publisher of $name on npmjs.com must name qmediat/ai-cost, publish.yml and the environment npm."
+            fi
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID · commit $GITHUB_SHA"
+            echo '<details><summary>stage log (the stage id is in it)</summary>'
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/stage.log"
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

@@ -45,6 +45,7 @@ AI agent operating the tool on their behalf.
 
 ```bash
 pipx install ai-costs            # or: pip install ai-costs  (the PyPI name is ai-costs; the command is ai-cost)
+npm install -g ai-costs          # or: npx ai-costs — the same program from npm; it needs Python ≥ 3.9 on the machine
 # or the single executable file from the GitHub release: put it on PATH and run it
 # or no package at all: standalone/SKILL.md is a one-file Claude Code skill that counts and prices with a stdlib snippet
 ai-cost selftest [-v]            # the package's own tests, run from the shipped file, offline
@@ -54,7 +55,7 @@ ai-cost install --schedule-reports   # yesterday's global + per-project reports 
 ai-cost doctor                   # sources, your plans, how each provider was billed, prices, schedules — every !! line names what is missing
 ```
 
-Requirements: Python ≥ 3.9. `gh` only for `--github`.
+Requirements: Python ≥ 3.9 (also under npm, which only starts it). `gh` only for `--github`.
 
 ## Commands
 
@@ -188,7 +189,8 @@ Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`
 `total_usd`), `vendor` (when items exist), `attribution` (with `--attribute`). A line's `calls` is what it folded in
 (rows, review runs, Copilot reviews — the `Runs` column) and `model_calls` the API requests its sources reported
 (`Model calls`; 0 where none does); `--detail` adds `rows[]`, where
-`cost_reported` is the source's own figure for the row: cash for an `api` row (a charge the source reported), the
+`client` is the program that wrote the session (a Codex rollout's `originator`), `cost_reported` is the source's
+own figure for the row: cash for an `api` row (a charge the source reported), the
 source's list-price estimate for a `subscription` row (never counted as cash; the API-equivalent fallback when the
 model has no list price), a part of the session's figure when a session spans several rows; `source` names the
 source that produced the row and `kind` its record shape (`transcript`, `session`, `chat`, `log`, `ledger`,
@@ -205,7 +207,9 @@ unpriced model exits 5 unless `--unpriced skip`.
 positive CLI-reported cost is the row's
 cash, 0 or absent means the CLI did not price the run and the list price applies), budgets for `monitor` (daily / monthly 0 by
 default = no check; a provider listed with 0 = any spend is a breach), item sizing thresholds,
-vendor profiles, `plugins` and `plugin_settings`. A `null` anywhere in it means "no override" (the shipped value
+vendor profiles, `plugins`, `plugin_settings` and `outside_scope_clients` (clients whose sessions are outside the
+work you track, by a row's `client` — a Codex rollout's `originator`: their rows of unknown billing stay unknown
+and are said apart). A `null` anywhere in it means "no override" (the shipped value
 stays); inside a list a `null` is an error — a list such as `subscriptions` replaces the shipped list whole, so there
 is no shipped item a `null` could stand for. `openai.default_model` names the model of a Codex rollout that does not
 say its own (empty by default: such rows are `unknown`). `ai-cost doctor` lists what the file still lacks: a CLI

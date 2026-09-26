@@ -1105,3 +1105,25 @@ def test_prices_update_never_overwrites_a_malformed_shape_on_its_path(tmp_path: 
         else:
             raise AssertionError(f"{shape}: a malformed path must be a ToolError, never rewritten")
         assert json.loads(paths.user_prices_file().read_text()) == shape, "untouched"
+
+
+def test_outside_scope_clients_is_a_list_of_names() -> None:
+    raw = builtin_config()
+    assert parse_config(raw, "cfg").outside_scope_clients == (), "absent: every client is in scope"
+    raw["outside_scope_clients"] = ["codex_work_desktop"]
+    assert parse_config(raw, "cfg").outside_scope_clients == ("codex_work_desktop",)
+    raw["outside_scope_clients"] = "codex_work_desktop"
+    try:
+        parse_config(raw, "cfg")
+    except ConfigError as exc:
+        assert "outside_scope_clients" in str(exc)
+    else:
+        raise AssertionError("a string where a list belongs is a ConfigError naming the key")
+    for bad in (" ", "", "codex_work_desktop "):
+        raw["outside_scope_clients"] = [bad]
+        try:
+            parse_config(raw, "cfg")
+        except ConfigError as exc:
+            assert "outside_scope_clients" in str(exc) and repr(bad) in str(exc)
+        else:
+            raise AssertionError(f"{bad!r} can never match a client: a ConfigError, never silence")

@@ -28,13 +28,26 @@ from .collectors.usage_log import log_files
 from .config import MAX_WINDOW_HOURS, Config, Paths, PriceBook
 from .errors import ToolError, UsageError
 from .groups import RealGroup, Report, api_group, needs_list_price, real_group, vendor_group
-from .models import Billing, Collected, Provider, Scope, Size, Skipped, UsageRow, Window, WorkItem
+from .models import (
+    Billing,
+    Collected,
+    Provider,
+    Scope,
+    Size,
+    Skipped,
+    UsageRow,
+    Window,
+    WorkItem,
+    client_outside,
+)
 from .onboarding import (
     Check,
     Mark,
     billing_hint,
     init_config_lines,
+    outside_scope,
     paid_for,
+    provider_use,
     setup_checks,
     source_checks,
     source_files,
@@ -360,13 +373,17 @@ def _with_billing_rules(rows: list[UsageRow], config: Config) -> list[UsageRow]:
     """A row without billing evidence of its own takes ``providers.<name>.billing`` when the config names a rule.
 
     The built-in sources apply their provider's rule themselves; this is how a plugin's rows (xai, deepseek, a
-    user-added provider) follow the same config keys instead of staying unknown.
+    user-added provider) follow the same config keys instead of staying unknown. A row of a client outside scope
+    keeps its unknown billing: the rules are for the tracked work.
     """
     rules = {name: Billing.rule(rule) for name, rule in config.billing_rules.items() if rule}
+    outside = config.outside_scope_clients
     return [
         (
             replace(row, billing=rules[row.provider.value])
-            if row.billing is Billing.UNKNOWN and row.provider.value in rules
+            if row.billing is Billing.UNKNOWN
+            and row.provider.value in rules
+            and not client_outside(row.client, outside)
             else row
         )
         for row in rows
@@ -586,18 +603,40 @@ def _config_warnings(paths: Paths, config: Config, book: PriceBook) -> list[str]
     return [f"no user config — subscriptions are the defaults ({plans}); run `ai-cost install --init-config`"]
 
 
-def _billing_warnings(real: RealGroup | None) -> list[str]:
-    """Rows of unknown billing are priced by the API group only — count them per provider, with the rule to set."""
+def _billing_warnings(real: RealGroup | None, rows: Sequence[UsageRow], config: Config) -> list[str]:
+    """Rows of unknown billing are priced by the API group only.
+
+    Those of clients outside scope are said as such; the rest are counted per provider with the rule to set.
+    """
     if real is None or not real.unknown_billing:
         return []
-    names = sorted(real.unknown_by_provider)
-    counts = [f"{name} {real.unknown_by_provider[name]}" for name in names]
-    unfigured = real.unfigured_ledger
-    counts += [f"{unfigured} ledger row(s) without a figure, counted nowhere else"] if unfigured else []
-    rules = "; ".join(f"providers.{name}.billing — {billing_hint(name)}" for name in names)
-    fix = f"set {rules}; or add" if names else "add"
+    return _outside_warning(outside_scope(rows, config)) + _unknown_warning(real, rows, config)
+
+
+def _outside_warning(clients: Mapping[str, int]) -> list[str]:
+    if not clients:
+        return []
     return [
-        f"{real.unknown_billing} usage row(s) with unknown billing are left out of the real group "
+        f"{sum(clients.values())} usage row(s) from clients outside scope ({', '.join(sorted(clients))}) have "
+        "unknown billing and stay out of the real group on purpose (outside_scope_clients); the API-only group "
+        "still prices their tokens"
+    ]
+
+
+def _unknown_warning(real: RealGroup, rows: Sequence[UsageRow], config: Config) -> list[str]:
+    """The unknown rows a rule or a plugin could place, per provider, and the ledger rows without a figure."""
+    outside = {use.provider: use.outside for use in provider_use(rows, config.outside_scope_clients)}
+    left = {name: n - outside.get(name, 0) for name, n in sorted(real.unknown_by_provider.items())}
+    left = {name: n for name, n in left.items() if n}
+    unfigured = real.unfigured_ledger
+    if not left and not unfigured:
+        return []
+    counts = [f"{name} {n}" for name, n in left.items()]
+    counts += [f"{unfigured} ledger row(s) without a figure, counted nowhere else"] if unfigured else []
+    rules = "; ".join(f"providers.{name}.billing — {billing_hint(name)}" for name in left)
+    fix = f"set {rules}; or add" if left else "add"
+    return [
+        f"{sum(left.values()) + unfigured} usage row(s) with unknown billing are left out of the real group "
         f"({', '.join(counts)}; the API group prices the ones with tokens) — {fix} a plugin that knows how those "
         "sessions were paid"
     ]
@@ -635,7 +674,7 @@ def build_report(
     items = _vendor_items(request, gathered, config)
     window, rows = gathered.window, gathered.rows
     real = real_group(rows, book, config, window) if "real" in request.groups else None
-    gathered.warnings += _billing_warnings(real)
+    gathered.warnings += _billing_warnings(real, rows, config)
     return Report(
         version=__version__,
         generated_at=iso(now()),

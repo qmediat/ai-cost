@@ -47,14 +47,26 @@ _LOG_LINE = {
 
 
 def _row(
-    provider: Provider, billing: Billing, ref: str = "r", kind: RowKind = RowKind.SESSION, source: str = "cli"
+    provider: Provider,
+    billing: Billing,
+    ref: str = "r",
+    kind: RowKind = RowKind.SESSION,
+    source: str = "cli",
+    client: str = "",
 ) -> UsageRow:
-    return UsageRow(provider, "model-x", kind, None, ref, billing, Tokens(input=10, output=2), source=source)
+    tokens = Tokens(input=10, output=2)
+    return UsageRow(provider, "model-x", kind, None, ref, billing, tokens, source=source, client=client)
 
 
-def _config(rules: dict[str, str], plans: list[dict[str, object]] | None = None, **github: bool) -> Config:
+def _config(
+    rules: dict[str, str],
+    plans: list[dict[str, object]] | None = None,
+    outside: tuple[str, ...] = (),
+    **github: bool,
+) -> Config:
     raw = builtin_config()
     raw["subscriptions"] = plans or []
+    raw["outside_scope_clients"] = list(outside)
     for name, rule in rules.items():
         raw["providers"].setdefault(name, {})["billing"] = rule
     raw["providers"]["github"].update(github)
@@ -471,7 +483,93 @@ def test_unknown_rows_are_counted_per_provider_and_a_ledger_row_apart(tmp_path: 
     group = real_group(rows, book, config, WINDOW)
     assert group.unknown_by_provider == {"xai": 2, "google": 1} and group.unfigured_ledger == 1
     assert group.unknown_billing == 4, "the per-provider rows and the ledger row, each counted once"
-    said = ops_module._billing_warnings(group)[0]
+    said = ops_module._billing_warnings(group, rows, config)[0]
     assert (
         "xai 2" in said and "1 ledger row(s) without a figure" in said and "providers.openai" not in said
     ), said
+
+
+_APP = "codex_work_desktop"
+
+
+def test_unknown_rows_of_clients_outside_scope_are_said_never_asked_for() -> None:
+    app = [
+        _row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP),
+        _row(Provider.OPENAI, Billing.UNKNOWN, "b", client=_APP),
+    ]
+    config = _config({}, outside=(_APP,))
+    use = [c for c in setup_checks([], config, _book(), app) if c.text.startswith("openai:")]
+    assert len(use) == 1 and use[0].mark is Mark.INFO, use
+    assert "2 of unknown billing (2 from clients outside scope, left unknown on purpose)" in use[0].text, use
+    mixed = [*app, _row(Provider.OPENAI, Billing.UNKNOWN, "c", client="codex_exec")]
+    assert [
+        c for c in setup_checks([], config, _book(), mixed) if c.mark is Mark.PROBLEM
+    ], "codex_exec is in scope"
+    unlisted = setup_checks([], _config({}), _book(), app)
+    assert [
+        c for c in unlisted if c.mark is Mark.PROBLEM
+    ], "a client the config does not name is not outside scope"
+    unnamed = [_row(Provider.OPENAI, Billing.UNKNOWN, "u", client="")]
+    blank = setup_checks([], replace(_config({}), outside_scope_clients=("",)), _book(), unnamed)
+    assert [c for c in blank if c.mark is Mark.PROBLEM], "a row that names no client is never outside scope"
+
+
+def test_the_report_header_says_outside_scope_rows_apart_from_the_ones_to_fix(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    config = _config({}, outside=(_APP,))
+    app = [_row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP)]
+    alone = ops_module._billing_warnings(real_group(app, book, config, WINDOW), app, config)
+    assert len(alone) == 1 and f"clients outside scope ({_APP})" in alone[0], alone
+    assert "providers.openai.billing" not in alone[0], "nothing to fix for rows left unknown on purpose"
+    mixed = [*app, _row(Provider.OPENAI, Billing.UNKNOWN, "c", client="codex_exec")]
+    said = ops_module._billing_warnings(real_group(mixed, book, config, WINDOW), mixed, config)
+    assert len(said) == 2 and said[1].startswith("1 usage row(s) with unknown billing"), said
+    assert "openai 1" in said[1] and "providers.openai.billing — " in said[1], said
+
+
+def test_a_plugin_row_of_a_client_outside_scope_keeps_its_unknown_billing() -> None:
+    config = _config({"xai": "api"}, outside=(_APP,))
+    rows = [_row(Provider.XAI, Billing.UNKNOWN, "a", client=_APP), _row(Provider.XAI, Billing.UNKNOWN, "b")]
+    billed = {row.ref: row.billing for row in ops_module._with_billing_rules(rows, config)}
+    assert billed == {"a": Billing.UNKNOWN, "b": Billing.API}
+
+
+def test_only_unknown_rows_of_a_client_outside_scope_count_as_outside() -> None:
+    rows = [
+        _row(Provider.OPENAI, Billing.SUBSCRIPTION, "p", client=_APP),
+        _row(Provider.OPENAI, Billing.UNKNOWN, "u"),
+    ]
+    use = provider_use(rows, (_APP,))
+    assert use == [
+        ProviderUse("openai", on_plan=1, unknown=1, outside=0)
+    ], "a plan row of the app is not unknown"
+
+
+def test_the_doctor_asks_only_for_the_rows_in_scope() -> None:
+    config = _config({}, outside=(_APP,))
+    rows = [
+        _row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP),
+        _row(Provider.OPENAI, Billing.UNKNOWN, "c"),
+    ]
+    red = _problem_texts(setup_checks([], config, _book(), rows))
+    assert len(red) == 1 and "— the 1 in scope stay out of real: set the rule" in red[0], red
+
+
+def test_the_outside_scope_line_says_the_api_group_still_prices_them(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    config = _config({}, outside=(_APP,))
+    app = [_row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP)]
+    said = ops_module._billing_warnings(real_group(app, book, config, WINDOW), app, config)
+    assert said and "the API-only group still prices their tokens" in said[0], said
+
+
+def test_doctor_names_each_client_outside_scope_with_its_rows() -> None:
+    config = _config({}, outside=(_APP, "codex_desktop_typo"))
+    rows = [_row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP)]
+    lines = [
+        c.text for c in setup_checks([], config, _book(), rows) if c.text.startswith("clients outside scope")
+    ]
+    assert lines == [
+        f"clients outside scope: {_APP} (1 row(s) in the last 24 h, 1 of unknown billing), codex_desktop_typo"
+        " (0 row(s) in the last 24 h, 0 of unknown billing) — their unknown rows are left unknown on purpose"
+    ], "a name that matches nothing shows 0: a typo is visible"

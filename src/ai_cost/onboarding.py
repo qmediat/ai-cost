@@ -23,7 +23,7 @@ from .collectors.gemini_cli import session_files
 from .collectors.grok_build import SOURCE_NAME as GROK_SOURCE
 from .collectors.grok_build import usage_files
 from .config import Budgets, Config, Paths, PriceBook
-from .models import Billing, Skipped, UsageRow
+from .models import Billing, Skipped, UsageRow, client_outside
 
 SETUP_GUIDE = "https://github.com/qmediat/ai-cost/blob/main/docs/SETUP.md"
 _USAGE_LOG_GUIDE = f"{SETUP_GUIDE}#4-count-your-own-apps-and-mcp-servers"
@@ -78,6 +78,7 @@ class ProviderUse:
     on_plan: int = 0
     per_token: int = 0
     unknown: int = 0
+    outside: int = 0  # of the unknown ones, rows of clients the config puts outside the tracked work
 
     @property
     def rows(self) -> int:
@@ -205,19 +206,50 @@ def _source_files(layout: _Layout, paths: Paths) -> SourceFiles:
     )
 
 
-def provider_use(rows: Iterable[UsageRow]) -> list[ProviderUse]:
-    """Rows per provider by billing: on a plan, per token (settled on a ledger too), or unknown."""
+def provider_use(rows: Iterable[UsageRow], outside_clients: Sequence[str] = ()) -> list[ProviderUse]:
+    """Rows per provider by billing: on a plan, per token (settled on a ledger too), or unknown.
+
+    ``outside`` counts the unknown ones that come from clients outside the tracked work.
+    """
     counts: dict[str, Counter[Billing]] = {}
+    outside: Counter[str] = Counter()
     for row in rows:
         counts.setdefault(row.provider.value, Counter())[row.billing] += 1
+        outside[row.provider.value] += _outside(row, outside_clients)
     return [
         ProviderUse(
             provider,
             on_plan=count[Billing.SUBSCRIPTION],
             per_token=count[Billing.API] + count[Billing.API_SETTLED],
             unknown=count[Billing.UNKNOWN],
+            outside=outside[provider],
         )
         for provider, count in sorted(counts.items())
+    ]
+
+
+def outside_scope(rows: Iterable[UsageRow], config: Config) -> Counter[str]:
+    """Rows of unknown billing per client that the config puts outside the tracked work (``outside_scope_clients``)."""
+    return Counter(row.client for row in rows if _outside(row, config.outside_scope_clients))
+
+
+def _outside(row: UsageRow, clients: Sequence[str]) -> bool:
+    """A row of unknown billing whose client is one the config puts outside scope."""
+    return row.billing is Billing.UNKNOWN and client_outside(row.client, clients)
+
+
+def scope_checks(config: Config, rows: Sequence[UsageRow]) -> list[Check]:
+    """The clients the config puts outside scope and how many rows of the window each matched (a typo matches 0)."""
+    if not config.outside_scope_clients:
+        return []
+    seen = Counter(row.client for row in rows)
+    unknown = Counter(row.client for row in rows if row.billing is Billing.UNKNOWN)
+    listed = ", ".join(
+        f"{name} ({seen[name]} row(s) in the last 24 h, {unknown[name]} of unknown billing)"
+        for name in config.outside_scope_clients
+    )
+    return [
+        Check(Mark.INFO, f"clients outside scope: {listed} — their unknown rows are left unknown on purpose")
     ]
 
 
@@ -319,13 +351,14 @@ def setup_checks(
     found: Sequence[SourceFiles], config: Config, book: PriceBook, rows: Sequence[UsageRow]
 ) -> list[Check]:
     """Plans, billing rules, the window's rows and the budgets: every gap that keeps real from being complete."""
-    uses = provider_use(rows)
+    uses = provider_use(rows, config.outside_scope_clients)
     placed = _placed_sources(rows)
     unruled = {f.provider for f in found if _needs_rule(f, config) and f.source not in placed}
     return [
         *plan_checks(config, book, uses),
         *(_rule_problem(f) for f in found if f.provider in unruled),
         *(_use_check(use, config, use.provider in unruled) for use in uses),
+        *scope_checks(config, rows),
         budget_check(config.budgets),
     ]
 
@@ -403,13 +436,14 @@ def _use_check(use: ProviderUse, config: Config, already_said: bool) -> Check:
     text = (
         f"{use.provider}: {use.rows} row(s) in the last 24 h — {use.on_plan} on a plan, {use.per_token} per token"
         + (f", {use.unknown} of unknown billing" if use.unknown else "")
+        + (f" ({use.outside} from clients outside scope, left unknown on purpose)" if use.outside else "")
         + f" (providers.{use.provider}.billing = {rule})"
     )
     if not use.unknown:
         return Check(Mark.OK, text)
-    if already_said:
+    if already_said or use.unknown == use.outside:
         return Check(Mark.INFO, text)
+    which = f"the {use.unknown - use.outside} in scope" if use.outside else "the unknown ones"
     return Check(
-        Mark.PROBLEM,
-        f"{text} — the unknown ones stay out of real: set the rule, {billing_hint(use.provider)}",
+        Mark.PROBLEM, f"{text} — {which} stay out of real: set the rule, {billing_hint(use.provider)}"
     )

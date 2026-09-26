@@ -189,6 +189,9 @@ class Config:
     )
     plugins: tuple[str, ...] = ()  # module names loaded besides the entry points (ADR-0004)
     usage_logs: tuple[str, ...] = ()  # usage-log files read besides the default one (ADR-0005)
+    outside_scope_clients: tuple[
+        str, ...
+    ] = ()  # clients whose sessions are outside the tracked work (UsageRow.client)
     plugin_settings: Mapping[str, Mapping[str, Any]] = field(
         default_factory=dict
     )  # plugin_settings.<plugin name>
@@ -625,6 +628,7 @@ def parse_config(raw: JsonDict, where: str) -> Config:
         ),
         plugins=_names(raw, "plugins", where),
         usage_logs=_names(raw, "usage_logs", where),
+        outside_scope_clients=_clients(raw, where),
         plugin_settings=_plugin_settings(raw, where),
         billing_rules=_billing_rules(providers, where),
     )
@@ -699,6 +703,21 @@ def _billing_choice(raw: Mapping[str, Any], where: str) -> str:
     if value not in ("", "api", "subscription"):
         raise ConfigError(f"{where}: billing must be api, subscription or mixed, got {value!r}")
     return value
+
+
+def _clients(raw: Mapping[str, Any], where: str) -> tuple[str, ...]:
+    """``outside_scope_clients``: names exactly as a row's ``client`` spells them.
+
+    An empty or space-padded name could never match, so it is a ``ConfigError``, never trimmed in silence.
+    """
+    names = _names(raw, "outside_scope_clients", where)
+    bad = [name for name in names if not name or name != name.strip()]
+    if bad:
+        raise ConfigError(
+            f"{where}: outside_scope_clients holds {bad!r} — a client is named exactly as the rollout's originator, "
+            "e.g. codex_work_desktop"
+        )
+    return names
 
 
 def _names(raw: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:

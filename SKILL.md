@@ -64,7 +64,10 @@ background price check.
   picks the newest for the cwd's project; `--all-projects` for a time window across projects.
 - **Codex billing:** a rollout that names a ChatGPT plan is a subscription session; the others follow
   `providers.openai.billing` in the config (`api`, `subscription`, or `mixed` = no single rule) and stay `unknown`
-  without it. A plugin that knows what the key was charged (a ledger, a proxy log) can settle them.
+  without it. A plugin that knows what the key was charged (a ledger, a proxy log) can settle them. A row's `client`
+  is the rollout's `originator` (`codex_exec`; the Codex app writes `codex_work_desktop` and may name no plan):
+  config `outside_scope_clients` marks clients whose sessions are outside the tracked work — no billing rule
+  applies to them, their unknown rows stay unknown and are said apart, never as a problem.
 - **Gemini CLI:** sessions under `~/.gemini/tmp/*/chats/` (`GEMINI_CLI_HOME` overrides the home); `~/.gemini/projects.json`
   maps each folder to its working directory.
 - **Grok Build CLI:** `~/.grok/sessions/<cwd, URL-encoded>/<session>/usage.json` (`GROK_HOME` overrides); one row per

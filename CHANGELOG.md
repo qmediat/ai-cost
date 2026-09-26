@@ -3,6 +3,29 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-09-26
+
+### Changed
+
+- `ai-cost install --schedule …` / `--schedule-reports` refuse (exit 2) when this copy runs from npx's cache, which
+  npm may prune: a job registered there would stop in silence. The rest of the same call (`--init-config`,
+  `--unschedule…`) still runs; install globally (`npm install -g ai-costs`) and schedule from there.
+
+### Added
+
+- The npm package **`ai-costs`**: `npm install -g ai-costs` (or `npx ai-costs`) gives the same `ai-cost` command. It
+  carries the same single-file program as the Python distribution and starts it with a Python 3.9+ found on the
+  machine (`python3`, or `AI_COST_PYTHON`); installing it runs nothing and downloads nothing.
+- Every Codex row carries its `client`: the program that wrote the rollout (`originator` — `codex_exec`, or
+  `codex_work_desktop` for the Codex app, whose sessions may name no ChatGPT plan). It is in `--format json --detail`.
+- Config `outside_scope_clients`: clients whose sessions are outside the work you track. A billing rule never
+  applies to their rows (a plan their file names still does), so rows without evidence stay unknown and out of the
+  real group; the API-only group still prices their tokens. The report header and `doctor` say them apart
+  (`… from clients outside scope, left unknown on purpose`) and never ask to fix them — a provider with unknown
+  rows in scope as well gets its `!!` for those alone. `doctor` lists each listed client with the rows it matched
+  (a typo shows 0); an empty name is a config error. `reconcile` notes them apart from the rows a rule could place
+  (the JSON history line gains `outside_scope`).
+
 ## [2.4.0] - 2026-09-25
 
 ### Added

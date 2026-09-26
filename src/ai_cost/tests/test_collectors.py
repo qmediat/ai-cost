@@ -631,3 +631,40 @@ def test_a_run_without_a_created_at_is_a_counted_loss() -> None:
     with mock.patch.object(github_module, "gh", return_value="{}"):
         assert github_module._minutes("o/r", [{"databaseId": 9}], WINDOW, "linux", skipped) == {}
     assert skipped and "no createdAt" in skipped[0].reason, skipped
+
+
+def test_a_rollout_names_the_client_that_wrote_it(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    turn = [(BASE + timedelta(minutes=5), 1_000, 10, 0)]
+    write_rollout(
+        paths,
+        "2026-09-19",
+        "sid-app",
+        BASE,
+        "gpt-5.6-sol",
+        turn,
+        originator="codex_work_desktop",
+        limits=False,
+    )
+    write_rollout(paths, "2026-09-19", "sid-bare", BASE, "gpt-5.5", turn, originator="")
+    rows = collect_codex(paths.codex_home, WINDOW, "").rows
+    assert {row.ref: row.client for row in rows} == {"sid-app": "codex_work_desktop", "sid-bare": ""}
+    assert all(row.billing is Billing.UNKNOWN for row in rows), "no plan in the events and no rule: unknown"
+
+
+def test_a_rule_never_bills_a_client_outside_scope(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    turn = [(BASE + timedelta(minutes=5), 1_000, 10, 0)]
+    app = "codex_work_desktop"
+    write_rollout(paths, "2026-09-19", "sid-app", BASE, "gpt-5.6-sol", turn, originator=app, limits=False)
+    write_rollout(
+        paths, "2026-09-19", "sid-exec", BASE, "gpt-6-astra", turn, originator="codex_exec", limits=False
+    )
+    write_rollout(paths, "2026-09-19", "sid-app-plan", BASE, "gpt-5.6-sol", turn, originator=app, plan="team")
+    rows = collect_codex(paths.codex_home, WINDOW, "", Billing.API, (app,)).rows
+    billing = {row.ref: row.billing for row in rows}
+    assert billing == {
+        "sid-app": Billing.UNKNOWN,
+        "sid-exec": Billing.API,
+        "sid-app-plan": Billing.SUBSCRIPTION,
+    }, "the rule is for the tracked work; a plan the file names still counts"

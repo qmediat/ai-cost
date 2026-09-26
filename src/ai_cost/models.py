@@ -187,6 +187,11 @@ class Scope:
         return tuple(key for key in (self.branch, self.workspace, self.pr) if key)
 
 
+def client_outside(client: str, clients: Sequence[str]) -> bool:
+    """Whether a row's client — named, never empty — is one the config puts outside the tracked work."""
+    return bool(client) and client in clients
+
+
 @dataclass(frozen=True)
 class UsageRow:
     """One priced unit of usage: a call, a review, a review count, a run."""
@@ -204,6 +209,9 @@ class UsageRow:
     scope: Scope = field(default_factory=Scope)
     source: str = ""  # the name of the source that produced the row (a built-in or a plugin source)
     share: float = 1.0  # this row's fraction of its session's usage (input + output), across every window
+    client: str = (
+        ""  # the program that wrote the session, as its file names it (a Codex rollout's originator)
+    )
 
 
 @dataclass(frozen=True)

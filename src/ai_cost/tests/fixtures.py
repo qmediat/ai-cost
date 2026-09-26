@@ -177,12 +177,14 @@ def write_claude_session(paths: Paths, project: Path) -> Path:
     return session
 
 
-def _event(stamp: datetime, inp: int, out: int, cached: int = 0, plan: str = "") -> str:
+def _event(stamp: datetime, inp: int, out: int, cached: int = 0, plan: str = "", limits: bool = True) -> str:
+    """One ``token_count`` event; ``limits=False`` writes ``rate_limits: null``, as the Codex app does."""
     usage = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out}
+    rate_limits = {"limit_id": "codex" if plan else "premium", "plan_type": plan or None} if limits else None
     payload: dict[str, Any] = {
         "type": "token_count",
         "info": {"total_token_usage": usage, "last_token_usage": usage},
-        "rate_limits": {"limit_id": "codex" if plan else "premium", "plan_type": plan or None},
+        "rate_limits": rate_limits,
     }
     return json.dumps({"timestamp": iso(stamp), "type": "event_msg", "payload": payload})
 
@@ -197,10 +199,14 @@ def write_rollout(
     switch_to: str | None = None,
     branch: str = "",
     plan: str = "",
+    originator: str = "codex_exec",
+    limits: bool = True,
 ) -> Path:
     """A Codex rollout with per-turn ``token_count`` events; ``switch_to`` changes the model before the last one.
 
-    ``plan`` names the ChatGPT plan the events report (``team``); empty = the API key or unknown.
+    ``plan`` names the ChatGPT plan the events report (``team``); empty = the API key or unknown. ``originator`` is the
+    program the header names (``codex_exec``; the Codex app writes ``codex_work_desktop``); empty leaves it out.
+    ``limits=False`` writes every event with ``rate_limits: null`` (a Codex app session, 2026-09-25).
     """
     folder = paths.codex_home / "sessions" / day[:4] / day[5:7] / day[8:10]
     folder.mkdir(parents=True, exist_ok=True)
@@ -210,12 +216,16 @@ def write_rollout(
             {
                 "timestamp": iso(started),
                 "type": "session_meta",
-                "payload": {"session_id": session, **({"git": {"branch": branch}} if branch else {})},
+                "payload": {
+                    "session_id": session,
+                    **({"originator": originator} if originator else {}),
+                    **({"git": {"branch": branch}} if branch else {}),
+                },
             }
         ),
         json.dumps({"timestamp": iso(started), "type": "turn_context", "payload": {"model": model}}),
     ]
-    lines += [_event(stamp, inp, out, cached, plan) for stamp, inp, out, cached in events]
+    lines += [_event(stamp, inp, out, cached, plan, limits) for stamp, inp, out, cached in events]
     if switch_to:
         lines.insert(
             len(lines) - 1,

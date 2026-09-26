@@ -52,7 +52,7 @@ from .ops import (
     run_auto_check,
 )
 from .prices_check import apply_check, check_prices, exit_code, merged_registry_json, save_result
-from .process import self_command
+from .process import self_command, transient_warning
 from .reconcile import Reported, run_reconcile
 from .render import plain, render_json, render_markdown, render_text
 from .timeutil import parse_cli_ts
@@ -413,10 +413,16 @@ def cmd_install(args: argparse.Namespace, paths: Paths) -> int:
         code = init_config(paths, args.force, emit)
     if args.unschedule:
         code = remove_schedule(emit) or code
-    if args.schedule:
-        code = install_schedule(paths, args.schedule, self_command(), emit) or code
     if args.unschedule_reports:
         code = remove_job(DAILY_JOB, emit) or code
+    refusal = transient_warning(self_command()) if args.schedule or args.schedule_reports else ""
+    if (
+        refusal
+    ):  # only the jobs are refused: one registered here would stop in silence the day npm prunes the file
+        emit_err(f"not scheduled: {refusal}")
+        return 2
+    if args.schedule:
+        code = install_schedule(paths, args.schedule, self_command(), emit) or code
     if args.schedule_reports:
         cadence = _cadence(args.at) if args.at else DAILY_CADENCE
         code = install_job(paths, DAILY_JOB, cadence, self_command(), emit) or code

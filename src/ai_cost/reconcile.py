@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields, replace
 
 from .config import Config, Paths, PriceBook
 from .errors import ToolError
-from .models import Billing, RowKind, Tokens, UsageRow
+from .models import Billing, RowKind, Tokens, UsageRow, client_outside
 from .ops import Emit, ReportRequest, append_json_line, build_report
 from .render import plain
 from .timeutil import iso, now
@@ -48,6 +48,9 @@ class Reconciliation:
     tolerance_pct: float
     checked_at: str = ""
     unknown_billing: int = 0  # rows of the provider the real group could not attribute to a key or a plan
+    outside_scope: int = (
+        0  # of those, rows of clients the config puts outside the tracked work (never a rule's)
+    )
     plan_rows: int = 0  # rows a subscription paid: not in a console's API figure, so not in the local count
     skipped: int = 0  # records the collectors could not use in the window (doctor lists them)
     warnings: tuple[str, ...] = ()  # the report's own header warnings: what the local count is built on
@@ -115,6 +118,10 @@ def reconcile(
         tolerance_pct=config.reconcile_tolerance_pct,
         checked_at=iso(now()),
         unknown_billing=sum(row.billing is Billing.UNKNOWN for row in rows),
+        outside_scope=sum(
+            row.billing is Billing.UNKNOWN and client_outside(row.client, config.outside_scope_clients)
+            for row in rows
+        ),
         plan_rows=sum(row.billing is Billing.SUBSCRIPTION for row in rows),
         skipped=len(report.skipped),
         warnings=tuple(report.warnings),
@@ -165,10 +172,16 @@ def _notes(outcome: Reconciliation) -> list[str]:
         notes.append(
             f"  note      {outcome.plan_rows} plan row(s) are not counted: a console shows API usage only"
         )
-    if outcome.unknown_billing:
+    in_scope = outcome.unknown_billing - outcome.outside_scope
+    if in_scope:
         notes.append(
-            f"  note      {outcome.unknown_billing} row(s) of unknown billing are neither in the local USD nor in "
+            f"  note      {in_scope} row(s) of unknown billing are neither in the local USD nor in "
             f"the tokens — set providers.{outcome.provider}.billing"
+        )
+    if outcome.outside_scope:
+        notes.append(
+            f"  note      {outcome.outside_scope} row(s) of clients outside scope are left unknown on purpose: "
+            "neither in the local USD nor in the tokens"
         )
     if outcome.skipped:
         notes.append(

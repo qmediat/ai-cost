@@ -501,3 +501,16 @@ def test_a_daily_index_round_trips_through_json(tmp_path: Path) -> None:
     path = tmp_path / "index.json"
     path.write_text(json.dumps(plain(index)))
     assert read_index(path) == index
+
+
+def test_reconcile_says_rows_of_clients_outside_scope_apart_from_the_rule_to_set() -> None:
+    from ..reconcile import Reconciliation, describe
+
+    base = Reconciliation("openai", ("a", "b"), 24.0, 0, 0.0, 0, 1.0, None, 5.0)
+    only = describe(replace(base, unknown_billing=2, outside_scope=2))
+    assert any("2 row(s) of clients outside scope are left unknown on purpose" in text for text in only), only
+    assert not any("set providers.openai.billing" in text for text in only), "no rule can place them"
+    mixed = describe(replace(base, unknown_billing=3, outside_scope=2))
+    assert any(
+        "1 row(s) of unknown billing" in t and "set providers.openai.billing" in t for t in mixed
+    ), mixed

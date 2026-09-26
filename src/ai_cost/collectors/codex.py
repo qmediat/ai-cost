@@ -11,19 +11,32 @@ is per turn; the other turns take the provider's configured
 billing and stay ``UNKNOWN`` without it. What an API key was actually charged is not in the rollout: a plugin that
 knows (a ledger, a proxy log) settles the rows afterwards and splits a session cost by each row's ``share``.
 The header names the working directory the session ran in (``session_meta.payload.cwd``, verified 2026-09-21): it
-is the row's workspace, so ``--project`` and ``--attribute`` place a rollout by directory (ADR-0006).
+is the row's workspace, so ``--project`` and ``--attribute`` place a rollout by directory (ADR-0006). It also names the
+program that wrote it (``originator``: ``codex_exec`` for ``codex exec``, ``codex_work_desktop`` for the Codex app —
+whose rollouts do not always carry ``rate_limits``, verified 2026-09-25): the row's ``client``.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..models import Billing, Collected, Provider, RowKind, Scope, Skipped, Tokens, UsageRow, Window
+from ..models import (
+    Billing,
+    Collected,
+    Provider,
+    RowKind,
+    Scope,
+    Skipped,
+    Tokens,
+    UsageRow,
+    Window,
+    client_outside,
+)
 from ..timeutil import parse_ts
 from ..values import as_object, count
 from .files import listing, or_skip
@@ -56,6 +69,7 @@ class _Rollout:
     )
     model: str = ""  # the model of the CURRENT turn while reading; a session may switch models
     plan: str = ""  # the ChatGPT plan named by any token_count event; empty when none was
+    client: str = ""  # session_meta.payload.originator: codex_exec, codex_cli_rs, codex_work_desktop, …
     first_ts: str = ""
     total: Mapping[str, Any] | None = None
     turns_seen: bool = (
@@ -98,6 +112,8 @@ def _absorb(rollout: _Rollout, record: Mapping[str, Any]) -> None:
         rollout.branch = str(git.get("branch") or "") if isinstance(git, Mapping) else ""
         cwd = payload.get("cwd")  # metadata as well: anything but text costs the workspace, never the usage
         rollout.cwd = cwd if isinstance(cwd, str) else ""
+        client = payload.get("originator")  # likewise: anything but text leaves the client unnamed
+        rollout.client = client if isinstance(client, str) else ""
     elif kind == "turn_context":
         rollout.model = str(payload.get("model") or rollout.model)
     elif payload.get("type") == "token_count":
@@ -234,6 +250,7 @@ class _Session:
     billing: Billing
     weight: int
     turns: int
+    client: str = ""
 
 
 def _session_rows(session: _Session, windowed: _Windowed, default_model: str) -> list[UsageRow]:
@@ -254,6 +271,7 @@ def _session_rows(session: _Session, windowed: _Windowed, default_model: str) ->
             ),
             scope=session.scope,
             share=_share(bucket, session),
+            client=session.client,
         )
         for key, bucket in windowed.items()
     ]
@@ -265,12 +283,17 @@ def rollout_files(codex_home: Path) -> list[Path]:
 
 
 def collect_codex(
-    codex_home: Path, window: Window, default_model: str, billing_default: Billing = Billing.UNKNOWN
+    codex_home: Path,
+    window: Window,
+    default_model: str,
+    billing_default: Billing = Billing.UNKNOWN,
+    outside_clients: Sequence[str] = (),
 ) -> Collected:
     """Rows for every rollout with turns inside the window, one per (model, UTC day) the turns fall in.
 
     A rollout that names a plan is a subscription session; every other session gets ``billing_default`` (the
-    provider's configured billing), ``UNKNOWN`` when nothing says how it was paid.
+    provider's configured billing), ``UNKNOWN`` when nothing says how it was paid — and always ``UNKNOWN`` when its
+    client is one of ``outside_clients``: the rule is for the tracked work, evidence in the file still counts.
     """
     rows: list[UsageRow] = []
     skipped: list[Skipped] = []
@@ -292,7 +315,8 @@ def collect_codex(
             continue
         ref = rollout.session or path.name
         scope = Scope(branch=rollout.branch, workspace=rollout.cwd)
-        session = _Session(ref, scope, billing_default, weight, turns)
+        billing = Billing.UNKNOWN if client_outside(rollout.client, outside_clients) else billing_default
+        session = _Session(ref, scope, billing, weight, turns, rollout.client)
         rows += _session_rows(session, windowed, default_model)
     return Collected(rows=rows, skipped=skipped)
 
@@ -305,4 +329,7 @@ class CodexSource:
     def collect(self, ctx: Context) -> Collected:
         """Codex rows inside the window, billed by plan evidence, else by the configured rule."""
         rule = Billing.rule(ctx.config.openai_billing)
-        return collect_codex(ctx.paths.codex_home, ctx.window, ctx.config.openai_default_model, rule)
+        config = ctx.config
+        return collect_codex(
+            ctx.paths.codex_home, ctx.window, config.openai_default_model, rule, config.outside_scope_clients
+        )
