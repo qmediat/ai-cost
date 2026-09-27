@@ -246,7 +246,7 @@ def entry_for(row: UsageRow, book: PriceBook) -> PriceEntry | None:
     return book.entry(row.provider, row.model)
 
 
-UNTRACKED_NOTE = "provider report − local records"  # a provider day's difference (ADR-0008)
+UNTRACKED_NOTE = "provider report − this machine's records"  # a provider day's difference (ADR-0008)
 
 
 def _own_figure(row: UsageRow, config: Config) -> Money | None:

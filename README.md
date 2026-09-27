@@ -186,12 +186,13 @@ price it applies differently — never a number to hide.
 
 ## Provider day reports: what no local record shows
 
-A provider's own day report names what the account was billed. The local records can miss a call: a script, another
-tool, a key used elsewhere. For each day the report can hold whole, `ai-cost` compares the provider's figure with the
-local rows of the same interval.
+A provider's own day report names what the account was billed: every machine, key and project of the account, while
+`ai-cost` reads the records of the machine it runs on. The difference holds a call this machine did not record (a
+script, another tool) and the work of other machines on the same account. For each day the report can hold whole,
+`ai-cost` compares the provider's figure with this machine's rows of the same interval.
 
-- A positive difference becomes one **untracked** row: the gross amount in the API-only group, the net in the real
-  group.
+- A positive difference becomes one **untracked** row (`provider report − this machine's records`): the gross amount
+  in the API-only group, the net in the real group.
 - A negative difference is only said: a price above the provider's, a call counted twice, or a row of another
   account.
 - A day the window cuts, a day the provider may still add to, or a day whose cash sits on other rows is listed with
@@ -221,7 +222,8 @@ Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`
 `gross`, `discount`, `net` — amounts as exact text), `outside[]` (days the window only touches), `missing` (months not
 read, with the reason)), `provider_reports` (with `providers.<name>.report`: per provider `days[]` —
 `day` (`start`, `end`, `lines[]` with `gross` / `net` / `requests` / `excluded` / `rate_note` — the provider's own
-conversion, e.g. `PLN ÷ 3.75385` —, `closed`, `currency`), `local_api`, `local_real`, `api_diff`, `real_diff` (exact
+conversion, e.g. `PLN ÷ 3.75385` —, `closed`, `currency`, `counts_requests` — the provider states a request
+count per line —, `requests` — `null` when it states none), `local_api`, `local_real`, `api_diff`, `real_diff` (exact
 text; `null` when not compared), `why_not`, `unknown_rows`, `local_requests`, `uncounted_rows` — plus `missing[]` and
 `unreadable[]` spans with their reason, `offline` (a live source not asked) and `utc_days` (its days are UTC days, so
 `daily` reads a day not final again)). A line's `calls` is what it folded in

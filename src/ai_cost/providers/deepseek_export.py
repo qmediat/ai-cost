@@ -613,6 +613,7 @@ def _day(stored: Mapping[str, Any]) -> ProviderDay:
         captured=captured,
         source=SOURCE,
         currency=stored.get("currency", "USD"),
+        counts_requests=True,  # every line of the export states its requests
     )
 
 

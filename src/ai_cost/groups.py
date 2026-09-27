@@ -11,6 +11,7 @@ from typing import Callable
 from .config import Config, PriceBook, Staffing, VendorProfile
 from .errors import ConfigError, PricingError
 from .models import (
+    STATED_PLACES,
     Billing,
     BillSummary,
     Money,
@@ -390,8 +391,8 @@ def invoice_shares(rows: Sequence[UsageRow]) -> list[SubscriptionShare]:
     shares = []
     for (provider, sku), seats in sorted(by_sku.items()):
         amounts = [row.invoice for row in seats if row.invoice is not None]
-        months = round(sum(line.quantity for line in amounts), 9)
-        net = round(sum(line.net for line in amounts), 9)
+        months = round(sum(line.quantity for line in amounts), STATED_PLACES)
+        net = round(sum(line.net for line in amounts), STATED_PLACES)
         prices = sorted(
             {line.unit_price for line in amounts}
         )  # a price change inside the window: every price said

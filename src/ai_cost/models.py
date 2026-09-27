@@ -292,12 +292,17 @@ class BillSummary:
     ] = ()  # YYYY-MM of every month whose report was read: its amounts are the report's
 
 
+# the decimals a provider's report states amounts to (GitHub's usage report); a conversion keeps them
+STATED_PLACES = 9
+
+
 @dataclass(frozen=True)
 class ProviderLine:
-    """One label of a provider's day report (a model, a SKU) with its exact amounts (ADR-0008).
+    """One label of a provider's day report (a model, a SKU) with its amounts as the provider states them (ADR-0008).
 
     ``gross`` is the usage before anything free or discounted, ``net`` what the account pays; ``excluded`` lines (tax,
     rounding, other services) are listed and never compared; ``requests`` is the provider's count when it keeps one.
+    An amount converted from another currency is the provider's own quotient to ``STATED_PLACES`` decimals.
     """
 
     label: str
@@ -305,9 +310,8 @@ class ProviderLine:
     net: Decimal
     requests: int | None = None
     excluded: bool = False
-    rate_note: str = (
-        ""  # the provider's own conversion when the account bills another currency (``PLN ÷ 3.80055``)
-    )
+    # the provider's own conversion when the account bills another currency (``PLN ÷ 3.80055``)
+    rate_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -327,6 +331,9 @@ class ProviderDay:
     captured: datetime
     source: str
     currency: str = "USD"
+    counts_requests: bool = (
+        False  # the provider states a request count per line (DeepSeek): a day without one is 0
+    )
 
     @property
     def gross(self) -> Decimal:
@@ -340,9 +347,14 @@ class ProviderDay:
 
     @property
     def requests(self) -> int | None:
-        """The provider's request count, when every usage line has one."""
+        """The provider's request count; ``None`` when the provider states none (xAI, Google).
+
+        The sum when every usage line has one; 0 for a day without usage lines from a provider that counts requests.
+        """
         counts = [line.requests for line in self.lines if not line.excluded]
-        return None if any(c is None for c in counts) else sum(c for c in counts if c is not None)
+        if any(c is None for c in counts) or not (counts or self.counts_requests):
+            return None
+        return sum(c for c in counts if c is not None)
 
 
 @dataclass(frozen=True)

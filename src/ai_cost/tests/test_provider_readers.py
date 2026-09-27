@@ -117,9 +117,10 @@ def test_google_days_convert_by_each_lines_own_rate_and_count_only_the_services_
     assert {line.label.split(" / ")[0] for line in storage} == {
         "Cloud Storage"
     }, "another service is listed, excluded"
-    assert first.gross == sum(
-        Decimal(r) / Decimal("3.75385") for r in ("2.740132", "0.024505", "3.407607", "0.01224", "2.278927")
-    )
+    assert sorted(line.gross for line in usage) == [
+        Decimal(x) for x in ("0.003260652", "0.006527965", "0.607090587", "0.729952449", "0.907763230")
+    ], "each line: PLN ÷ its rate, to nine decimals (2.740132 ÷ 3.75385 = 0.729952449…)"
+    assert first.gross == Decimal("2.254594883")
     rates = {line.rate_note for line in report.days[1].lines if not line.excluded}
     assert rates == {"PLN ÷ 3.80055"}, "August's rate for August's lines, never another"
     assert report.days[2].gross == 0 and len(report.days) == 3
@@ -720,6 +721,78 @@ def test_a_converted_amount_is_shown_with_the_providers_own_rate() -> None:
     )
     summary = ProviderSummary(Provider.GOOGLE, "bigquery-export", (DayComparison(day, "not compared here"),))
     assert any(
-        text.endswith("in USD by the provider's own rate: PLN ÷ 3.75385")
+        text.endswith("in USD by the provider's own rate, to 9 decimals: PLN ÷ 3.75385")
         for text in _provider_section(summary)
     )
+
+
+def test_a_day_with_nothing_on_either_side_has_no_request_line_and_no_rate_line() -> None:
+    from ..models import DayComparison, ProviderDay, ProviderLine, ProviderSummary
+    from ..render import _provider_section
+
+    start = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    storage = ProviderLine(
+        "Cloud Storage / x (regular)", Decimal(0), Decimal(0), excluded=True, rate_note="PLN ÷ 3.80055"
+    )
+    day = ProviderDay(
+        Provider.GOOGLE, start, start + timedelta(days=1), (storage,), True, READ_AT, "bigquery-export"
+    )
+    compared = DayComparison(
+        day, local_api=Decimal(0), local_real=Decimal(0), api_diff=Decimal(0), real_diff=Decimal(0)
+    )
+    text = "\n".join(_provider_section(ProviderSummary(Provider.GOOGLE, "bigquery-export", (compared,))))
+    assert "request(s)" not in text, "0 against 0: nothing to set side by side"
+    assert "provider's own rate" not in text, "an excluded line's rate is not the day's"
+
+
+def test_a_day_the_provider_billed_nothing_on_still_faces_the_local_requests() -> None:
+    from ..models import DayComparison, ProviderDay, ProviderSummary
+    from ..render import _provider_section
+
+    start = datetime(2026, 9, 20, 22, tzinfo=timezone.utc)
+    covered = ProviderDay(
+        Provider.DEEPSEEK, start, start + timedelta(days=1), (), True, READ_AT, "import", counts_requests=True
+    )
+    compared = DayComparison(
+        covered,
+        local_api=Decimal(0),
+        local_real=Decimal(0),
+        api_diff=Decimal(0),
+        real_diff=Decimal(0),
+        local_requests=7,
+    )
+    assert covered.requests == 0, "the export covers the day and billed nothing: a stated 0"
+    text = "\n".join(_provider_section(ProviderSummary(Provider.DEEPSEEK, "import", (compared,))))
+    assert "provider 0 request(s), local 7" in text
+
+
+def test_a_local_sum_of_nothing_is_a_plain_zero() -> None:
+    from ..remainder import exact
+
+    assert str(exact([])) == "0"
+    assert str(exact([0.0, 0.0])) == "0"
+    assert str(exact([1.0, -1.0])) == "0", "amounts that cancel are a zero sum too"
+    assert exact([1.5]) == Decimal(
+        "1.50000000000000"
+    ), "a real amount keeps the digits its error bound allows"
+
+
+def test_a_provider_that_states_no_count_is_never_said_to_have_counted_zero() -> None:
+    from ..models import DayComparison, ProviderDay, ProviderSummary
+    from ..render import _provider_section
+
+    start = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    empty = ProviderDay(
+        Provider.GOOGLE, start, start + timedelta(days=1), (), True, READ_AT, "bigquery-export"
+    )
+    compared = DayComparison(
+        empty,
+        local_api=Decimal(0),
+        local_real=Decimal(0),
+        api_diff=Decimal(0),
+        real_diff=Decimal(0),
+        local_requests=5,
+    )
+    assert empty.requests is None, "Google states no request count, on a day without usage neither"
+    text = "\n".join(_provider_section(ProviderSummary(Provider.GOOGLE, "bigquery-export", (compared,))))
+    assert "request(s)" not in text

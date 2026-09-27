@@ -22,7 +22,7 @@ from .groups import (
     SubscriptionShare,
     VendorGroup,
 )
-from .models import BillSubtotal, BillSummary, DayComparison, Provider, ProviderSummary, Tokens
+from .models import STATED_PLACES, BillSubtotal, BillSummary, DayComparison, Provider, ProviderSummary, Tokens
 from .remainder import interval, span_text
 from .timeutil import iso
 
@@ -283,8 +283,10 @@ def _provider_section(summary: ProviderSummary) -> list[str]:
         "",
         f"## Provider report: {summary.provider.value} ({summary.source})",
         "",
-        "The provider's own figures, exact, against the local records of the same interval. A positive difference is "
-        "booked as untracked (API: gross, real: net); a negative one is only said (ADR-0008).",
+        f"The provider's own figures, exact{_converted_clause(summary)}, against this machine's records of the same "
+        "interval. The provider's report covers the whole account — every machine, key and project — so a positive "
+        "difference, booked as untracked (API: gross, real: net), is what this machine did not record; a negative "
+        "one is only said (ADR-0008).",
     ]
     if summary.compared:
         out += ["", md_table(_DAY_HEADERS, [_compared_row(c) for c in summary.compared])]
@@ -302,13 +304,25 @@ def _provider_section(summary: ProviderSummary) -> list[str]:
     return out
 
 
+def _converted_clause(summary: ProviderSummary) -> str:
+    """How a converted amount is rounded, for a report that converted one; nothing for one that did not."""
+    converted = any(line.rate_note and not line.excluded for c in summary.days for line in c.day.lines)
+    return (
+        f" (another currency: at the provider's own rate, to {STATED_PLACES} decimals)" if converted else ""
+    )
+
+
 def _rate_lines(summary: ProviderSummary) -> list[str]:
-    """The provider's own conversions per day: an amount read in another currency is never shown without its rate."""
+    """The provider's own conversion of each day's usage lines: a converted amount is never shown without its rate."""
     lines = []
     for compared in summary.days:
-        notes = sorted({line.rate_note for line in compared.day.lines if line.rate_note})
+        notes = sorted(
+            {line.rate_note for line in compared.day.lines if line.rate_note and not line.excluded}
+        )
         if notes:
-            lines.append(f"- {interval(compared.day)} in USD by the provider's own rate: {'; '.join(notes)}")
+            rates = "; ".join(notes)
+            day, places = interval(compared.day), f"to {STATED_PLACES} decimals"
+            lines.append(f"- {day} in USD by the provider's own rate, {places}: {rates}")
     return lines
 
 
@@ -325,11 +339,16 @@ def _compared_row(compared: DayComparison) -> list[Any]:
     ]
 
 
+def _nothing_counted(compared: DayComparison) -> bool:
+    """0 requests on both sides and no local row without a count: nothing to set side by side."""
+    return compared.day.requests == 0 and compared.local_requests == 0 and compared.uncounted_rows == 0
+
+
 def _request_lines(compared: Sequence[DayComparison]) -> list[str]:
     """The provider's request count beside the local rows that count requests (the others are counted apart)."""
     lines = []
     for c in compared:
-        if c.day.requests is None:
+        if c.day.requests is None or _nothing_counted(c):
             continue
         rest = f", {c.uncounted_rows} local row(s) without a request count" if c.uncounted_rows else ""
         unknown = f", {c.unknown_rows} of unknown billing" if c.unknown_rows else ""

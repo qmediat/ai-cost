@@ -245,7 +245,8 @@ Each is optional. The config names the source; the key comes from the environmen
   tool's.
 - **Google days are UTC days, summed from the hourly export.** A day is closed 72 hours after it ends, because late
   usage can still arrive.
-  - An account in another currency is converted by Google's own rate on each line, never another.
+  - An account in another currency is converted by Google's own rate on each line, never another, and rounded to
+    nine decimals (the precision the GitHub usage report states its amounts in); the report prints the rate.
   - Credits make the difference between gross and net.
   - Taxes and other services are listed, never compared.
 - **Alibaba's bill times are UTC+8.** A day is final after 12:00 UTC+8 on the 4th of the next month, when Alibaba

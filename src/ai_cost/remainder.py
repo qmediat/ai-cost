@@ -172,8 +172,11 @@ def _local(rows: Sequence[UsageRow], book: PriceBook, config: Config) -> _Local:
 
 
 def exact(amounts: Sequence[float]) -> Decimal:
-    """The float sum of local amounts as a Decimal, shown no finer than its own error bound."""
-    return Decimal(math.fsum(amounts)).quantize(_step(amounts))
+    """The float sum of local amounts as a Decimal, shown no finer than its own error bound; a zero sum is a plain 0."""
+    total = math.fsum(amounts)
+    if total == 0:
+        return Decimal(0)
+    return Decimal(total).quantize(_step(amounts))
 
 
 def difference(provider: Decimal, amounts: Sequence[float]) -> Decimal:

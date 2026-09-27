@@ -92,6 +92,9 @@ def test_a_positive_difference_is_one_untracked_row_booked_gross_in_api_and_net_
     assert (api, cash) == (3.0, 2.5), "each group equals the provider's figure: gross in API, net in real"
     line = next(line for line in real_group([untracked], book, config, WINDOW).usage)
     assert (line.label, line.calls) == (UNTRACKED_LABEL, 0), "an amount, not a run"
+    assert line.notes == {
+        "provider report − this machine's records"
+    }, "it says whose records it is set against"
 
 
 def test_a_row_of_unknown_billing_is_never_counted_twice(tmp_path: Path) -> None:

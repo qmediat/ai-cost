@@ -3,6 +3,27 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-09-27
+
+### Changed
+
+- An amount converted from another currency (Google's billing export in PLN) is rounded half-even to nine decimals,
+  the precision the GitHub usage report states its amounts in, instead of a 28-digit quotient. The rate line beside
+  the day and the section's text say so.
+- The untracked row and the provider section say what the difference is. A provider's report covers the whole account
+  (every machine, key and project), while `ai-cost` reads this machine's records: the row's note is
+  `provider report − this machine's records`.
+
+### Fixed
+
+- A local sum of no rows shows as `0`, not as eighteen zeros.
+- A request line is printed only for a provider that states request counts (DeepSeek), and only when either side
+  counted something: no more "provider 0 request(s), local 0". A DeepSeek day that billed nothing still faces the
+  requests this machine recorded; an xAI or Google day never claims a count the provider did not state (JSON
+  `requests` is `null` there, `counts_requests` says which).
+- A rate line is printed only for a day whose usage lines were converted, never for one where only an excluded line
+  (another service) was.
+
 ## [2.7.0] - 2026-09-26
 
 ### Added

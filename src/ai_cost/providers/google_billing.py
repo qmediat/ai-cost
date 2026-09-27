@@ -19,10 +19,10 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any
 
-from ..models import Provider, ProviderDay, ProviderDays, ProviderLine, Span, Window
+from ..models import STATED_PLACES, Provider, ProviderDay, ProviderDays, ProviderLine, Span, Window
 from .common import day_interval, days_touched, exact_amount, holds_a_whole_day, not_read
 
 SOURCE = "bigquery-export"
@@ -147,9 +147,15 @@ def usd_line(row: Mapping[str, Any], services: Sequence[str]) -> tuple[date, Pro
     usage = row.get("service") in services and row.get("cost_type") == USAGE_TYPE
     label = f"{row.get('service')} / {row.get('sku')} ({row.get('cost_type')})"
     converted = "" if currency == "USD" else f"{currency} ÷ {rate}"
-    return day, ProviderLine(
-        label, cost / rate, (cost + credits) / rate, excluded=not usage, rate_note=converted
-    )
+    gross, net = _in_usd(cost, rate), _in_usd(cost + credits, rate)
+    return day, ProviderLine(label, gross, net, excluded=not usage, rate_note=converted)
+
+
+def _in_usd(amount: Decimal, rate: Decimal) -> Decimal:
+    """``amount ÷ rate`` to the decimals a provider report states (a quotient rarely ends); USD itself is unchanged."""
+    if rate == 1:
+        return amount
+    return (amount / rate).quantize(Decimal(1).scaleb(-STATED_PLACES), rounding=ROUND_HALF_EVEN)
 
 
 def exported_span(rows: Sequence[Mapping[str, Any]]) -> tuple[date, date] | None:
