@@ -13,14 +13,19 @@ from dataclasses import dataclass
 from .config import Config, PriceBook
 from .errors import UsageError
 from .groups import (
+    ApiGroup,
     AttributionGroup,
     AttributionLine,
+    AttributionModel,
+    Line,
+    RealGroup,
     api_group,
     invoice_shares,
     real_group,
     subscription_shares,
 )
-from .models import Provider, RowKind, Scope, TokenTierPrice, UsageRow, Window
+from .models import Provider, RowKind, Scope, Tokens, TokenTierPrice, UsageRow, Window
+from .permodel import Payment, payments_of
 from .pricing import current_price, entry_for
 
 MIXED = "mixed"
@@ -115,6 +120,60 @@ def _subscription_split(
     return out
 
 
+def _models(
+    subset: Sequence[UsageRow], api: ApiGroup, book: PriceBook, config: Config, window: Window
+) -> tuple[AttributionModel, ...]:
+    """Every model the label's rows name: its API line beside the cash the real group counts on that model's own rows.
+
+    Cash is computed per model, not looked up by a real-group label (those name a billing rule — "api", "api-key
+    (rollout)", "api-key (ledger)", "plan" — not a model): a ledger row settles its model's cash, a plan-covered model has
+    none. The billing rules that counted the model are its notes, beside the API line's. The largest list price first,
+    then the largest cash, then by provider and model.
+    """
+    rows_of: dict[tuple[str, str], list[UsageRow]] = {}
+    for row in subset:
+        rows_of.setdefault((row.provider.value, row.model), []).append(row)
+    lines = {(line.provider.value, line.label): line for line in api.lines}
+    models = [
+        _model(
+            key, lines.get(key), rows, real_group(rows, book, config, window), payments_of(rows, book, config)
+        )
+        for key, rows in rows_of.items()
+    ]
+    return tuple(sorted(models, key=lambda m: (-m.api_usd, -m.cash_usd, m.provider.value, m.model)))
+
+
+def _model(
+    key: tuple[str, str],
+    line: Line | None,
+    rows: Sequence[UsageRow],
+    real: RealGroup,
+    payments: tuple[Payment, ...],
+) -> AttributionModel:
+    notes = tuple(
+        sorted(
+            {
+                *(line.notes if line else ()),
+                *(usage.label for usage in real.usage),
+                *(n for usage in real.usage for n in usage.notes),
+            }
+        )
+    )
+    if line is None:
+        return AttributionModel(rows[0].provider, key[1], 0, 0, Tokens(), 0.0, real.cash_usd, notes, payments)
+    return AttributionModel(
+        line.provider,
+        key[1],
+        line.calls,
+        line.model_calls,
+        line.tokens,
+        line.usd,
+        real.cash_usd,
+        notes,
+        payments,
+    )
+
+
 def attribution_group(
     rows: Sequence[UsageRow], rules: Sequence[Rule], book: PriceBook, config: Config, window: Window
 ) -> AttributionGroup:
@@ -139,6 +198,7 @@ def attribution_group(
                 cash_usd=real.cash_usd,
                 subscription_usd=subscriptions[label],
                 keys=tuple(sorted({key for row in subset for key in row.scope.identity()})),
+                models=_models(subset, api, book, config, window),
             )
         )
     return AttributionGroup(policy=POLICY, lines=lines)

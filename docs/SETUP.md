@@ -114,7 +114,10 @@ a counted skip:
 Optional: `cost` (USD the request was charged — the row's cash under an `api` rule; also the price of a model the
 registry lacks), `billing` (`api` \| `subscription`), `event_id` (a repeated id in one file is read once — safe to
 replay an import), `source` (your program's name, shown in the report header), `ref`, `session` (name a CLI session
-id and the row takes that session's scope: its project and branch), `branch`, `pr`, `tags[]` (attribution keys).
+id and the row takes that session's scope: its project and branch), `branch`, `pr`, `tags[]` (attribution keys), and
+who launched the work — `origin_session` (the session that started it, e.g. a Claude Code session id), `origin_repo`
+(`owner/name`), `origin_pr` (a number, only with `origin_repo`), `run_id` (one id per invocation; `ai-cost log
+--origin-session … --origin-repo … --origin-pr … --run-id …`). `pr` stays free text; `origin_pr` is the number.
 
 **From a shell, straight from the API's response** (the shapes of Anthropic, Google, OpenAI Chat Completions and
 OpenAI Responses are recognised; OpenAI-shaped responses need `--provider`):
@@ -171,7 +174,7 @@ a plain `report` run from inside a project — keeps the project's Claude transc
 no directory (a plugin's review workspace, a Gemini folder the map does not know — `--attribute` places those),
 **includes** rows that name nothing (a usage-log line without `session`, a GitHub row), and counts each group per
 source in the header, so the number says what it could not place. A git worktree is its own project. `--all-projects`
-and `--session <id>` never filter.
+never filters; `--session <id>` keeps the rows stamped with that session, from every project (ADR-0009).
 
 `ai-cost daily` prices the UTC day before today (`--date YYYY-MM-DD` for another) once over every project and once per
 Claude project whose transcripts were written that day, and writes under `<reports>/<date>/`:
@@ -308,7 +311,7 @@ A `Plugin(tests_package="my_llm_costs.tests")` gets its tests run by `ai-cost se
 
 | the person asks | run | read |
 |---|---|---|
-| what did this session cost | `ai-cost report --session latest` (or the id / a transcript path) | sections 1 and 2; say the window, the sources found, `prices checked_at` |
+| what did this session cost | `ai-cost report --session <id>` (or a unique prefix / a transcript path; `latest` is the newest transcript's period) | sections 1 and 2; say what the header left out (other sessions, unstamped rows), the sources found, `prices checked_at` |
 | what did the last N hours / this week cost | `ai-cost report --hours N --all-projects` or `--since … --until …` | as above |
 | what did project X cost | `ai-cost report --project /path/to/X --since … --until …` | the header's `--project …` lines say what was left out and what is included without a directory |
 | what did yesterday cost, per project | `ai-cost daily` then the files under `<reports>/<date>/`; `index.json` for the numbers | `projects[].real_usd`, `notes[]` |

@@ -52,9 +52,7 @@ def _everything(tmp_path: Path) -> tuple[Path, ReportRequest]:
     paths = paths_in(tmp_path)
     write_claude_session(paths, tmp_path / "proj")
     write_codex(paths)
-    return tmp_path, ReportRequest(
-        session="sess-1", project=tmp_path / "proj", groups=("real", "api", "vendor"), detail=True
-    )
+    return tmp_path, ReportRequest(session="sess-1", groups=("real", "api", "vendor"), detail=True)
 
 
 def test_report_window_from_the_session_span_and_all_groups(tmp_path: Path) -> None:
@@ -63,7 +61,10 @@ def test_report_window_from_the_session_span_and_all_groups(tmp_path: Path) -> N
     config, book = defaults(paths)
     report = build_report(request, paths, config, book)
     assert report.window_iso[0] == iso(BASE.replace(minute=59, hour=14))
-    assert report.real and report.api and len(report.rows) >= 6, "Claude + Codex rows"
+    last_turn = BASE + timedelta(minutes=55)
+    assert report.window_iso[1] == iso(last_turn + timedelta(days=1)), "one session reads on for a day"
+    assert report.real and report.api and not [row for row in report.rows if row.model == "gpt-6-astra"]
+    assert report.selection and report.selection.unstamped_rows >= 2, "the Codex rows nobody stamped, listed"
     assert report.vendor is None, "no work items from any source: no vendor quote"
     assert any("not JSON" in s.reason for s in report.skipped), "skipped records are surfaced, not hidden"
 
@@ -85,7 +86,8 @@ def test_markdown_and_json_renderings(tmp_path: Path) -> None:
     tmp, request = _everything(tmp_path)
     paths = paths_in(tmp)
     config, book = defaults(paths)
-    report = build_report(request, paths, config, book)
+    period = replace(request, session=None, since=iso(WINDOW.start), until=iso(WINDOW.end))
+    report = build_report(period, paths, config, book)
     text = render_markdown(report)
     assert all(section in text for section in ("## 1. Real cost", "## 2. API-only", "## Summary"))
     data = json.loads(render_json(report, detail=False))
@@ -247,14 +249,13 @@ def test_cli_report_json_and_exit_codes(tmp_path: Path) -> None:
                     "report",
                     "--session",
                     "sess-1",
-                    "--project",
-                    str(tmp / "proj"),
                     "--format",
                     "json",
                     "--no-auto-check",
                 ]
             )
         assert code == 0 and json.loads(out.getvalue())["real"]["subscriptions"]
+        _assert_project_refused(tmp)
         with redirect_stdout(io.StringIO()):
             assert cli.main(["prices", "check"]) == 2, "offline → usage error, never a network call"
     finally:
@@ -263,6 +264,12 @@ def test_cli_report_json_and_exit_codes(tmp_path: Path) -> None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def _assert_project_refused(tmp: Path) -> None:
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        narrowed = ["report", "--session", "sess-1", "--project", str(tmp / "proj"), "--no-auto-check"]
+        assert cli.main(narrowed) == 2, "a session report reads every project: --project is a usage error"
 
 
 def test_time_parsing_forms() -> None:

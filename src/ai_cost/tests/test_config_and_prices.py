@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import copy
 import email
+import io
 import json
 import os
 import time
 import urllib.error
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -36,7 +38,6 @@ from ..prices_check import (
     auto_check,
     check_due,
     exit_code,
-    expected_amounts,
     fetch,
     load_result,
     match_model,
@@ -46,6 +47,7 @@ from ..prices_check import (
     save_result,
     state_file,
     take_lock,
+    wanted_rates,
 )
 from .fixtures import defaults, paths_in, with_test_plans
 
@@ -365,12 +367,15 @@ def test_expected_amounts_follow_the_active_price_and_every_deepseek_tariff(tmp_
     prices["providers"]["google"]["models"]["gemini-3.8-flash"]["next"]["from"] = "2020-01-01"
     book = parse_pricebook(prices, {}, "prices")
     flash = book.entry(Provider.GOOGLE, "gemini-3.8-flash")
-    assert flash is not None and expected_amounts(flash) == [
-        1.5,
-        7.5,
-    ], "the page is compared with today's price"
+    assert flash is not None and wanted_rates(flash, Provider.GOOGLE)[0] == [
+        ("input", 1.5),
+        ("output", 7.5),
+        ("cached_input", 0.15),
+    ], "the page is compared with today's price, the next block's cache rate included"
     deepseek = book.entry(Provider.DEEPSEEK, "deepseek-flash")
-    assert deepseek is not None and len(expected_amounts(deepseek)) == 6, "peak and off-peak, all three rates"
+    assert (
+        deepseek is not None and len(wanted_rates(deepseek, Provider.DEEPSEEK)[0]) == 6
+    ), "peak and off-peak, all three rates"
     prices = builtin_prices()
     prices["providers"]["xai"]["models"]["grok-4.6"]["long"]["threshold"] = "lots"
     try:
@@ -1152,3 +1157,323 @@ def test_outside_scope_clients_is_a_list_of_names() -> None:
             assert "outside_scope_clients" in str(exc) and repr(bad) in str(exc)
         else:
             raise AssertionError(f"{bad!r} can never match a client: a ConfigError, never silence")
+
+
+def test_a_changed_cache_rate_in_the_models_row_is_caught(tmp_path: Path) -> None:
+    """Anthropic lists every cache rate in the model's row: a changed one is a change (DEF-AC-01)."""
+    _, book = defaults(paths_in(tmp_path))
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5-1")
+    assert isinstance(fable, TokenTierPrice)
+    rates = [fable.input, fable.cache_write_5m, fable.cache_write_1h, fable.cache_read, fable.output]
+    row = "".join(f"<td>${rate:g}</td>" for rate in rates)
+    same = page_text(f"<table><tr><td>Claude Fable 5.1</td>{row}</tr></table>")
+    assert match_model([same], Provider.ANTHROPIC, "claude-fable-5-1", fable).status is CheckStatus.CONFIRMED
+    moved = page_text(
+        f"<table><tr><td>Claude Fable 5.1</td>{row.replace(f'${fable.cache_read:g}<', '$9.99<')}</tr></table>"
+    )
+    assert match_model([moved], Provider.ANTHROPIC, "claude-fable-5-1", fable).status is CheckStatus.CHANGED
+
+
+def test_a_cache_rate_listed_apart_is_named_when_the_row_lacks_it(tmp_path: Path) -> None:
+    """Alibaba shows cached input as a share in prose: the price confirms on its pair, the rate is said, never a change."""
+    _, book = defaults(paths_in(tmp_path))
+    qwen = book.entry(Provider.ALIBABA, "qwen3.8-flash")
+    assert isinstance(qwen, TokenTierPrice) and qwen.cached_input
+    row = f"<tr><td>qwen3.8-flash</td><td>${qwen.input:g}</td><td>${qwen.output:g}</td></tr>"
+    row = f"<table>{row}<tr><td>qwen3.8-max</td><td>$2</td><td>$6</td></tr></table>"
+    elsewhere = page_text(row + f"<p>Batch: ${qwen.cached_input:g} per 1M</p>")
+    found = match_model([elsewhere], Provider.ALIBABA, "qwen3.8-flash", qwen)
+    assert found.status is CheckStatus.CONFIRMED and found.unchecked == [
+        f"cached_input {qwen.cached_input:g}"
+    ], "an amount somewhere on the page proves nothing"
+    in_row = row.replace("</tr>", f"<td>${qwen.cached_input:g}</td></tr>", 1)
+    assert match_model([page_text(in_row)], Provider.ALIBABA, "qwen3.8-flash", qwen).unchecked == []
+
+
+def _anthropic_rows(*rows: tuple[str, list[float]]) -> str:
+    cells = "".join(
+        f"<tr><td>{name}</td>" + "".join(f"<td>${rate:g} / MTok</td>" for rate in rates) + "</tr>"
+        for name, rates in rows
+    )
+    return page_text(f"<table>{cells}</table>")
+
+
+def test_a_neighbours_row_never_confirms_a_model(tmp_path: Path) -> None:
+    """The live page's case: Claude Fable 5's cache read changed, the next row (Mythos 5) still shows the old one."""
+    _, book = defaults(paths_in(tmp_path))
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5")
+    assert isinstance(fable, TokenTierPrice)
+    own = [fable.input, fable.output, fable.cache_write_5m, fable.cache_write_1h]
+    page = _anthropic_rows(
+        ("Claude Fable 5.1", [10, 50, 12.5, 20, 0.25]),
+        ("Claude Fable 5", [*own, fable.cache_read + 0.25]),
+        ("Claude Mythos 5", [*own, fable.cache_read]),
+    )
+    check = match_model([page], Provider.ANTHROPIC, "claude-fable-5", fable)
+    assert check.status is CheckStatus.CHANGED and check.missing == [f"cache_read {fable.cache_read:g}"]
+    only_longer = _anthropic_rows(("Claude Fable 5.1", [*own, fable.cache_read]))
+    assert (
+        match_model([only_longer], Provider.ANTHROPIC, "claude-fable-5", fable).status
+        is CheckStatus.NOT_FOUND
+    ), "Claude Fable 5 inside Claude Fable 5.1 is another model"
+
+
+def test_openai_lists_cached_input_in_the_row_and_a_change_there_is_caught(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    sol = book.entry(Provider.OPENAI, "gpt-5.6-sol")
+    assert isinstance(sol, TokenTierPrice) and sol.cached_input
+    cells = [sol.input, sol.cached_input, sol.output]
+    row = "".join(f"<td>${rate:.2f}</td>" for rate in cells)
+    same = page_text(
+        f"<table><tr><td>gpt-5.6-sol</td>{row}</tr><tr><td>gpt-6-astra</td><td>$0.40</td></tr></table>"
+    )
+    assert match_model([same], Provider.OPENAI, "gpt-5.6-sol", sol).status is CheckStatus.CONFIRMED
+    moved = same.replace(f"${sol.cached_input:.2f}", "$0.55", 1)
+    check = match_model([moved], Provider.OPENAI, "gpt-5.6-sol", sol)
+    assert check.status is CheckStatus.CHANGED and check.missing == [
+        f"cached_input {sol.cached_input:g}"
+    ], "gpt-6-astra's $0.40 is its own row's"
+
+
+def test_a_changed_long_context_rate_is_a_change(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    pro = book.entry(Provider.GOOGLE, "gemini-2.5-pro")
+    assert isinstance(pro, TokenTierPrice) and pro.long is not None
+    rates = [pro.input, pro.long.input, pro.output, pro.long.output, pro.cached_input, pro.long.cached_input]
+    section = "Gemini 2.5 Pro Input price " + " ".join(f"${rate:g}" for rate in rates)
+    assert match_model([section], Provider.GOOGLE, "gemini-2.5-pro", pro).status is CheckStatus.CONFIRMED
+    moved = section.replace(f"${pro.long.output:g}", "$18")
+    check = match_model([moved], Provider.GOOGLE, "gemini-2.5-pro", pro)
+    assert check.status is CheckStatus.CHANGED and check.missing == [f"long output {pro.long.output:g}"]
+
+
+def test_a_page_in_columns_keeps_the_span(tmp_path: Path) -> None:
+    """DeepSeek names both models, then every figure: a row bound would give the first name nothing."""
+    _, book = defaults(paths_in(tmp_path))
+    flash = book.entry(Provider.DEEPSEEK, "deepseek-flash")
+    assert isinstance(flash, PeakOffpeakPrice)
+    figures = [
+        getattr(tariff, rate)
+        for tariff in (flash.peak, flash.offpeak)
+        for rate in ("cache_hit", "cache_miss", "output")
+    ]
+    page = "MODEL deepseek-flash deepseek-v4-pro VERSION DeepSeek-V4.1-Flash DeepSeek-V4-Pro-0813 PRICE "
+    page += " ".join(f"${rate:g}" for rate in figures)
+    assert match_model([page], Provider.DEEPSEEK, "deepseek-flash", flash).status is CheckStatus.CONFIRMED
+    pro = book.entry(Provider.DEEPSEEK, "deepseek-v4-pro")
+    assert isinstance(pro, PeakOffpeakPrice)
+    theirs = " ".join(
+        f"${getattr(tariff, rate):g}"
+        for tariff in (pro.peak, pro.offpeak)
+        for rate in ("cache_hit", "cache_miss", "output")
+    )
+    labels = "MODEL VERSION DeepSeek-V4-Pro-0813 PRICE " + theirs
+    assert (
+        match_model([labels], Provider.DEEPSEEK, "deepseek-v4-pro", pro).status is CheckStatus.CONFIRMED
+    ), "a display name inside a compound label"
+
+
+def test_the_state_file_keeps_what_a_row_lacks_and_an_older_one_loads() -> None:
+    result = CheckResult(checked_at="2026-09-30T00:00:00Z")
+    result.providers["openai"] = ProviderCheck(
+        "u",
+        "fetched",
+        {"m": ModelCheck(CheckStatus.CHANGED, [1.0, 2.0], [1.0], ["output 2"], ["cached_input 0.1"])},
+    )
+    back = CheckResult.from_json(result.to_json()).providers["openai"].models["m"]
+    assert (back.missing, back.unchecked) == (["output 2"], ["cached_input 0.1"])
+    old = {
+        "providers": {
+            "openai": {"url": "u", "status": "s", "models": {"m": {"status": "confirmed", "expected": [1]}}}
+        }
+    }
+    assert CheckResult.from_json(old).providers["openai"].models["m"].unchecked == []
+
+
+def test_the_check_line_names_what_changed_and_quiet_prints_only_that() -> None:
+    """Printed through redirect_stdout: the shipped selftest runs this test too, and provides tmp_path only."""
+    from ..cli import _emit_check
+
+    changed = ModelCheck(CheckStatus.CHANGED, [1.0, 2.0], [1.0, 3.0], missing=["output 2"])
+    apart = ModelCheck(CheckStatus.CONFIRMED, [1.0, 2.0], [1.0, 2.0], unchecked=["cached_input 0.1"])
+    printed = io.StringIO()
+    with redirect_stdout(printed):
+        _emit_check("m-changed", changed, quiet=True)
+        _emit_check("m-apart", apart, quiet=True)
+    quiet = printed.getvalue()
+    assert "!! m-changed" in quiet and "not in its row: output 2" in quiet and "m-apart" not in quiet
+    printed = io.StringIO()
+    with redirect_stdout(printed):
+        _emit_check("m-apart", apart, quiet=False)
+    loud = printed.getvalue().splitlines()
+    assert (
+        loud[0].startswith("   ok m-apart")
+        and loud[1].startswith("   ~  m-apart")
+        and "cached_input 0.1" in loud[1]
+    )
+
+
+def test_a_changed_check_names_what_its_nearest_row_lacks(tmp_path: Path) -> None:
+    """The live page's worked example holds 16 amounts after the name: the model's own row is the one to compare."""
+    _, book = defaults(paths_in(tmp_path))
+    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5")
+    assert isinstance(opus, TokenTierPrice)
+    own = [opus.input + 1, opus.output, opus.cache_write_5m, opus.cache_write_1h, opus.cache_read]
+    page = _anthropic_rows(("Claude Opus 5", own))
+    page += " Example: Claude Opus 5 consumes 50,000 input tokens " + " ".join(f"${n}" for n in range(1, 17))
+    check = match_model([page], Provider.ANTHROPIC, "claude-opus-5", opus)
+    assert check.status is CheckStatus.CHANGED and check.missing == [f"input {opus.input:g}"], check.missing
+
+
+def test_update_writes_a_pair_only_when_the_check_expected_a_pair(tmp_path: Path) -> None:
+    """A row cut to two amounts for a vendor whose row holds cache rates is not a price row: a hand edit."""
+    _, book = defaults(paths_in(tmp_path))
+    user = tmp_path / "prices.json"
+    result = CheckResult(checked_at="2026-09-30T00:00:00Z")
+    three = ModelCheck(CheckStatus.CHANGED, [1.25, 10.0, 0.125], [1.5, 2.5], missing=["input 1.25"])
+    pair = ModelCheck(CheckStatus.CHANGED, [0.15, 0.47], [0.2, 0.47], missing=["input 0.15"])
+    result.providers["google"] = ProviderCheck("u", "fetched", {"gemini-2.5-pro": three})
+    result.providers["alibaba"] = ProviderCheck("u", "fetched", {"qwen3.8-flash": pair})
+    applied = apply_check(result, book, user)
+    assert [(p, m) for p, m, _, _ in applied] == [("alibaba", "qwen3.8-flash")]
+    assert three.status is CheckStatus.CHANGED and pair.status is CheckStatus.APPLIED and pair.missing == []
+
+
+def test_doctor_names_the_rates_the_last_check_found_listed_apart() -> None:
+    from ..ops import _unchecked_rates
+
+    result = CheckResult(checked_at="2026-09-30T00:00:00Z")
+    result.providers["alibaba"] = ProviderCheck(
+        "u",
+        "fetched",
+        {
+            "qwen3.8-flash": ModelCheck(
+                CheckStatus.CONFIRMED, [0.15, 0.47], unchecked=["cached_input 0.015"]
+            ),
+            "qwen3.8-max": ModelCheck(CheckStatus.CONFIRMED, [2.0, 6.0]),
+        },
+    )
+    assert _unchecked_rates(result) == [("alibaba", "qwen3.8-flash", "cached_input 0.015")]
+    assert _unchecked_rates(None) == []
+
+
+def test_the_vendors_rows_end_at_any_of_its_model_names_and_a_name_is_whole(tmp_path: Path) -> None:
+    """As check_prices builds them: every model's names of the vendor; an id inside a longer id is another model."""
+    from ..prices_check import page_rows
+
+    _, book = defaults(paths_in(tmp_path))
+    models = book.models[Provider.ANTHROPIC]
+    rows = page_rows(
+        Provider.ANTHROPIC, [n for m, e in models.items() for n in name_variants(Provider.ANTHROPIC, m, e)]
+    )
+    opus = models["claude-opus-5"]
+    assert isinstance(opus, TokenTierPrice)
+    figures = " ".join(
+        f"${rate:g}" for rate in (opus.input, opus.output, opus.cache_write_5m, opus.cache_write_1h)
+    )
+    page = f"Claude Opus 5 {figures} Sonnet 5 ${opus.cache_read:g}"
+    check = match_model([page], Provider.ANTHROPIC, "claude-opus-5", opus, rows)
+    assert (
+        check.status is CheckStatus.CHANGED
+    ), "Sonnet 5 starts another row: its figure is not Opus 5's cache read"
+    sol = TokenTierPrice(input=4.0, output=20.0)
+    only_longer = "gpt-5.6-sol $4.00 $20.00"
+    assert match_model([only_longer], Provider.OPENAI, "gpt-5.6", sol).status is CheckStatus.NOT_FOUND
+
+
+def _vendor_rows(provider: Provider, book: Any) -> Any:
+    from ..prices_check import page_rows
+
+    models = book.models[provider]
+    return page_rows(provider, [n for m, e in models.items() for n in name_variants(provider, m, e)])
+
+
+def test_a_row_ends_at_a_neighbour_written_as_an_id(tmp_path: Path) -> None:
+    """A page whose rows name models by id: the next id ends the row as a display name does."""
+    _, book = defaults(paths_in(tmp_path))
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5")
+    assert isinstance(fable, TokenTierPrice)
+    own = [fable.input, fable.output, fable.cache_write_5m, fable.cache_write_1h]
+    page = " ".join(
+        f"{name} " + " ".join(f"${rate:g} / MTok" for rate in rates)
+        for name, rates in (
+            ("claude-fable-5", [*own, fable.cache_read + 0.25]),
+            ("claude-mythos-5", [*own, fable.cache_read]),
+        )
+    )
+    check = match_model(
+        [page], Provider.ANTHROPIC, "claude-fable-5", fable, _vendor_rows(Provider.ANTHROPIC, book)
+    )
+    assert check.status is CheckStatus.CHANGED, "claude-mythos-5's cache read is not claude-fable-5's"
+
+
+def test_the_models_own_id_and_endpoint_do_not_end_its_section_another_version_does(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    pro = book.entry(Provider.GOOGLE, "gemini-3.1-pro-preview")
+    assert isinstance(pro, TokenTierPrice) and pro.long is not None
+    rates = [pro.input, pro.long.input, pro.output, pro.long.output, pro.cached_input, pro.long.cached_input]
+    section = "Gemini 3.1 Pro Preview gemini-3.1-pro-preview and gemini-3.1-pro-preview-customtools Try it "
+    section += "Input price " + " ".join(f"${rate:g}" for rate in rates)
+    rows = _vendor_rows(Provider.GOOGLE, book)
+    assert (
+        match_model([section], Provider.GOOGLE, "gemini-3.1-pro-preview", pro, rows).status
+        is CheckStatus.CONFIRMED
+    )
+    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5")
+    assert isinstance(opus, TokenTierPrice)
+    figures = " ".join(
+        f"${rate:g}" for rate in (opus.input, opus.output, opus.cache_write_5m, opus.cache_write_1h)
+    )
+    versions = f"claude-opus-5 {figures} claude-opus-5-5 ${opus.cache_read:g}"
+    check = match_model(
+        [versions], Provider.ANTHROPIC, "claude-opus-5", opus, _vendor_rows(Provider.ANTHROPIC, book)
+    )
+    assert check.status is CheckStatus.CHANGED, "claude-opus-5-5 is another model"
+
+
+def test_two_equal_rates_need_the_figure_twice() -> None:
+    entry = TokenTierPrice(input=1.0, output=5.0, cache_read=5.0)
+    once = "claude-test-1 $1 $5"
+    check = match_model([once], Provider.ANTHROPIC, "claude-test-1", entry)
+    assert check.status is CheckStatus.CHANGED and check.missing == ["cache_read 5"]
+    assert (
+        match_model([once + " $5"], Provider.ANTHROPIC, "claude-test-1", entry).status
+        is CheckStatus.CONFIRMED
+    )
+
+
+def test_a_changed_row_still_names_the_rates_listed_apart(tmp_path: Path) -> None:
+    """A changed price that `update` then applies keeps its warning: the rates its row does not show."""
+    _, book = defaults(paths_in(tmp_path))
+    qwen = book.entry(Provider.ALIBABA, "qwen3.8-flash")
+    assert isinstance(qwen, TokenTierPrice) and qwen.cached_input
+    page = f"qwen3.8-flash ${qwen.input + 0.05:g} ${qwen.output:g} qwen3.8-max $2 $6"
+    check = match_model([page], Provider.ALIBABA, "qwen3.8-flash", qwen)
+    assert check.status is CheckStatus.CHANGED and check.unchecked == [f"cached_input {qwen.cached_input:g}"]
+
+
+def test_a_figure_the_pair_took_never_answers_a_rate_listed_apart(tmp_path: Path) -> None:
+    """grok-4.20's output and long-context input are both 2.5: the row's one $2.5 is the output's."""
+    _, book = defaults(paths_in(tmp_path))
+    grok = book.entry(Provider.XAI, "grok-4.20-0309-reasoning")
+    assert isinstance(grok, TokenTierPrice) and grok.long is not None and grok.long.input == grok.output
+    page = f"grok-4.20-0309-reasoning ${grok.input:g} ${grok.output:g} grok-4.6 $2 $6"
+    check = match_model([page], Provider.XAI, "grok-4.20-0309-reasoning", grok)
+    assert check.status is CheckStatus.CONFIRMED and f"long input {grok.long.input:g}" in check.unchecked
+
+
+def test_two_rows_of_one_model_never_pool_their_figures(tmp_path: Path) -> None:
+    """Its standard row and its batch row (under its id) are two rows: neither alone holds the changed price."""
+    _, book = defaults(paths_in(tmp_path))
+    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5")
+    assert isinstance(opus, TokenTierPrice)
+    standard = [opus.input + 1, opus.output, opus.cache_write_5m, opus.cache_write_1h]
+    page = (
+        "Claude Opus 5 "
+        + " ".join(f"${r:g}" for r in standard)
+        + f" claude-opus-5 ${opus.input:g} ${opus.cache_read:g}"
+    )
+    check = match_model(
+        [page], Provider.ANTHROPIC, "claude-opus-5", opus, _vendor_rows(Provider.ANTHROPIC, book)
+    )
+    assert check.status is CheckStatus.CHANGED, "the id after an amount starts the model's next row"

@@ -30,6 +30,12 @@ $ ai-cost report --session latest
 # AI cost report — 2026-09-19T15:01:09Z → 2026-09-20T00:35:24Z (9.6 h)
 ## 1. Real cost (what you paid): 54.71 USD
 ## 2. API-only cost (as if no subscription existed): 175.02 USD
+## Per model
+| Provider | Model | Records | Model calls | Tokens | Paid USD | How it was paid | API list USD |
+|---|---|---|---|---|---|---|---|
+| anthropic | claude-opus-5-5 | 2474 |  | … | 0.00 | plan ×2474 | 694.47 |
+| xai | grok-4.7 | 29 | 41 | … | 15.24 | API key 15.24 (reported) | 15.24 |
+| deepseek | deepseek-flash | 111 | 111 | … | 2.35 | API key 2.35 (list price) | 2.35 |
 ## 3. Vendor quote (what an outside firm would charge): profile `consultancy-eu`
 | Staffing | Rate EUR/h | Time factor | Senior review | Hours | Working days | Quote EUR |
 | junior | 70 | 1.8 | 25% | 148–296 | 24.7–49.3 | 12 950–25 900 |
@@ -63,10 +69,10 @@ Requirements: Python ≥ 3.9 (also under npm, which only starts it). `gh` only f
 | command | does |
 |---|---|
 | `report` (default) | the three groups for a window. `--session <id\|latest\|all\|path>` `--project DIR` (every source scoped to that directory — "Per project" below) `--all-projects` · `--unpriced fail\|skip` · `--since/--until` `--hours N` (N > 0; default the config's `window_default_hours`, 24) · `--github owner/repo` · `--group real,api,vendor` · `--items scope.md` `--vendor-profile NAME` · `--setting PLUGIN.KEY=VALUE` · `--format md\|json\|table` `--out FILE` `--detail` |
-| `log` | append one usage line for a request your program made: `--provider openai --model gpt-5.5 --input 1200 --output 300 [--cost 0.0123] [--ref job-42] [--tag ci]`, or `--from-response resp.json [--provider …]` for a raw Anthropic / Google / OpenAI response; `--log FILE` picks the file — a model the pricebook does not list needs `--cost` (or an entry in your prices file): the line is refused rather than written as a row every report would fail on |
+| `log` | append one usage line for a request your program made: `--provider openai --model gpt-5.5 --input 1200 --output 300 [--cost 0.0123] [--ref job-42] [--tag ci] [--origin-session S --origin-repo owner/name --origin-pr N --run-id R]`, or `--from-response resp.json [--provider …]` for a raw Anthropic / Google / OpenAI response; `--log FILE` picks the file — a model the pricebook does not list needs `--cost` (or an entry in your prices file): the line is refused rather than written as a row every report would fail on |
 | `prices show` | merged registry (shipped defaults → your overrides) |
-| `prices check` | re-read every vendor page, report `confirmed` / `changed?` / `not-found` / `fetch-failed`; exit 4 on drift |
-| `prices update` | check, then write unambiguous changes to **your** `~/.config/ai-cost/prices.json` |
+| `prices check` | re-read every vendor page, report `confirmed` / `changed?` / `not-found` / `fetch-failed`; exit 4 on drift. A model is read in its own row (its name as a whole word, up to the next model name). Where the vendor lists its cache and long-context rates in that row (Anthropic, Google, OpenAI), they are part of what confirms the price and a `!!` line names what the row lacks; elsewhere a rate the row does not show is named on a `~` line (`listed apart from its row: cached_input 0.015`), without failing the check. `--quiet` prints only what changed or vanished (`doctor` names the `~` rates of the last check) |
+| `prices update` | check, then write unambiguous changes to **your** `~/.config/ai-cost/prices.json`: a changed input/output pair read from a row of exactly those two amounts, where the check expected a pair (Alibaba, xAI); a vendor whose row holds cache rates (Anthropic, Google, OpenAI) is always a hand edit |
 | `doctor` | diagnostics: sources found (Claude, Codex, Gemini CLI, Grok Build, the usage log), your plans and how each provider's rows of the last 24 h were billed (a `!!` line names the key to set and the value that fits), plugins, config, prices, both schedules, the newest daily index, the last reconciliation; exit 1 on problems |
 | `daily` | write one UTC day's reports: `global.{md,json}` over every project and `<project dir>.{md,json}` per Claude project touched that day, plus `index.json` — `--date YYYY-MM-DD` (default yesterday), `--out DIR` (default `AI_COST_REPORTS_DIR` or `$XDG_DATA_HOME/ai-cost/reports`), `--quiet`; the job `install --schedule-reports` runs |
 | `import deepseek` | `<export ZIP>` (or the two CSV files with `--captured WHEN`): check DeepSeek's usage export and keep its days as the provider's day report — "Provider day reports" below |
@@ -78,7 +84,15 @@ Requirements: Python ≥ 3.9 (also under npm, which only starts it). `gh` only f
 The window comes from `--since/--until`, else from the session's first and last timestamp, else the last `--hours`
 (the config's `window_default_hours`, 24 by default).
 Every source is filtered to that window, so a report is reproducible. Without `--session/--project`, the cwd's
-project transcripts are read (every project's when the cwd has none). Codex usage is summed per turn inside the
+project transcripts are read (every project's when the cwd has none).
+
+**One session** (`--session <id|prefix|path>`, ADR-0009): the report keeps only the rows stamped with that session —
+its transcript (subagents included) and every run it launched that carries its id (a usage-log line's
+`origin_session`, a plugin's stamp), from every project. Collection runs to a day after the last turn, so a late
+run is in; the header counts the rows of other sessions and the rows without a stamp in the session's span, and the
+unstamped ones are listed under the report, never summed. No subscription fee is allocated to a session: "real" is
+its cash; a vendor quote needs `--items`. `--project`, `--all-projects` and `--github` are refused with it; `latest`
+and `all` stay period reports. Codex usage is summed per turn inside the
 window, so a session resumed from before it or still running after it contributes only the turns in between.
 
 **Per project.** Every CLI row carries the working directory its CLI ran in (a Codex rollout's `cwd`, a Gemini CLI
@@ -88,7 +102,8 @@ a plain `report` run from inside a project — then keeps the project's Claude t
 directory is `DIR` or below it (symlinks resolved), leaves out rows of other directories and rows of named
 workspaces that are no directory (a review workspace, a folder the map does not know — `--attribute` places those),
 and includes rows that name nothing; the header counts each group per source, so the number is honest about what it
-could not place. A git worktree is its own project. `--all-projects` and `--session <id>` never filter.
+could not place. A git worktree is its own project. `--all-projects` never filters; `--session <id>` selects by the
+session's stamp instead.
 
 ## Sources it reads
 
@@ -128,7 +143,9 @@ deepseek line) makes the line a counted skip, and `ai-cost log` / `record()` ref
 at zero in silence. Optional keys: `cost` (what the request was charged, USD — a `currency` other than `USD` is a
 counted skip; a row with `cost` and no list price is priced by it), `billing` (`api` | `subscription`; a line with tokens or a cost is
 `api` by default), `ref`, `session`, `branch`, `pr`, `tags`, `source`, `event_id` (a repeated id within one file is
-read once). From Python: `ai_cost.log.record("openai", "gpt-5.5", {"input": 12, "output": 3}, ref="job-42")`;
+read once), and who launched the work: `origin_session` and `run_id` (letters, digits and `. _ : -`, at most 200
+characters), `origin_repo` (`owner/name`), `origin_pr` (a positive integer, only beside `origin_repo`) — a malformed
+origin keeps the line's usage and is one counted warning per file. From Python: `ai_cost.log.record("openai", "gpt-5.5", {"input": 12, "output": 3}, ref="job-42")`;
 from a shell: `ai-cost log --from-response resp.json --provider openai` maps a raw API response's usage block
 (Google, DeepSeek and Anthropic name themselves — Google by `usageMetadata`, DeepSeek by `prompt_cache_hit_tokens`, Anthropic by `type: message` or its cache counters; a bare OpenAI-shaped usage block needs `--provider`). A line that fails validation (a boolean, a
 negative or fractional count, a malformed provider id) is a counted skip, never a guess; a well-formed provider or model the pricebook does not list, with no cost, is an unpriced row under `--unpriced`.
@@ -217,17 +234,24 @@ Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`
 `row_count`, `sources`, `warnings`, `skipped` (`[{source, path, reason}]`), `prices_checked_at`, `real`
 (`subscriptions[]` — a share the usage report states has `attribution` `invoice`, `seats` 0 and its user-months in
 `note` —, `usage[]`, `cash_usd`, `subscription_usd`, `total_usd`, `unknown_billing`, `unknown_by_provider`, `unfigured_ledger`), `api` (`lines[]`,
-`total_usd`), `vendor` (when items exist), `attribution` (with `--attribute`), `github_bill` (with `providers.github.bill`:
+`total_usd`), `models[]` (with the API group: one per model — `provider`, `model`, `records`, `model_calls`, `tokens`, `api_usd`, `paid_usd`, `payments[]` with `paid` (`plan`, `metered beyond the plan`, `API key`, `billed`, `untracked`, `settled on another row`, `unknown`), `evidence` (`list price`, `reported`, `ledger`, `usage report`, `provider report`, `no amount`), `usd`, `rows` and `text` (the table's cell); the payments sum to the real group's cash on the model), `vendor` (when items exist), `attribution` (with `--attribute`: `lines[]`, each with its `models[]` — `provider`, `model`, `calls`, `model_calls`, `tokens`,
+`api_usd`, `cash_usd`, `notes`, `payments[]`; one per model the label's rows name, the largest list price first; cash is
+what the real group counts on that model's own rows — a ledger's settlement included, 0 under a plan —, `notes` name the
+billing rules that counted it (`api-key (ledger)`, `plan`, …) and `payments[]` split that cash as the per-model table
+does, each with its `text` — the cell as the table prints it; a provider report's difference is the model
+`untracked`), `github_bill` (with `providers.github.bill`:
 `account`, `read_at`, `days`, `provisional`, `counted[]` / `left_out[]` (`product`, `sku`, `unit`, `lines`, `quantity`,
-`gross`, `discount`, `net` — amounts as exact text), `outside[]` (days the window only touches), `missing` (months not
-read, with the reason)), `provider_reports` (with `providers.<name>.report`: per provider `days[]` —
+`gross`, `discount`, `net` — amounts as exact text), `outside[]` (days the window only touches), `repositories[]` (every
+touched day's counted lines per repository: `day`, `repository`, `product`, `sku`, `lines`, `gross`, `discount`, `net`,
+`final` — false while the day may still grow; a repository's day holds every use in it that day, the report splits it
+no further), `missing` (months not read, with the reason)), `provider_reports` (with `providers.<name>.report`: per provider `days[]` —
 `day` (`start`, `end`, `lines[]` with `gross` / `net` / `requests` / `excluded` / `rate_note` — the provider's own
 conversion, e.g. `PLN ÷ 3.75385` —, `closed`, `currency`, `counts_requests` — the provider states a request
 count per line —, `requests` — `null` when it states none), `local_api`, `local_real`, `api_diff`, `real_diff` (exact
 text; `null` when not compared), `why_not`, `unknown_rows`, `local_requests`, `uncounted_rows` — plus `missing[]` and
 `unreadable[]` spans with their reason, `offline` (a live source not asked) and `utc_days` (its days are UTC days, so
 `daily` reads a day not final again)). A line's `calls` is what it folded in
-(rows, review runs, Copilot reviews — the `Runs` column) and `model_calls` the API requests its sources reported
+(rows, review runs, Copilot reviews — the `Records` column) and `model_calls` the API requests its sources reported
 (`Model calls`; 0 where none does); `--detail` adds `rows[]`, where
 `client` is the program that wrote the session (a Codex rollout's `originator`), `cost_reported` is the source's
 own figure for the row: cash for an `api` row (a charge the source reported), the

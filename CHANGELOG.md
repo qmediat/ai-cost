@@ -3,6 +3,78 @@
 All notable changes to `ai-cost` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.8.0] - 2026-10-01
+
+### Fixed
+
+- `ai-cost selftest` passes again: one test asked pytest for `capsys`, which the shipped runner does not provide (it
+  provides `tmp_path` only); a test now fails in CI when a shipped test takes any other fixture.
+- An aborted Grok Build turn (every counter 0, no model id: `unknown`) reports its cost as exactly 0, so it needs no
+  price: it was listed as an unpriced row to add to prices.json. The pricer is unchanged — a row of any other source
+  that counts nothing and has no price still fails loud (exit 5).
+
+### Added
+
+- A "Per model" table in every report that has the API group: one row per model with its records, calls and tokens,
+  the cash the real group counts on it split by how it was paid (`plan`, `metered beyond the plan`, `API key`, `billed`, `untracked`, `settled on another row`, `unknown`) and what the amount rests on (`list price`, `reported`, `ledger`, `usage report`, `provider report`, `no amount`),
+  beside its list price (marked when the model has none and the figure is the one the tool reported). JSON: `models[]` with `payments[]`. A subscription fee is never split across models.
+- Each attribution model says how its cash was paid, by the same rule as the per-model table (JSON
+  `attribution.lines[].models[].payments[]`); every payment carries `text`, the cell as the table prints it.
+- The GitHub usage report's amounts per repository and UTC day for every day the window touches (JSON
+  `github_bill.repositories[]`, exact text, `final` false while the day may still grow): a repository's day is the
+  report's own line sum, never split further.
+
+- Each attribution line of the JSON report lists its models (`attribution.lines[].models[]`: provider, model, calls,
+  model calls, tokens, list-price USD and the cash the real group counts on that model's own rows, a ledger's
+  settlement included), so a label — a PR, a branch, a workspace — reads as a per-model table. Plan-covered usage
+  shows 0 cash; its fee stays a subscription share of the label.
+- Usage-log lines can say who launched the work: `origin_session`, `origin_repo` (`owner/name`), `origin_pr` (a positive
+  number, only with a repository) and `run_id`. `ai-cost log` takes `--origin-session`, `--origin-repo`, `--origin-pr`
+  and `--run-id`, `record()` takes the same keys, and one validator serves the writer and the reader (ADR-0005
+  amended). A malformed origin keeps the line's usage and is one counted warning per file; a report reads the
+  lines as before.
+
+### Changed
+
+- `prices check` reads a model's own row: its name as a whole word (`Claude Fable 5` is no longer found inside
+  `Claude Fable 5.1`), up to the next model name the page shows — a display name or an id, whichever form the page
+  uses; the model's other names (its id after its display name, an endpoint such as `…-customtools`) do not end it
+  in the row's header, before its first amount (after one, the model's own id starts its next row) —
+  600 characters at most; a page in columns (DeepSeek) keeps the span. A neighbour's figures no longer confirm a model
+  whose price changed, and one figure answers one rate (two equal rates need it twice; a figure the input/output pair
+  took never answers a rate listed apart, as grok-4.20's output and long input share 2.5). On DeepSeek's column page a
+  changed figure equal to the other model's is not noticed (today the two share none), and a name that extends the
+  model's own with a word in its row's header (an endpoint, `…-customtools`) is read as the model's. A limit, said: a model is
+  confirmed by any of its rows, so a page that still shows the old figures in another of the model's rows (an example,
+  a second table) hides a change in the first — a rule that flagged such a pair would flag gpt-6-astra today, whose
+  batch and flex tables share figures with its standard row.
+- `prices check` confirms a model's cache and long-context rates too where the vendor lists them in the model's row
+  (Anthropic, Google, OpenAI — measured on the live pages 2026-09-30): there a changed one is `changed?`, and the line
+  names what the row lacks (`not in its row: cache_read 1`). Alibaba and xAI list them apart or not at all: a rate the
+  confirming row does not show is named on a `~` line (`listed apart from its row: cached_input 0.015`), never a
+  failed check; `--quiet` prints only what changed or vanished, and `doctor` names those rates from the last check.
+  The state file keeps both lists. A `!!` line names what the model's nearest row lacks (the fewest missing amounts).
+  `prices update` writes a pair read from a row of exactly two amounts only where the check expected a pair (a vendor
+  whose row holds cache rates is a hand edit). Two limits, said: a row showing one figure twice (Alibaba's non-thinking
+  and thinking output) confirms while either still shows it, and a page listing a model only under a dated snapshot id
+  (`qwen3.7-plus-2026-05-26`) does not name the plain id (today every vendor prints both).
+
+- The tables' "Runs" column is "Records": it counts the records a source gave (a Codex row aggregates a session's
+  model and day, a Grok row can hold several model calls), never runs.
+
+- `report --session <id>` counts what that session launched, not what happened while it ran (ADR-0009). Every row
+  carries the session that launched it (a transcript's id, a usage-log line's `origin_session`, a plugin's stamp); the
+  report keeps the rows stamped with the session, from every project, collected up to a day after its last turn.
+  The header counts the rows of other sessions and the rows without a stamp in the session's span, and the unstamped
+  ones are listed under the report, never summed. No subscription fee is allocated to a session, and the sources' work
+  items give it no vendor quote (`--items` does). A prefix naming two transcripts, a subagent transcript,
+  `--github`, `--project` or `--all-projects` with `--session`, and a session without a transcript or dates are
+  usage errors. `latest` and `all` keep their period meaning.
+- A repeated usage-log event keeps its copy that carries a session stamp; a copy stamped for another session is
+  counted as a conflict.
+
 ## [2.7.1] - 2026-09-27
 
 ### Changed
@@ -16,6 +88,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A payment below zero (a credit) keeps its sign in the per-model table and in `payments[].text`; only an amount between
+  zero and half a cent reads `< 0.01`.
 - A local sum of no rows shows as `0`, not as eighteen zeros.
 - A request line is printed only for a provider that states request counts (DeepSeek), and only when either side
   counted something: no more "provider 0 request(s), local 0". A DeepSeek day that billed nothing still faces the

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -29,9 +29,10 @@ from ..models import (
     UsageRow,
     Window,
 )
+from ..origin import origin_of
 from ..pricing import as_tier_family, counters_of, folds_to_tiers
 from ..timeutil import parse_ts
-from ..values import count, money
+from ..values import count, money, optional_text
 
 if TYPE_CHECKING:
     from ..config import Config, Paths, PriceBook
@@ -115,8 +116,8 @@ def _scope(entry: Mapping[str, Any]) -> Scope:
     if not isinstance(tags, (list, tuple)) or not all(isinstance(tag, str) for tag in tags):
         raise ValueError("tags must be a list of strings")  # as the writer's Attribution requires
     return Scope(
-        branch=_optional_text(entry, "branch"),
-        pr=_optional_text(entry, "pr"),
+        branch=optional_text(entry, "branch"),
+        pr=optional_text(entry, "pr"),
         paths=tuple(tags),
     )
 
@@ -124,16 +125,6 @@ def _scope(entry: Mapping[str, Any]) -> Scope:
 def _text(entry: Mapping[str, Any], key: str) -> str:
     """A required id as the string it must be: a number is not a provider or a model, however it would print."""
     value = entry[key]
-    if not isinstance(value, str):
-        raise ValueError(f"{key} must be a string, got {type(value).__name__}")
-    return value
-
-
-def _optional_text(entry: Mapping[str, Any], key: str) -> str:
-    """An optional key as the writer writes it: a string, or absent; a list or a number is a ``ValueError``."""
-    value = entry.get(key)
-    if value is None:
-        return ""
     if not isinstance(value, str):
         raise ValueError(f"{key} must be a string, got {type(value).__name__}")
     return value
@@ -184,15 +175,24 @@ def parse_line(entry: Any, source_name: str, unknown: set[str], book: PriceBook 
         provider=provider,
         model=model,
         kind=RowKind.LOG,
-        source=_optional_text(entry, "source")
+        source=optional_text(entry, "source")
         or "usage-log",  # the reporting program's own name when it gave one
         at=at,
-        ref=_optional_text(entry, "ref") or _optional_text(entry, "session") or source_name,
+        ref=optional_text(entry, "ref") or optional_text(entry, "session") or source_name,
         billing=_billing(entry),
         tokens=tokens,
         cost_reported=cost,
         scope=_scope(entry),
+        origin_session=_origin_session(entry),
     )
+
+
+def _origin_session(entry: Mapping[str, Any]) -> str:
+    """The line's ``origin_session``; a malformed origin stamps nothing (``_OriginNotes`` counts it per file)."""
+    try:
+        return origin_of(entry).session
+    except ValueError:
+        return ""
 
 
 def _event_id(entry: Mapping[str, Any]) -> str:
@@ -230,8 +230,9 @@ def _collect_file(
     book: PriceBook | None = None,
 ) -> list[UsageRow]:
     rows: list[UsageRow] = []
-    seen: set[str] = set()
+    events = _Events()
     unknown: set[str] = set()
+    origins = _OriginNotes()
     for line_no, line in _lines(path):
         entry: Any = None  # this line's, never the previous one's
         try:
@@ -244,14 +245,68 @@ def _collect_file(
             continue
         if window is not None and not window.contains(row.at):
             continue  # outside the window: neither counted nor remembered, so it never consumes an id
-        if event and event in seen:
-            continue
-        if event:
-            seen.add(event)
-        rows.append(row)
+        if events.keep(rows, row, event):
+            origins.note(entry, line_no)
     if unknown:
         warnings.append(f"{path}: unknown token keys ignored: {', '.join(sorted(unknown))}")
+    if events.conflicts:
+        warnings.append(
+            f"{path}: {events.conflicts} repeated event(s) stamped for another session: first copy kept"
+        )
+    if origins.count:
+        warnings.append(
+            f"{path}: {origins.count} line(s) with a malformed origin: usage counted, origin ignored"
+            f" (first: {origins.first})"
+        )
     return rows
+
+
+@dataclass
+class _Events:
+    """One file's event ids: the first copy of an event counts, once.
+
+    A later copy that carries the session stamp the kept one lacks lends the kept copy its stamp (a session report
+    selects by the stamp; the first copy's time and figures stay); a later copy stamped for another session is a
+    conflict, counted, and the first copy stays as it was.
+    """
+
+    at: dict[str, int] = field(default_factory=dict)
+    conflicts: int = 0
+
+    def keep(self, rows: list[UsageRow], row: UsageRow, event: str) -> bool:
+        """Whether ``row`` joined ``rows`` (appended, or in its event's place)."""
+        index = self.at.get(event) if event else None
+        if index is None:
+            if event:
+                self.at[event] = len(rows)
+            rows.append(row)
+            return True
+        kept = rows[index].origin_session
+        if not kept and row.origin_session:
+            rows[index] = replace(
+                rows[index], origin_session=row.origin_session
+            )  # the stamp, never other figures
+            return True
+        self.conflicts += bool(kept and row.origin_session and row.origin_session != kept)
+        return False
+
+
+@dataclass
+class _OriginNotes:
+    """Malformed origins of one file's counted lines: how many and the first reason (the reader streams, keeps no list).
+
+    A malformed origin never costs the line its usage: the tokens are real, only the stamp is unusable.
+    """
+
+    count: int = 0
+    first: str = ""
+
+    def note(self, entry: Mapping[str, Any], line_no: int) -> None:
+        try:
+            origin_of(entry)
+        except ValueError as exc:
+            self.count += 1
+            self.first = self.first or f"line {line_no}: {exc}"
 
 
 def collect_usage_log(

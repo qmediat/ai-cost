@@ -20,6 +20,7 @@ from typing import Any
 from .config import PriceBook, usage_log_path
 from .errors import UsageError
 from .models import Provider
+from .origin import Origin
 from .timeutil import iso, now
 from .values import count, money
 
@@ -178,6 +179,10 @@ class Attribution:
     source: str = ""
     event_id: str = ""
     billing: str = ""
+    origin_session: str = ""
+    origin_repo: str = ""
+    origin_pr: int | None = None
+    run_id: str = ""
 
     def __post_init__(self) -> None:
         """The keys as the reader will read them: tags a sequence of strings (never one string), billing known."""
@@ -193,7 +198,13 @@ class Attribution:
         for key in ("ref", "session", "branch", "pr", "source", "event_id"):  # the reader takes strings only
             if not isinstance(getattr(self, key), str):
                 raise ValueError(f"{key} must be a string, got {type(getattr(self, key)).__name__}")
+        _ = self.origin  # the origin keys by the reader's own validator: a malformed one is its ValueError
         object.__setattr__(self, "tags", listed)
+
+    @property
+    def origin(self) -> Origin:
+        """Who launched the work this line records, validated as the reader validates it."""
+        return Origin(self.origin_session, self.origin_repo, self.origin_pr, self.run_id)
 
 
 def entry(usage: Usage, at: datetime | None = None, meta: Attribution | None = None) -> dict[str, Any]:
@@ -219,6 +230,7 @@ def entry(usage: Usage, at: datetime | None = None, meta: Attribution | None = N
         "event_id": meta.event_id,
     }
     line.update({key: value for key, value in optional.items() if value})
+    line.update(meta.origin.line_keys())
     if meta.tags:
         line["tags"] = list(meta.tags)
     return line

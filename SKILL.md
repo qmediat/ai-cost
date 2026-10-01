@@ -63,8 +63,10 @@ background price check.
 
 ## Getting the inputs right
 
-- **Session id:** the current transcript's file name under `~/.claude/projects/<project>/`; `--session latest`
-  picks the newest for the cwd's project; `--all-projects` for a time window across projects.
+- **Session id:** the current transcript's file name under `~/.claude/projects/<project>/` (in Claude Code's Bash
+  tool: `$CLAUDE_CODE_SESSION_ID`). `--session <id>` counts only the rows stamped with that session, from every
+  project (ADR-0009); `--session latest` is the newest transcript's period; `--all-projects --since` for a time window
+  across projects.
 - **Codex billing:** a rollout that names a ChatGPT plan is a subscription session; the others follow
   `providers.openai.billing` in the config (`api`, `subscription`, or `mixed` = no single rule) and stay `unknown`
   without it. A plugin that knows what the key was charged (a ledger, a proxy log) can settle them. A row's `client`

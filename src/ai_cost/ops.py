@@ -39,12 +39,25 @@ from .config import MAX_WINDOW_HOURS, Config, Paths, PriceBook
 from .errors import ToolError, UsageError
 from .groups import (
     INVOICE_ATTRIBUTION,
+    ApiGroup,
     RealGroup,
     Report,
     api_group,
     needs_list_price,
     real_group,
     vendor_group,
+)
+from .identity import (
+    COLLECT_TAIL,
+    SessionSelection,
+    inherit_origin_by_ref,
+    is_identity,
+    resolve_session,
+    select_session,
+    selection_warnings,
+    session_span,
+    source_counts,
+    without_shares,
 )
 from .models import (
     Billing,
@@ -77,6 +90,7 @@ from .onboarding import (
     source_checks,
     source_files,
 )
+from .permodel import model_lines
 from .plugins import (
     Context,
     Enricher,
@@ -88,7 +102,7 @@ from .plugins import (
     entry_point_modules,
     load_plugins,
 )
-from .prices_check import auto_check, load_result, state_file
+from .prices_check import CheckResult, auto_check, load_result, state_file
 from .pricing import entry_for
 from .providers import ReadContext, read_reports
 from .remainder import compare, interval, span_text
@@ -121,7 +135,12 @@ class ReportRequest:
 
 
 def resolve_window(request: ReportRequest, span: Window | None, default_hours: float) -> Window:
-    """``--since/--until`` win; else the session span (a minute before, five after); else the last N hours."""
+    """``--since/--until`` win; else the session span; else the last N hours.
+
+    The span runs from a minute before the first turn to five minutes after the last. One session reads on for a
+    day (``COLLECT_TAIL``, never past now): a round it launched may settle, and a ledger charge land, after its last
+    turn, and only the rows stamped with it are kept.
+    """
     if request.since and request.hours is not None:
         raise UsageError("--hours cannot be combined with --since: both would set the window start")
     if request.hours is not None:
@@ -136,7 +155,12 @@ def resolve_window(request: ReportRequest, span: Window | None, default_hours: f
         return _with_room(Window(start, end), "--since/--until")
     if span and request.session:
         padded = _with_room(span, "--session: the session's timestamps")
-        return Window(padded.start - minutes(1), padded.end + minutes(5))
+        end = padded.end + minutes(5)
+        if is_identity(
+            request.session
+        ):  # a day on, never past now, always past the last turn (end is exclusive)
+            end = max(min(padded.end + COLLECT_TAIL, now()), padded.end + timedelta(seconds=1))
+        return Window(padded.start - minutes(1), end)
     end = now()
     return Window(_hours_before(end, request.hours, default_hours), end)
 
@@ -245,6 +269,8 @@ class _Gathered:
     skipped: list[Skipped]
     book: PriceBook | None = None
     bill: BillSummary | None = None  # the GitHub usage report's exact figures, when one was read
+    selection: SessionSelection | None = None  # a session report: what it kept and what it left out
+    session: str = ""  # a session report's resolved id, known before any source runs
 
 
 def _default_project(request: ReportRequest, paths: Paths) -> tuple[Path | None, bool]:
@@ -286,14 +312,11 @@ def _gather(
         [*unlisted, *claude.skipped],
         book,
     )
-    if not files:
-        gathered.warnings.append(
-            f"no Claude transcripts matched (project {project or Path.cwd()}, session {request.session})"
-        )
+    session = _open_session(gathered, request, files, project)
     gathered.rows += [row for row in claude.rows if window.contains(row.at)]
     if request.github:  # before the plugins, so their enrichers see every row — the live GitHub rows included
         _gather_github(request, config, book, gathered)
-    bill = _gather_bill(request, paths, config, gathered)
+    bill = None if session else _gather_bill(request, paths, config, gathered)
     _collect_sources(request, paths, config, loaded, gathered)
     gathered.rows = _inherit_scope_by_ref(gathered.rows)
     per_project = False
@@ -303,7 +326,89 @@ def _gather(
     _absorb_bill(gathered, bill, per_project, config)
     _enrich_rows(request, paths, config, loaded, gathered)
     gathered.rows = _with_billing_rules(gathered.rows, config)
+    _select(gathered, session, claude.span)
     return gathered
+
+
+def _open_session(
+    gathered: _Gathered, request: ReportRequest, files: Sequence[tuple[str, Path]], project: Path | None
+) -> str | None:
+    """The report's session (``None`` for a period), kept for the plugins; a report without a transcript says so."""
+    session = _session_of(request, files, gathered.sources)
+    gathered.session = session or ""
+    if not files:
+        gathered.warnings.append(_no_transcript(request, project, session))
+    return session
+
+
+def _session_of(request: ReportRequest, files: Sequence[tuple[str, Path]], sources: list[str]) -> str | None:
+    """The one session a session report is about; ``None`` for a period report.
+
+    Account-wide figures name no session: ``--github`` is refused and the usage report is not read (said in the
+    sources line). Without a transcript nothing says when the session ran, so the dates must.
+    """
+    if request.session is None or not is_identity(request.session):
+        return None
+    if request.github:
+        raise UsageError("--github with --session: a live GitHub count names no session (the review rows do)")
+    if request.project or request.all_projects:
+        raise UsageError(
+            "--project/--all-projects with --session: a session report reads every project and keeps the rows "
+            "stamped with the session"
+        )
+    if not files and not (request.since or request.until):
+        raise UsageError(
+            f"--session {request.session}: no transcript says when it ran — give --since/--until to read its rows"
+        )
+    sources.append("GitHub usage report: not read — a report of one session")
+    return resolve_session(request.session, files)
+
+
+def _select(gathered: _Gathered, session: str | None, turns: Window | None) -> None:
+    """After every enricher, so a plugin's stamps are in: the session's rows stay, the rest of its span is counted.
+
+    A work item names no session: a session's vendor quote comes from ``--items`` alone (said by ``_vendor_items``).
+    """
+    if session is None:  # a period report
+        return
+    span = session_span(turns) if turns else None
+    gathered.rows, selection = select_session(inherit_origin_by_ref(gathered.rows), session, span)
+    said = (iso(turns.start), iso(turns.end)) if turns else ("", "")
+    gathered.selection = replace(selection, turns=said)
+    gathered.items = []
+
+
+def _priced_groups(
+    request: ReportRequest, gathered: _Gathered, book: PriceBook, config: Config, priced: Config
+) -> tuple[RealGroup | None, ApiGroup | None]:
+    """The real group (with its billing warnings) and the API group, each only when asked for."""
+    rows = gathered.rows
+    real = real_group(rows, book, priced, gathered.window) if "real" in request.groups else None
+    gathered.warnings += _billing_warnings(real, rows, config, one_session=gathered.selection is not None)
+    api = api_group(rows, book, config) if "api" in request.groups else None  # it prices every row at list
+    return real, api
+
+
+def _skip_unpriced(
+    request: ReportRequest, paths: Paths, config: Config, book: PriceBook, gathered: _Gathered
+) -> None:
+    """``--unpriced skip``: rows without a price leave, counted (``_drop_unpriced``)."""
+    if request.unpriced == "skip":
+        list_priced = "api" in request.groups or bool(request.attribute)
+        _drop_unpriced(gathered, book, config, paths.user_prices_file(), list_priced=list_priced)
+
+
+def _say_selection(gathered: _Gathered) -> None:
+    """After ``--unpriced skip``: a session report's header counts the rows its groups price."""
+    if gathered.selection:
+        gathered.selection = replace(gathered.selection, kept=len(gathered.rows))
+        gathered.warnings += selection_warnings(gathered.selection)
+
+
+def _no_transcript(request: ReportRequest, project: Path | None, session: str | None) -> str:
+    if session is not None:
+        return f"no transcript for --session {session}: only rows stamped with exactly that id are counted"
+    return f"no Claude transcripts matched (project {project or Path.cwd()}, session {request.session})"
 
 
 def _gather_github(
@@ -470,10 +575,6 @@ def _is_under(workspace: str, project: Path) -> bool:
     return any(d == root or d.startswith(root.rstrip(os.sep) + os.sep) for d in dirs for root in roots)
 
 
-def _counts(by_source: Mapping[str, int]) -> str:
-    return ", ".join(f"{name} ×{count}" for name, count in sorted(by_source.items()))
-
-
 def _keep_project_rows(gathered: _Gathered, project: Path) -> None:
     """``--project`` (or the cwd's project): rows that name another scope leave, counted per source.
 
@@ -508,7 +609,7 @@ def _scope_warnings(project: Path, counts: Mapping[str, Mapping[str, int]]) -> l
         "unplaced": "row(s) naming no working directory are included",
     }
     return [
-        f"--project {project}: {sum(by_source.values())} {texts[group]} ({_counts(by_source)})"
+        f"--project {project}: {sum(by_source.values())} {texts[group]} ({source_counts(by_source)})"
         + (" — --all-projects counts them" if group != "unplaced" else "")
         for group, by_source in counts.items()
         if by_source
@@ -545,7 +646,15 @@ def _context(
         else {}
     )
     return Context(
-        paths, config, gathered.window, request, settings, gathered.skipped, gathered.warnings, gathered.book
+        paths,
+        config,
+        gathered.window,
+        request,
+        settings,
+        gathered.skipped,
+        gathered.warnings,
+        gathered.book,
+        gathered.session,
     )
 
 
@@ -694,6 +803,11 @@ def load_configured_plugins(config: Config, environ: Mapping[str, str] | None = 
 def _vendor_items(request: ReportRequest, gathered: _Gathered, config: Config) -> list[WorkItem]:
     if request.items:
         return load_items(request.items) if "vendor" in request.groups else []
+    if gathered.selection and "vendor" in request.groups:
+        gathered.warnings.append(
+            "vendor: no quote — the sources' work items name no session; pass --items with the session's scope"
+        )
+        return []
     if gathered.items and "vendor" in request.groups:
         loc = config.sizing.loc
         gathered.warnings.append(
@@ -766,12 +880,14 @@ def _retired(paths: Paths, config: Config, book: PriceBook) -> list[str]:
     ]
 
 
-def _billing_warnings(real: RealGroup | None, rows: Sequence[UsageRow], config: Config) -> list[str]:
+def _billing_warnings(
+    real: RealGroup | None, rows: Sequence[UsageRow], config: Config, one_session: bool = False
+) -> list[str]:
     """Copilot counts without a usage report, and rows of unknown billing (priced by the API group only).
 
     Those of clients outside scope are said as such; the rest are counted per provider with the rule to set.
     """
-    counted = _copilot_counted(rows, config) + _plans_beside_seats(real)
+    counted = _copilot_counted(rows, config, one_session) + _plans_beside_seats(real)
     if real is None or not real.unknown_billing:
         return counted
     return counted + _outside_warning(outside_scope(rows, config)) + _unknown_warning(real, rows, config)
@@ -792,11 +908,19 @@ def _plans_beside_seats(real: RealGroup | None) -> list[str]:
     ]
 
 
-def _copilot_counted(rows: Sequence[UsageRow], config: Config) -> list[str]:
-    """Copilot reviews without a usage report: counted, never priced — said, so a total is never read as complete."""
+def _copilot_counted(rows: Sequence[UsageRow], config: Config, one_session: bool = False) -> list[str]:
+    """Copilot reviews without a usage report: counted, never priced — said, so a total is never read as complete.
+
+    A session report reads no usage report (it bills per repository and day, not per session): its reviews are said too.
+    """
     reviews = sum(row.tokens.reviews for row in rows if row.kind is RowKind.COPILOT)
-    if not reviews or config.github.bill is not None:
+    if not reviews or (config.github.bill is not None and not one_session):
         return []
+    if one_session:
+        return [
+            f"{reviews} Copilot review(s) counted, not priced: the GitHub usage report bills a repository's day, "
+            "not a session — its amount is in `report --since/--until` for those days"
+        ]
     return [f"{reviews} Copilot review(s) counted, not priced (a review has no price) — {BILL_HINT}"]
 
 
@@ -858,14 +982,13 @@ def build_report(
     gathered = _gather(request, paths, config, loaded, book)
     gathered.warnings += loaded.warnings
     compared = _compare_providers(request, paths, config, book, gathered)
-    if request.unpriced == "skip":
-        list_priced = "api" in request.groups or bool(request.attribute)
-        _drop_unpriced(gathered, book, config, paths.user_prices_file(), list_priced=list_priced)
+    _skip_unpriced(request, paths, config, book, gathered)
+    _say_selection(gathered)
     gathered.warnings += _config_warnings(paths, config, book)
     items = _vendor_items(request, gathered, config)
     window, rows = gathered.window, gathered.rows
-    real = real_group(rows, book, config, window) if "real" in request.groups else None
-    gathered.warnings += _billing_warnings(real, rows, config)
+    priced = without_shares(config) if gathered.selection else config  # a session is not a period
+    real, api = _priced_groups(request, gathered, book, config, priced)
     return Report(
         version=__version__,
         generated_at=iso(now()),
@@ -877,10 +1000,12 @@ def build_report(
         prices_checked_at=book.checked_at.isoformat(),
         rows=rows,
         real=real,
-        attribution=attribution_group(rows, rules, book, config, window) if rules else None,
+        attribution=attribution_group(rows, rules, book, priced, window) if rules else None,
         github_bill=gathered.bill,
         provider_reports=compared,
-        api=api_group(rows, book, config) if "api" in request.groups else None,
+        selection=gathered.selection,
+        api=api,
+        models=model_lines(rows, api, book, priced) if api else (),
         vendor=(
             vendor_group(items, config, request.vendor_profile)
             if "vendor" in request.groups and items
@@ -1045,6 +1170,10 @@ def _doctor_state(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> N
         ("  ok  " if last else "  --  ")
         + f"last price check: {last.checked_at if last else 'never'} ({state_file(paths)})"
     )
+    for provider, model, rates in _unchecked_rates(last):
+        emit(
+            f"  --  {provider}/{model}: listed apart from its row on the vendor page — confirm by hand: {rates}"
+        )
     state = paths.state_dir
     if _writable(state):
         line(
@@ -1054,6 +1183,18 @@ def _doctor_state(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> N
         line(False, f"state dir {state} is not writable — AI_COST_STATE_DIR, or fix the permissions")
     _doctor_tools(emit)
     _doctor_reports(paths, line, emit, bill)
+
+
+def _unchecked_rates(last: CheckResult | None) -> list[tuple[str, str, str]]:
+    """The rates the last price check found listed apart from a model's row (its --quiet run prints none)."""
+    if last is None:
+        return []
+    return [
+        (provider, model, ", ".join(check.unchecked))
+        for provider, prov in last.providers.items()
+        for model, check in prov.models.items()
+        if check.unchecked
+    ]
 
 
 def _doctor_tools(emit: Emit) -> None:

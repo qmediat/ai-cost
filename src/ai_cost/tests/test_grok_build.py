@@ -166,3 +166,52 @@ def test_the_source_is_built_in_and_follows_the_xai_billing_rule(tmp_path: Path)
         assert [r.billing for r in GrokBuildSource().collect(ctx).rows] == [expected], rule
     assert parse_config(builtin_config(), "cfg").xai_billing == "api", "the shipped rule is read, not dead"
     assert Window(BASE, BASE + timedelta(hours=1)).contains(BASE)
+
+
+def _aborted_turn() -> dict[str, Any]:
+    """The real shape: every counter 0, no modelUsage, no primaryModelId (the collector names it ``unknown``)."""
+    counters = (
+        "inputTokens",
+        "outputTokens",
+        "cachedReadTokens",
+        "cacheCreationTokens",
+        "reasoningTokens",
+        "totalTokens",
+    )
+    return {"turnNumber": 1, "endedAt": iso(BASE + timedelta(minutes=5)), **dict.fromkeys(counters, 0)}
+
+
+def test_an_aborted_turn_costs_nothing_and_is_no_unpriced_row_under_skip(tmp_path: Path) -> None:
+    from ..ops import ReportRequest, build_report
+    from ..permodel import Evidence
+
+    _write(tmp_path, CWD, "s-aborted", {"sessionId": "s-aborted", "turns": [_aborted_turn()]})
+    (collected,) = collect_grok_build(tmp_path / ".grok", WINDOW, Billing.API).rows
+    assert (collected.model, collected.cost_reported) == (
+        "unknown",
+        0.0,
+    ), "the collector says it cost nothing"
+    paths = paths_in(tmp_path)
+    config, book = defaults(paths)
+    since, until = iso(WINDOW.start), iso(WINDOW.end)
+    request = ReportRequest(
+        since=since, until=until, all_projects=True, groups=("real", "api"), unpriced="skip"
+    )
+    report = build_report(request, paths, config, book)
+    assert any(row.model == "unknown" for row in report.rows), "kept: it used nothing, it costs nothing"
+    assert not any("unpriced" in warning for warning in report.warnings)
+    (line,) = [m for m in report.models if m.model == "unknown"]
+    assert (
+        line.api_usd == 0 and line.payments[0].evidence is Evidence.REPORTED
+    ), "its own 0, no list price claimed"
+
+
+def test_only_the_clis_own_zero_counters_are_a_zero_cost(tmp_path: Path) -> None:
+    aborted = _aborted_turn()
+    drifted = {
+        key: value for key, value in aborted.items() if key != "totalTokens"
+    }  # a counter renamed or dropped
+    creation = {**aborted, "cacheCreationTokens": 40, "totalTokens": 40}  # a cache write alone is usage
+    _write(tmp_path, CWD, "s", {"sessionId": "s", "turns": [drifted, creation]})
+    rows = collect_grok_build(tmp_path / ".grok", WINDOW, Billing.API).rows
+    assert [row.cost_reported for row in rows] == [None, None], "not the CLI's own zero: priced, or loud"

@@ -6,6 +6,7 @@ import io
 import json
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 from .. import cli
@@ -15,7 +16,7 @@ from ..collectors.claude import find_session_files
 from ..config import Config, PriceBook
 from ..errors import UsageError
 from ..groups import Report, subscription_shares
-from ..models import Scope
+from ..models import Billing, Provider, RowKind, Scope, Tokens, UsageRow
 from ..ops import ReportRequest, build_report
 from ..render import render_json, render_markdown
 from ..timeutil import iso
@@ -111,6 +112,61 @@ def test_attribution_sums_to_the_group_totals_and_reports_the_buckets(tmp_path: 
     assert 0 < by_label["ai-cost"].usd_context < by_label["ai-cost"].api_usd, "cache reads are shown apart"
 
 
+def test_each_label_lists_its_models_whose_list_prices_sum_to_the_label(tmp_path: Path) -> None:
+    report, _ = _report(tmp_path, RULES)
+    assert report.attribution is not None
+    for line in report.attribution.lines:
+        assert abs(sum(model.api_usd for model in line.models) - line.api_usd) < 1e-9, line.label
+        assert sum(model.calls for model in line.models) == line.calls, line.label
+        assert (
+            abs(sum(model.cash_usd for model in line.models) - line.cash_usd) < 1e-9
+        ), "every cash dollar reaches a model"
+    api = next(line for line in report.attribution.lines if line.label == "api")
+    assert [(m.provider.value, m.model) for m in api.models] == [
+        ("openai", "gpt-6-astra")
+    ], "the Codex rollout's model"
+    data = json.loads(render_json(report, detail=False))
+    first = next(line for line in data["attribution"]["lines"] if line["label"] == "api")["models"][0]
+    assert {"provider", "model", "calls", "model_calls", "tokens", "api_usd", "cash_usd", "notes"} <= set(
+        first
+    )
+
+
+def _cash_rows() -> list[UsageRow]:
+    """An API-key rollout (1.25), a session its ledger settles (0.62) and a ledger charge alone (0.40), branch x."""
+    at = WINDOW.start + timedelta(minutes=5)
+    tokens = Tokens(input=60_000, output=400)
+    rollout = UsageRow(
+        Provider.OPENAI,
+        "gpt-6-astra",
+        RowKind.SESSION,
+        at,
+        "s1",
+        Billing.API,
+        tokens,
+        1.25,
+        Scope(branch="x"),
+    )
+    settled = replace(rollout, ref="s2", billing=Billing.API_SETTLED, cost_reported=None)
+    ledger = replace(settled, kind=RowKind.LEDGER, billing=Billing.API, tokens=Tokens(), cost_reported=0.62)
+    return [rollout, settled, ledger, replace(ledger, model="gpt-5.5", ref="s3", cost_reported=0.4)]
+
+
+def test_a_models_cash_is_what_the_real_group_counts_on_its_rows(tmp_path: Path) -> None:
+    """API-key cash is labelled by billing rule in the real group ("api-key (rollout)", "api-key (ledger)"), never by model."""
+    config, book = defaults(paths_in(tmp_path))
+    group = attribution_group(_cash_rows(), parse_rules(("x=^x$",)), book, config, WINDOW)
+    line = next(line for line in group.lines if line.label == "x")
+    cash = {model.model: round(model.cash_usd, 6) for model in line.models}
+    assert cash == {"gpt-6-astra": 1.87, "gpt-5.5": 0.4}, cash
+    assert (
+        abs(sum(model.cash_usd for model in line.models) - line.cash_usd) < 1e-9
+    ), "every cash dollar reaches a model"
+    alone = next(m for m in line.models if m.model == "gpt-5.5")
+    assert alone.api_usd == 0.0 and "api-key (ledger)" in alone.notes, "a ledger charge alone says what it is"
+    assert [m.model for m in line.models] == ["gpt-6-astra", "gpt-5.5"], "the largest list price first"
+
+
 def test_subscription_weights_sum_every_model_of_a_provider(tmp_path: Path) -> None:
     """A label with two Claude models must weigh both, not the last one the dict saw."""
     paths = paths_in(tmp_path)
@@ -176,3 +232,26 @@ def test_cli_attribute_is_repeatable_and_a_bad_regex_exits_2(tmp_path: Path) -> 
             ["report", "--project", str(tmp_path), "--attribute", "a=x", "--attribute", "b=(", "--hours", "1"]
         )
     assert code == 2 and "--attribute b" in err.getvalue()
+
+
+def test_each_attribution_model_says_how_its_cash_was_paid(tmp_path: Path) -> None:
+    """The PR comment's "How it was paid": the per-model table's rule, on the label's own rows, summing to its cash."""
+    config, book = defaults(paths_in(tmp_path))
+    group = attribution_group(_cash_rows(), parse_rules(("x=^x$",)), book, config, WINDOW)
+    line = next(line for line in group.lines if line.label == "x")
+    for model in line.models:
+        assert abs(sum(p.usd for p in model.payments) - model.cash_usd) < 1e-9, model.model
+    astra = next(m for m in line.models if m.model == "gpt-6-astra")
+    assert [p.text for p in astra.payments] == [
+        "API key 1.25 (reported)",
+        "API key 0.62 (ledger)",
+        "settled on another row ×1",
+    ]
+    from ..render import plain
+
+    data = json.loads(json.dumps(plain(group)))
+    x = next(each for each in data["lines"] if each["label"] == "x")
+    cells = [p["text"] for p in x["models"][0]["payments"]]
+    assert cells == [
+        p.text for p in line.models[0].payments
+    ], "the JSON carries each cell as the table prints it"

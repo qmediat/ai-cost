@@ -8,6 +8,7 @@ import json
 import math
 import sys
 from collections.abc import Sequence
+from dataclasses import fields
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ from .ops import (
     remove_schedule,
     run_auto_check,
 )
-from .prices_check import apply_check, check_prices, exit_code, merged_registry_json, save_result
+from .prices_check import ModelCheck, apply_check, check_prices, exit_code, merged_registry_json, save_result
 from .process import self_command, transient_warning
 from .providers.deepseek_export import import_export, store_path
 from .reconcile import Reported, run_reconcile
@@ -81,7 +82,10 @@ def _add_window(parser: argparse.ArgumentParser) -> None:
 
 def _report_sources(report: argparse.ArgumentParser) -> None:
     report.add_argument(
-        "--session", help="Claude Code session id, prefix, 'latest', 'all' or a transcript path"
+        "--session",
+        help="one Claude Code session (an id, a unique prefix or a transcript path): only the rows stamped with it — "
+        "its transcript and the work it launched, from every project — no subscription share; "
+        "'latest' or 'all' name a period instead",
     )
     report.add_argument(
         "--project", type=Path, help="project directory whose transcripts to read (default: cwd)"
@@ -227,6 +231,14 @@ def _log_command(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> No
     log.add_argument("--billing", choices=["api", "subscription"])
     for key in ("ref", "session", "branch", "pr", "source", "event-id"):
         log.add_argument(f"--{key}")
+    log.add_argument("--origin-session", help="the session that launched this work")
+    log.add_argument(
+        "--origin-repo",
+        metavar="OWNER/NAME",
+        help="the repository the work belongs to (needed by --origin-pr)",
+    )
+    log.add_argument("--origin-pr", type=int, metavar="N", help="the pull request this work belongs to")
+    log.add_argument("--run-id", help="this invocation's own id (one run can log many lines)")
     log.add_argument("--tag", action="append", default=[], metavar="TAG")
     log.add_argument("--at", help="ISO-8601 timestamp of the request (default: now)")
     log.add_argument("--log", type=Path, help="the log file (default: AI_COST_USAGE_LOG or the XDG data dir)")
@@ -363,6 +375,28 @@ def _show_prices(args: argparse.Namespace, paths: Paths) -> int:
     return 0
 
 
+_CHECK_FLAGS = {
+    CheckStatus.CONFIRMED: "ok ",
+    CheckStatus.CHANGED: "!! ",
+    CheckStatus.NOT_FOUND: "?? ",
+    CheckStatus.APPLIED: "++ ",
+}
+
+
+def _emit_check(model: str, check: ModelCheck, quiet: bool) -> None:
+    """One model's line of `prices check`, and one for the rates its vendor lists apart that its row does not show.
+
+    A changed line names what the row lacks; ``quiet`` prints only what changed or vanished.
+    """
+    if quiet and check.status is CheckStatus.CONFIRMED:
+        return
+    flag = _CHECK_FLAGS.get(check.status, "   ")
+    lacks = f" — not in its row: {', '.join(check.missing)}" if check.missing else ""
+    emit(f"   {flag}{model:<26} expected {check.expected} seen {check.seen[:12]}{lacks}")
+    if check.unchecked:
+        emit(f"   ~  {model:<26} listed apart from its row: {', '.join(check.unchecked)} — confirm by hand")
+
+
 def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
     """Show / check / update."""
     if args.action == "show":
@@ -390,11 +424,7 @@ def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
     for name, prov in result.providers.items():
         emit(f"{name:<10} {prov.status}")
         for model, check in prov.models.items():
-            if not args.quiet or check.status.value != "confirmed":
-                flag = {"confirmed": "ok ", "changed?": "!! ", "not-found": "?? ", "applied": "++ "}.get(
-                    check.status.value, "   "
-                )
-                emit(f"   {flag}{model:<26} expected {check.expected} seen {check.seen[:12]}")
+            _emit_check(model, check, args.quiet)
     for provider, model, new_in, new_out in applied:
         emit(f"applied {provider}/{model} → input {new_in} output {new_out} ({paths.user_prices_file()})")
     code = exit_code(unresolved)
@@ -549,19 +579,21 @@ def _checked_usage(usage: Usage, cost: float | None, book: PriceBook) -> Usage:
         raise UsageError(f"log: {exc}") from exc
 
 
+def _log_meta(args: argparse.Namespace) -> Attribution:
+    """The optional keys of the line, one flag per ``Attribution`` field; a malformed value is a UsageError."""
+    given = {f.name: getattr(args, f.name) for f in fields(Attribution) if f.name != "tags"}
+    try:
+        return Attribution(
+            tags=tuple(args.tag), **{key: value for key, value in given.items() if value is not None}
+        )
+    except ValueError as exc:
+        raise UsageError(f"log: {exc}") from exc
+
+
 def cmd_log(args: argparse.Namespace, paths: Paths) -> int:
     """Append one usage line and echo it."""
     usage = _checked_usage(_log_usage(args), args.cost, load_pricebook(paths))
-    meta = Attribution(
-        ref=args.ref or "",
-        session=args.session or "",
-        branch=args.branch or "",
-        pr=args.pr or "",
-        tags=tuple(args.tag),
-        source=args.source or "",
-        event_id=args.event_id or "",
-        billing=args.billing or "",
-    )
+    meta = _log_meta(args)
     at = parse_cli_ts(args.at, "--at") if args.at else None
     line = log_entry(usage, at, meta)
     target = args.log or paths.usage_log or default_log_path()  # the Paths given, never the process env alone

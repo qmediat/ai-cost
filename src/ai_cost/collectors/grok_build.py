@@ -54,10 +54,29 @@ def _tokens(usage: Mapping[str, Any]) -> Tokens:
     )
 
 
+# the counters the CLI writes on every turn; all present and 0 is the CLI's own statement that the turn used nothing
+_ZERO_EVIDENCE = ("inputTokens", "outputTokens", "totalTokens")
+_COUNTERS = (*_ZERO_EVIDENCE, "cachedReadTokens", "cacheCreationTokens", "reasoningTokens", "modelCalls")
+
+
 def _cost(usage: Mapping[str, Any]) -> float | None:
-    """``costUsdTicks`` as USD; absent or zero (the CLI did not price the turn) is ``None``: the list price applies."""
+    """``costUsdTicks`` as USD; ``None`` when the CLI did not price the turn — the list price applies.
+
+    One exception: a turn whose counters say it used nothing (an aborted run: ``inputTokens``, ``outputTokens`` and
+    ``totalTokens`` present and 0, and every other counter the CLI writes that is there 0 — often no model id) cost
+    exactly 0, the CLI's own figure: it needs no price for a model it never named. One of the three missing or renamed
+    is not "nothing": that turn keeps its list price, or fails loud when its model has none. ``cacheCreationTokens``
+    counts here although ``_tokens`` does not price it: a cache write alone is still usage.
+    """
     ticks = money(usage.get("costUsdTicks"), "costUsdTicks")
-    return ticks / TICKS_PER_USD if ticks is not None and ticks > 0 else None
+    if ticks is not None and ticks > 0:
+        return ticks / TICKS_PER_USD
+    return 0.0 if _counted_nothing(usage) else None
+
+
+def _counted_nothing(usage: Mapping[str, Any]) -> bool:
+    present = all(key in usage for key in _ZERO_EVIDENCE)
+    return present and all(usage.get(key, 0) == 0 for key in _COUNTERS)
 
 
 def _model_usages(turn: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:

@@ -90,6 +90,17 @@ def _records(path: Path, skipped: list[Skipped]) -> Iterator[tuple[int, Any]]:
     yield from enumerate(messages, 1)
 
 
+def ref_of(project: str, session: str) -> str:
+    """A row's ref: ``<project dir>/<session id>`` — the one shape; ``split_ref`` reads it back."""
+    return f"{project}/{session}"
+
+
+def split_ref(ref: str) -> tuple[str, str]:
+    """``(project dir, session id)`` of a row's ref (a session id never holds a slash)."""
+    project, _, session = ref.rpartition("/")
+    return project, session
+
+
 def _tokens(raw: Any) -> Tokens:
     if not isinstance(raw, Mapping):
         raise TypeError(f"tokens must be an object, got {type(raw).__name__}")
@@ -113,7 +124,7 @@ def _row(record: Any, session: str, project: str, billing: Billing, workspace: s
         kind=RowKind.CHAT,
         source=SOURCE_NAME,
         at=at,
-        ref=f"{project}/{session}",
+        ref=ref_of(project, session),
         billing=billing,  # the configured providers.google.billing rule; the session log itself says nothing
         tokens=_tokens(record.get("tokens")),
         scope=Scope(workspace=workspace),

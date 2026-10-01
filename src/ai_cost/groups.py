@@ -6,7 +6,7 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .config import Config, PriceBook, Staffing, VendorProfile
 from .errors import ConfigError, PricingError
@@ -26,6 +26,10 @@ from .models import (
     WorkItem,
 )
 from .pricing import UNTRACKED_NOTE, price
+
+if TYPE_CHECKING:  # annotations only: the core's leaf modules import no report logic
+    from .identity import SessionSelection
+    from .permodel import ModelLine, Payment
 
 HOURS_PER_MONTH = 730.0
 
@@ -145,6 +149,21 @@ class VendorGroup:
 
 
 @dataclass(frozen=True)
+class AttributionModel:
+    """One model inside a label: its API-group line (list price) beside the cash the real group counted for it."""
+
+    provider: Provider
+    model: str
+    calls: int
+    model_calls: int  # API requests the sources reported; 0 where no source knows them
+    tokens: Tokens
+    api_usd: float
+    cash_usd: float  # what the real group counts on this model's rows (a ledger's settlement included); 0 under a plan
+    notes: tuple[str, ...]
+    payments: tuple[Payment, ...] = ()  # how that cash was paid and on what evidence (permodel.payments_of)
+
+
+@dataclass(frozen=True)
 class AttributionLine:
     """One label's share of the window; ``keys`` are the branches / workspaces / PRs it absorbed."""
 
@@ -155,6 +174,9 @@ class AttributionLine:
     cash_usd: float
     subscription_usd: float
     keys: tuple[str, ...]
+    models: tuple[
+        AttributionModel, ...
+    ] = ()  # every model the label's rows name ("untracked": a provider report)
 
     @property
     def usd_work(self) -> float:
@@ -204,6 +226,10 @@ class Report:
     attribution: AttributionGroup | None = None
     github_bill: BillSummary | None = None  # what the GitHub amounts rest on, exact (ADR-0007)
     provider_reports: Sequence[ProviderSummary] = ()  # the provider day reports compared, exact (ADR-0008)
+    models: Sequence[
+        ModelLine
+    ] = ()  # one row per model: tokens, how it was paid and on what evidence, list price
+    selection: SessionSelection | None = None  # a session report: what it kept and what it left out
 
     @property
     def window_hours(self) -> float:

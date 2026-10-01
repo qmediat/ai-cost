@@ -275,6 +275,25 @@ class OutsideDay:
 
 
 @dataclass(frozen=True)
+class RepositoryDay:
+    """One repository's counted lines of one product / SKU on one UTC day the window touches: the report's exact sums.
+
+    A repository's day holds every use of that day in it (every PR, every person): a whole the report does not split.
+    ``final`` is false while the day may still grow (not over, or ended less than ``SETTLE_HOURS`` before the reading).
+    """
+
+    day: date
+    repository: str  # owner/name
+    product: str
+    sku: str
+    lines: int
+    gross: Decimal
+    discount: Decimal
+    net: Decimal
+    final: bool
+
+
+@dataclass(frozen=True)
 class BillSummary:
     """What a report's GitHub amounts rest on: the report's own figures, exact, and what they leave out."""
 
@@ -290,6 +309,9 @@ class BillSummary:
     months_read: tuple[
         str, ...
     ] = ()  # YYYY-MM of every month whose report was read: its amounts are the report's
+    repositories: tuple[
+        RepositoryDay, ...
+    ] = ()  # every touched day's counted lines per repository, whole or not
 
 
 # the decimals a provider's report states amounts to (GitHub's usage report); a conversion keeps them
@@ -466,6 +488,7 @@ class UsageRow:
     )
     invoice: InvoiceAmounts | None = None  # a usage-report line's own amounts (RowKind.INVOICE)
     untracked: Untracked | None = None  # a provider day's difference (RowKind.UNTRACKED, ADR-0008)
+    origin_session: str = ""  # the session that launched the work: a transcript id, a line's origin_session
 
 
 @dataclass(frozen=True)

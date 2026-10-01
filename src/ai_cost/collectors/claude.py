@@ -313,6 +313,7 @@ def _row(msg: _Message, at: datetime, tokens: Tokens, billing: Billing) -> Usage
         source=SOURCE_NAME,
         at=at,
         ref=msg.session_id,
+        origin_session=msg.session_id,  # a subagent's messages carry the parent's id
         billing=billing,
         tokens=tokens,
         scope=Scope(branch="" if branch == "HEAD" else branch, paths=tuple(msg.segments[:_MAX_SEGMENTS])),

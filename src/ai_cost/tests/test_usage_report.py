@@ -426,3 +426,37 @@ def test_a_month_not_read_leaves_its_days_to_their_own_rows_and_the_read_month_t
     august = replace(september, at=across.start, tokens=Tokens(minutes=40))
     assert settled_by(september, bill.summary, ACME), "its day's month was read: a count"
     assert not settled_by(august, bill.summary, ACME), "August was not read: its own rules price it, once"
+
+
+def test_each_touched_day_names_its_repositories_exact_amounts_and_whether_they_are_final() -> None:
+    """A PR's comment needs the repository's day, not the account's: the report's lines per repository, as read."""
+    window = Window(
+        datetime(2026, 9, 24, 12, tzinfo=timezone.utc), datetime(2026, 9, 25, 10, tzinfo=timezone.utc)
+    )
+    with _report():
+        early = collect_bill(_request(read_at=datetime(2026, 9, 25, 10, 30, tzinfo=timezone.utc)), window)
+    assert early.summary is not None
+    days = [
+        (r.day.isoformat(), r.repository, r.sku, r.lines, r.net, r.final) for r in early.summary.repositories
+    ]
+    assert days == [
+        ("2026-09-24", "acme/widgets", "Copilot AI Credits", 1, Decimal("1.19057793"), False),
+        ("2026-09-25", "acme/gadgets", "Copilot AI Credits", 1, Decimal("2.45861137"), False),
+    ], "a line on no repository (0.78014235) and uncounted Actions are none of them"
+    with _report():
+        late = collect_bill(_request(read_at=datetime(2026, 9, 27, tzinfo=timezone.utc)), window)
+    assert late.summary is not None and all(r.final for r in late.summary.repositories), "both days settled"
+
+
+def test_the_json_report_carries_the_repositories_amounts_as_text(tmp_path: Path) -> None:
+    paths = replace(paths_in(tmp_path), offline=False)  # read through the stubbed gh, not the network
+    config, book = defaults(paths)
+    config = replace(config, subscriptions=(), github=GithubSettings(bill=ACME))
+    request = ReportRequest(since="2026-09-24T12:00:00Z", until="2026-09-25T10:00:00Z", all_projects=True)
+    with (
+        _report(),
+        mock.patch.object(ops_module, "now", return_value=datetime(2026, 9, 27, tzinfo=timezone.utc)),
+    ):
+        data = json.loads(render_json(build_report(request, paths, config, book), detail=False))
+    widgets = next(r for r in data["github_bill"]["repositories"] if r["repository"] == "acme/widgets")
+    assert (widgets["day"], widgets["net"], widgets["final"]) == ("2026-09-24", "1.19057793", True)

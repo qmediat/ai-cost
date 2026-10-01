@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .groups import (
     INVOICE_ATTRIBUTION,
@@ -25,6 +25,10 @@ from .groups import (
 from .models import STATED_PLACES, BillSubtotal, BillSummary, DayComparison, Provider, ProviderSummary, Tokens
 from .remainder import interval, span_text
 from .timeutil import iso
+
+if TYPE_CHECKING:  # annotations only: the core's leaf modules import no report logic
+    from .identity import SessionSelection
+    from .permodel import ModelLine
 
 
 def _fmt_usd(value: float) -> str:
@@ -79,12 +83,23 @@ def _share_cells(share: SubscriptionShare) -> list[Any]:
     return [share.plan, "—" if invoice else share.seats, monthly, share.attribution, _fmt_usd(share.usd)]
 
 
-def _real_section(group: RealGroup, hours: float) -> list[str]:
+_ONE_SESSION = (
+    "One session: no subscription fee is allocated to it (a plan row costs 0 here; its list price is in section 2) "
+    "+ pay-per-token API keys at list price. No promos, no negotiated discounts."
+)
+
+
+def _real_section(group: RealGroup, hours: float, one_session: bool = False) -> list[str]:
+    basis = (
+        _ONE_SESSION
+        if one_session
+        else f"Subscriptions prorated to the window ({hours:.1f} h of a 730 h month) + pay-per-token API keys at list price. No promos, no negotiated discounts."
+    )
     lines = [
         "",
         f"## 1. Real cost (what you paid): {_fmt_usd(group.total_usd)} USD",
         "",
-        f"Subscriptions prorated to the window ({hours:.1f} h of a 730 h month) + pay-per-token API keys at list price. No promos, no negotiated discounts.",
+        basis,
         "",
         md_table(
             ["Subscription", "Seats", "Monthly USD", "Attribution", "Share USD"],
@@ -92,7 +107,7 @@ def _real_section(group: RealGroup, hours: float) -> list[str]:
         ),
         "",
         md_table(
-            ["Provider", "Model / line", "Runs", "USD", "Note"],
+            ["Provider", "Model / line", "Records", "USD", "Note"],
             [
                 [
                     line.provider.value,
@@ -118,7 +133,7 @@ def _api_section(group: ApiGroup) -> list[str]:
         "Every token at the provider's pay-per-use list price (cache tiers applied, since that is how the APIs bill). GitHub: the usage report's gross amounts (before included credits and minutes); without one a Copilot review is a count and Actions billable minutes are at the per-minute list price.",
         "",
         md_table(
-            ["Provider", "Model", "Runs", "Model calls", "Tokens", "USD", "Notes"],
+            ["Provider", "Model", "Records", "Model calls", "Tokens", "USD", "Notes"],
             [
                 [
                     line.provider.value,
@@ -131,6 +146,47 @@ def _api_section(group: ApiGroup) -> list[str]:
                 ]
                 for line in group.lines
             ],
+        ),
+    ]
+
+
+def _models_section(models: Sequence[ModelLine]) -> list[str]:
+    """One row per model: its tokens once, the cash the real group counts and how it was paid, its list price."""
+    if not models:
+        return []
+    rows = [
+        [
+            m.provider.value,
+            m.model,
+            m.records,
+            m.model_calls or "",
+            tokens_brief(m.tokens),
+            _fmt_usd(m.paid_usd),
+            "; ".join(payment.text for payment in m.payments),
+            _fmt_usd(m.api_usd) + (" (no list price: reported)" if m.api_unlisted else ""),
+        ]
+        for m in models
+    ]
+    return [
+        "",
+        "## Per model",
+        "",
+        "Paid: the cash of the real group, split by how it was paid and what the amount rests on (list price, a "
+        "figure the tool reported, a ledger, the usage report, a provider report, or no amount of its own). A plan row "
+        "costs no cash here; its list price is beside it.",
+        "",
+        md_table(
+            [
+                "Provider",
+                "Model",
+                "Records",
+                "Model calls",
+                "Tokens",
+                "Paid USD",
+                "How it was paid",
+                "API list USD",
+            ],
+            rows,
         ),
     ]
 
@@ -197,7 +253,7 @@ def _attribution_section(group: AttributionGroup) -> list[str]:
         md_table(
             [
                 "Label",
-                "Runs",
+                "Records",
                 "API USD",
                 "of which context",
                 "Cash USD",
@@ -358,11 +414,33 @@ def _request_lines(compared: Sequence[DayComparison]) -> list[str]:
     return ["", *lines] if lines else []
 
 
+def _unstamped_section(selection: SessionSelection | None) -> list[str]:
+    """A session report's rows without a session stamp: listed, never summed."""
+    if selection is None or not selection.unstamped:
+        return []
+    rows = [[u.source, u.provider, u.model, u.rows] for u in selection.unstamped]
+    return [
+        "",
+        f"## Not in this session's sum — {selection.unstamped_rows} row(s) of its span without a session stamp",
+        "",
+        md_table(["Source", "Provider", "Model", "Rows"], rows),
+    ]
+
+
+def _title(report: Report, hours: float) -> str:
+    window = f"{report.window_iso[0]} → {report.window_iso[1]} ({hours:.1f} h)"
+    if report.selection is None:
+        return f"# AI cost report — {window}"
+    first, last = report.selection.turns
+    turns = f"turns {first} → {last}, " if first else ""
+    return f"# AI cost report — session {report.selection.session} — {turns}read {window}"
+
+
 def render_markdown(report: Report) -> str:
     """The human report."""
     hours = report.window.hours()
     out = [
-        f"# AI cost report — {report.window_iso[0]} → {report.window_iso[1]} ({hours:.1f} h)",
+        _title(report, hours),
         "",
         f"Sources: {', '.join(report.sources) or 'nothing found'}. Prices checked {report.prices_checked_at}. Generated by ai-cost {report.version} on {report.generated_at}.",
     ]
@@ -373,9 +451,10 @@ def render_markdown(report: Report) -> str:
         ]
     out += [f"- ⚠ {warning}" for warning in report.warnings]
     if report.real:
-        out += _real_section(report.real, hours)
+        out += _real_section(report.real, hours, one_session=report.selection is not None)
     if report.api:
         out += _api_section(report.api)
+    out += _models_section(report.models)
     if report.vendor:
         out += _vendor_section(report.vendor)
     if report.attribution:
@@ -384,21 +463,27 @@ def render_markdown(report: Report) -> str:
         out += _bill_section(report.github_bill)
     for summary in report.provider_reports:
         out += _provider_section(summary)
-    if report.real and report.api:
-        rows: list[list[Any]] = [
-            ["Real (subscriptions share + API keys)", _fmt_usd(report.real.total_usd)],
-            ["API-only equivalent", _fmt_usd(report.api.total_usd)],
-        ]
-        if report.vendor:
-            rows += [
-                [
-                    f"Vendor quote, {o.staffing} option",
-                    f"{_fmt_int(o.cost[0])}–{_fmt_int(o.cost[1])} {report.vendor.currency}",
-                ]
-                for o in report.vendor.options
-            ]
-        out += ["", "## Summary", "", md_table(["Group", "USD"], rows)]
+    out += _unstamped_section(report.selection) + _summary_section(report)
     return "\n".join(out) + "\n"
+
+
+def _summary_section(report: Report) -> list[str]:
+    if not (report.real and report.api):
+        return []
+    real = "Real (API keys; no subscription share for one session)" if report.selection else None
+    rows: list[list[Any]] = [
+        [real or "Real (subscriptions share + API keys)", _fmt_usd(report.real.total_usd)],
+        ["API-only equivalent", _fmt_usd(report.api.total_usd)],
+    ]
+    if report.vendor:
+        rows += [
+            [
+                f"Vendor quote, {o.staffing} option",
+                f"{_fmt_int(o.cost[0])}–{_fmt_int(o.cost[1])} {report.vendor.currency}",
+            ]
+            for o in report.vendor.options
+        ]
+    return ["", "## Summary", "", md_table(["Group", "USD"], rows)]
 
 
 def render_text(report: Report) -> str:

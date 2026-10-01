@@ -86,3 +86,13 @@ def merge_skips(into: list[Skipped], fresh: list[Skipped]) -> None:
         if key not in seen:
             seen.add(key)
             into.append(skip)
+
+
+def optional_text(entry: Mapping[str, Any], key: str) -> str:
+    """An optional key as a writer writes it: a string, or absent (``""``); a list or a number is a ``ValueError``."""
+    value = entry.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string, got {type(value).__name__}")
+    return value

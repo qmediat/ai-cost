@@ -25,6 +25,7 @@ from ..models import (
     InvoiceAmounts,
     OutsideDay,
     Provider,
+    RepositoryDay,
     RowKind,
     Scope,
     Skipped,
@@ -329,6 +330,30 @@ def outside_days(
     return tuple(found)
 
 
+def repository_days(
+    lines: Iterable[BillLine], account: BillAccount, read_at: datetime
+) -> tuple[RepositoryDay, ...]:
+    """The counted lines of every touched day summed per day, repository, product and SKU.
+
+    A line on no repository (a seat) is none of them.
+    """
+    groups: dict[tuple[date, str, str, str], list[BillLine]] = {}
+    for line in lines:
+        repository = repository_of(line, account)
+        if repository:
+            groups.setdefault((line.day, repository, line.product, line.sku), []).append(line)
+    return tuple(_repository_day(key, of_key, read_at) for key, of_key in sorted(groups.items()))
+
+
+def _repository_day(
+    key: tuple[date, str, str, str], lines: Sequence[BillLine], read_at: datetime
+) -> RepositoryDay:
+    day, repository, product, sku = key
+    gross, discount, net = (_total(lines, pick) for pick in ("gross", "discount", "net"))
+    final = not is_provisional(day, read_at)
+    return RepositoryDay(day, repository, product, sku, len(lines), gross, discount, net, final)
+
+
 # ---- the collector ------------------------------------------------------------------------------------------------
 
 
@@ -437,6 +462,9 @@ def _summary(request: BillRequest, window: Window, days: Sequence[date], read: _
         missing=tuple(read.missing),
         unreadable_lines=read.unreadable,
         months_read=tuple(sorted({f"{day:%Y-%m}" for day in read_months})),
+        repositories=repository_days(
+            (line for line in counted if line.day in days), request.account, request.read_at
+        ),
     )
 
 

@@ -31,6 +31,10 @@ MILLION = 1_000_000.0
 Pricer = Callable[[UsageRow, PriceEntry, PriceBook, Config], Money]
 
 
+NOT_PRICED = "not priced"  # a note's words for usage no list price covers (minutes of an unknown runner)
+REPORTED_FALLBACK = "no list price — CLI-reported cost"  # the API figure of a model without a list price
+
+
 def normalize(tokens: Tokens, cache_ttl_default: str) -> Tokens:
     """Assign an unsplit ``cache_creation`` count to the configured TTL tier (consult C3: explicit, typed step)."""
     if not tokens.cache_write_unsplit:
@@ -208,8 +212,8 @@ def _minutes_said(name: str, minutes: float, rates: Mapping[str, float]) -> str:
     if name in rates:
         return f"{name} {minutes:.0f} min"
     if name == ELAPSED_RUNNER:
-        return f"{minutes:.0f} min elapsed without a billable time (no /timing): not priced"
-    return f"{name} {minutes:.0f} min: no list price for this runner, not priced"
+        return f"{minutes:.0f} min elapsed without a billable time (no /timing): {NOT_PRICED}"
+    return f"{name} {minutes:.0f} min: no list price for this runner, {NOT_PRICED}"
 
 
 def _minutes_price(by_os: Mapping[str, float], rates: Mapping[str, float]) -> Money:
@@ -283,7 +287,7 @@ def price(row: UsageRow, book: PriceBook, config: Config) -> Money:
     entry = entry_for(row, book)
     if entry is None:
         if row.cost_reported is not None:
-            return Money(float(row.cost_reported), "no list price — CLI-reported cost")
+            return Money(float(row.cost_reported), REPORTED_FALLBACK)
         raise PricingError(
             f"no price for {row.provider.value}/{row.model} and no reported cost (add it to prices.json)"
         )

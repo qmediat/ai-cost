@@ -1,0 +1,19 @@
+# Dependabot for ai-cost. The package has no runtime dependencies (pyproject: dependencies = []); what moves is the
+# SHA-pinned GitHub Actions of the workflows. Weekly, minor and patch in one PR, majors as their own PRs. This
+# repository is published from a source tree kept elsewhere: a Dependabot PR is applied there before the next release,
+# or the release undoes it. The CI tool pins in `run:` lines (ruff, black, mypy) and the npm pin are raised by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: Europe/Warsaw
+    labels: [dependencies, github-actions, automated]
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-non-major:
+        update-types: [minor, patch]

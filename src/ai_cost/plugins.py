@@ -46,6 +46,8 @@ class Context:
         default_factory=list
     )  # shared sink: report-header warnings a plugin wants shown
     book: PriceBook | None = None  # the run's pricebook: a source that validates against list prices reads it
+    # a session report's resolved session id (ADR-0009): a plugin stamps or checks by it; "" in a period report
+    session: str = ""
 
 
 class Source(Protocol):
