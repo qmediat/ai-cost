@@ -80,7 +80,7 @@ jobs:
       - run: python -m pip install --upgrade pip build
       - run: python -m build --outdir dist
       - run: python scripts/build.py src dist/ai-cost && cp standalone/SKILL.md dist/ai-cost-SKILL.md
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           package-manager-cache: false
@@ -170,7 +170,7 @@ jobs:
           name: dist
           path: dist/
       # No dependency cache in the release build (npm's Trusted Publishing guidance).
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
