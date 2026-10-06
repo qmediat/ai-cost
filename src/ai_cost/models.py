@@ -585,6 +585,22 @@ class Skipped:
 
 
 @dataclass(frozen=True)
+class Estimate:
+    """A run nobody measured, known by an estimate only: shown in a cell of its own, never added into a cost (ADR-0010).
+
+    A source returns it beside its rows (``Collected.estimates``); no group, total or per-model line ever reads it.
+    """
+
+    provider: Provider
+    ref: str  # the run's own id in the source's records
+    at: datetime  # when the run started
+    usd: Decimal  # the estimate, exact as the source's record holds it
+    what: str  # the runs, in the source's words
+    why: str  # what the amount is instead of a cost, in the source's words
+    session: str = ""  # the session that launched the run; "" when nothing ties it to one
+
+
+@dataclass(frozen=True)
 class Collected:
     """What one collector returns."""
 
@@ -592,3 +608,4 @@ class Collected:
     items: Sequence[WorkItem] = ()
     skipped: Sequence[Skipped] = ()
     span: Window | None = None
+    estimates: Sequence[Estimate] = ()  # amounts that are no cost: never priced, never summed

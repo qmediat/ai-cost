@@ -38,6 +38,7 @@ from ..ops import (
     cron_has_entry,
     cron_without_entry,
 )
+from ..plugins import Loaded, Plugin
 from ..reconcile import (
     Reported,
     billed_tokens,
@@ -49,6 +50,7 @@ from ..reconcile import (
 )
 from ..timeutil import iso
 from .fixtures import BASE, GROK_TICKS, defaults, paths_in, write_grok
+from .test_estimates import CELL, FOUND, Guessing
 
 DAY = BASE.date()
 
@@ -135,6 +137,30 @@ def test_daily_writes_the_global_report_one_per_project_and_the_index(tmp_path: 
         assert "not a daily index" in str(exc)
     else:
         raise AssertionError("a torn index is a ToolError, never a traceback or a silent None")
+
+
+def test_daily_shows_an_estimate_only_in_the_global_report(tmp_path: Path) -> None:
+    paths = paths_in(tmp_path)
+    project = tmp_path / "proj"
+    _transcript(paths, project, "p1", str(project))
+    config, book = defaults(paths)
+    loaded = Loaded(plugins=[Plugin(name="acme", sources=(Guessing(FOUND),))])
+    lines: list[str] = []
+    with mock.patch.object(ops, "_configured_or_warned", return_value=loaded):
+        assert (
+            daily_reports(paths, config, book, DAY, paths.reports_dir, Output(lines.append, lines.append))
+            == 0
+        )
+    folder = paths.reports_dir / DAY.isoformat()
+    assert (folder / "global.md").read_text().splitlines().count(CELL) == 1
+    index = read_index(folder / "index.json")
+    assert [p.path for p in index.projects] == [str(project)]
+    own = Path(index.projects[0].json_file)
+    assert "Estimated, not measured" not in own.with_suffix(".md").read_text()
+    warnings = json.loads(own.read_text())["warnings"]
+    assert any(
+        "2 estimated run(s) in the span not tied to this project" in w and ": 7.5 USD" in w for w in warnings
+    )
 
 
 def _two_project_day(

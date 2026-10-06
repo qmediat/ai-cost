@@ -28,6 +28,7 @@ from .models import (
 from .pricing import UNTRACKED_NOTE, price
 
 if TYPE_CHECKING:  # annotations only: the core's leaf modules import no report logic
+    from .estimates import Estimates
     from .identity import SessionSelection
     from .permodel import ModelLine, Payment
 
@@ -230,6 +231,7 @@ class Report:
         ModelLine
     ] = ()  # one row per model: tokens, how it was paid and on what evidence, list price
     selection: SessionSelection | None = None  # a session report: what it kept and what it left out
+    estimates: Estimates | None = None  # amounts that are no cost, apart from every group (ADR-0010)
 
     @property
     def window_hours(self) -> float:

@@ -12,6 +12,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from .estimates import Estimates, amount
 from .groups import (
     INVOICE_ATTRIBUTION,
     ApiGroup,
@@ -22,7 +23,16 @@ from .groups import (
     SubscriptionShare,
     VendorGroup,
 )
-from .models import STATED_PLACES, BillSubtotal, BillSummary, DayComparison, Provider, ProviderSummary, Tokens
+from .models import (
+    STATED_PLACES,
+    BillSubtotal,
+    BillSummary,
+    DayComparison,
+    Estimate,
+    Provider,
+    ProviderSummary,
+    Tokens,
+)
 from .remainder import interval, span_text
 from .timeutil import iso
 
@@ -427,6 +437,24 @@ def _unstamped_section(selection: SessionSelection | None) -> list[str]:
     ]
 
 
+def _estimates_cell(estimates: Estimates | None) -> list[str]:
+    """The cell under a cost table: one line per kind of estimated run, headed so it cannot be read as a cost."""
+    if estimates is None or not estimates.shown:
+        return []
+    kinds: dict[tuple[str, str, str], list[Estimate]] = {}
+    for item in estimates.shown:
+        kinds.setdefault((item.provider.value, item.what, item.why), []).append(item)
+    lines: list[str] = []
+    for (provider, what, why), items in sorted(kinds.items()):
+        total = amount(sum((item.usd for item in items), Decimal(0)))
+        lines += [
+            "",
+            f"Estimated, not measured ({provider}: {what}): {len(items)} run(s), {total} USD — {why}; "
+            "in no sum of this report",
+        ]
+    return lines
+
+
 def _title(report: Report, hours: float) -> str:
     window = f"{report.window_iso[0]} → {report.window_iso[1]} ({hours:.1f} h)"
     if report.selection is None:
@@ -450,11 +478,7 @@ def render_markdown(report: Report) -> str:
             f"- ⚠ {len(report.skipped)} file(s) or record(s) skipped (see `doctor` / `--format json` for the list)",
         ]
     out += [f"- ⚠ {warning}" for warning in report.warnings]
-    if report.real:
-        out += _real_section(report.real, hours, one_session=report.selection is not None)
-    if report.api:
-        out += _api_section(report.api)
-    out += _models_section(report.models)
+    out += _cost_sections(report, hours)
     if report.vendor:
         out += _vendor_section(report.vendor)
     if report.attribution:
@@ -465,6 +489,18 @@ def render_markdown(report: Report) -> str:
         out += _provider_section(summary)
     out += _unstamped_section(report.selection) + _summary_section(report)
     return "\n".join(out) + "\n"
+
+
+def _cost_sections(report: Report, hours: float) -> list[str]:
+    """Real cost, API-only and per model, with the estimates' cell directly under the first cost table shown."""
+    cell, out = _estimates_cell(report.estimates), []
+    if report.real:
+        out += _real_section(report.real, hours, one_session=report.selection is not None) + cell
+        cell = []
+    if report.api:
+        out += _api_section(report.api) + cell
+        cell = []
+    return out + _models_section(report.models) + cell
 
 
 def _summary_section(report: Report) -> list[str]:
@@ -531,6 +567,8 @@ def render_json(report: Report, detail: bool) -> str:
     data = plain(report)
     if not detail:
         data.pop("rows", None)
+    if data.get("estimates") is None:
+        data.pop("estimates", None)  # a report without an estimate reads as it always did
     return json.dumps(data, indent=2)
 
 

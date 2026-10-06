@@ -82,6 +82,9 @@ background price check.
   row without a scope takes the scope of the row sharing its ref (a usage-log line with `session`). `--project`
   leaves out other directories and named workspaces that are no directory, includes rows that name nothing, and
   says so in the header. A worktree is its own project.
+- **Estimates:** a plugin may return estimates of runs nobody measured (`Collected.estimates`): shown in a cell of
+  their own under the first cost table and as `estimates` in JSON, never in any sum. They name no project: only a
+  report of every project shows them; a `--project` report counts them in a header line with their amount.
 - **Plugins:** `ai_cost.plugins` entry points, `plugins: [...]` in the config, or `AI_COST_PLUGINS=mod1,mod2`; settings
   under `plugin_settings.<name>`, overridable per run with `--setting <name>.<key>=<value>`. `doctor` lists what
   loaded and why a module did not.

@@ -37,6 +37,7 @@ from .collectors.github_bill import (
 from .collectors.usage_log import log_files
 from .config import MAX_WINDOW_HOURS, Config, Paths, PriceBook
 from .errors import ToolError, UsageError
+from .estimates import Estimates, left_out_warnings, scoped, valid
 from .groups import (
     INVOICE_ATTRIBUTION,
     ApiGroup,
@@ -63,6 +64,7 @@ from .models import (
     Billing,
     BillSummary,
     Collected,
+    Estimate,
     Provider,
     ProviderSummary,
     RowKind,
@@ -271,6 +273,8 @@ class _Gathered:
     bill: BillSummary | None = None  # the GitHub usage report's exact figures, when one was read
     selection: SessionSelection | None = None  # a session report: what it kept and what it left out
     session: str = ""  # a session report's resolved id, known before any source runs
+    estimates: list[Estimate] = field(default_factory=list)  # never priced, never summed (ADR-0010)
+    project: str = ""  # a per-project report's directory: it shows no estimate (ADR-0010)
 
 
 def _default_project(request: ReportRequest, paths: Paths) -> tuple[Path | None, bool]:
@@ -323,6 +327,7 @@ def _gather(
     if project is not None and not all_projects:  # the sources' raw working directories, before any enricher
         _keep_project_rows(gathered, project)
         per_project = True
+        gathered.project = str(project)
     _absorb_bill(gathered, bill, per_project, config)
     _enrich_rows(request, paths, config, loaded, gathered)
     gathered.rows = _with_billing_rules(gathered.rows, config)
@@ -668,17 +673,21 @@ def _absorb(gathered: _Gathered, source: Source, collected: Collected) -> None:
     rows, skips = _rows_only(collected.rows, "collect()"), _skips_only(
         collected.skipped
     )  # every part checked before any is kept
+    estimates = _estimates_only(collected.estimates)
     name = _piece_name(source)  # a nameless source fails here, before anything of it is in the report
     writers = sorted(
         {r.source for r in rows if isinstance(r.source, str) and r.source} - {name}
     )  # ADR-0005: the programs a log names
     gathered.rows += rows
     gathered.items += items
+    gathered.estimates += estimates
     merge_skips(gathered.skipped, skips)
     if rows or items:  # the checked lists: a generator behind collected.rows has been consumed by now
         suffix = f" ({', '.join(writers)})" if writers else ""
         suffix += f", {len(items)} work items" if items else ""
         gathered.sources.append(f"{name} ×{len(rows)}{suffix}")
+    if estimates:
+        gathered.sources.append(f"{name}: {len(estimates)} estimate(s), in no sum")
 
 
 def _collect_sources(
@@ -744,6 +753,15 @@ def _enriched(rows: list[UsageRow], enricher: Enricher, ctx: Context) -> list[Us
     if len(result) != len(rows):
         raise TypeError(f"enrich() must return one row per input row, got {len(result)} for {len(rows)}")
     return result
+
+
+def _estimates_only(result: object) -> list[Estimate]:
+    """The estimates a source returned, each checked field by field (``estimates.valid``).
+
+    A ``TypeError`` or ``ValueError`` costs the source its piece: a wrong field would fail the report later, in its
+    rendering.
+    """
+    return [valid(item) for item in cast("Iterable[object]", result)]
 
 
 def _skips_only(result: object) -> list[Skipped]:
@@ -989,6 +1007,7 @@ def build_report(
     window, rows = gathered.window, gathered.rows
     priced = without_shares(config) if gathered.selection else config  # a session is not a period
     real, api = _priced_groups(request, gathered, book, config, priced)
+    estimates = _scoped_estimates(gathered)
     return Report(
         version=__version__,
         generated_at=iso(now()),
@@ -1004,14 +1023,27 @@ def build_report(
         github_bill=gathered.bill,
         provider_reports=compared,
         selection=gathered.selection,
+        estimates=estimates,
         api=api,
         models=model_lines(rows, api, book, priced) if api else (),
-        vendor=(
-            vendor_group(items, config, request.vendor_profile)
-            if "vendor" in request.groups and items
-            else None
-        ),
+        vendor=vendor_group(items, config, request.vendor_profile) if _vendor_asked(request, items) else None,
     )
+
+
+def _vendor_asked(request: ReportRequest, items: Sequence[WorkItem]) -> bool:
+    """Whether the vendor group is built: asked for, and there is a work item to quote."""
+    return "vendor" in request.groups and bool(items)
+
+
+def _scoped_estimates(gathered: _Gathered) -> Estimates | None:
+    """The report's estimates and the header line for what it left out.
+
+    A session report's are split by the session; a per-project report leaves every one out.
+    """
+    session = gathered.selection.session if gathered.selection else ""
+    estimates = scoped(gathered.estimates, session, gathered.project)
+    gathered.warnings += left_out_warnings(estimates, gathered.project)
+    return estimates
 
 
 # ---- doctor -----------------------------------------------------------------------------------------------------

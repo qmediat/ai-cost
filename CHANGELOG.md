@@ -5,6 +5,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-10-06
+
+### Added
+
+- A source may return estimates beside its rows (`Collected.estimates`, `Estimate`; ADR-0010): an amount a budget
+  counts for a run nobody measured. It enters no sum — not real, API-only, per model, attribution or summary — and is
+  shown in a cell of its own directly under the first cost table ("Estimated, not measured (…): N run(s), X USD — …;
+  in no sum of this report") and in the JSON report as `estimates` (`shown`, `left_out`, `shown_usd`,
+  `left_out_usd`). A session report shows the estimates of runs it launched and counts every other one in a header
+  line with its amount. A report without an estimate is unchanged, byte for byte.
+  An estimate is tied to no project: a per-project report (`--project`, a report run in a project, each project's
+  file of `daily`) shows none and counts them in one header line with their amount. An estimate with a wrong field (an
+  amount that is not a finite `Decimal` not below zero, a time without a zone, a provider that is not a `Provider`)
+  costs its source, named in the warnings, never the report.
+
 ## [2.8.0] - 2026-10-01
 
 ### Fixed
