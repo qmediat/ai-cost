@@ -14,13 +14,14 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any, TypeVar
 
 from .errors import ConfigError
 from .models import (
+    Alias,
     BillAccount,
     BillScope,
     PeakOffpeakPrice,
@@ -50,6 +51,20 @@ _TOKEN_KEYS = {
 }
 _PEAK_KEYS = {"peak", "offpeak", "display"}
 _RATE_KEYS = {"cache_hit", "cache_miss", "output"}
+
+# The closed set of what may follow a row id in a served id of the SAME model, at the same price:
+# -preview / -exp (each optionally -<date>, where MM-DD is a date too), -latest, -<date>, then the endpoint word
+# -customtools (listed under its model's row), then a bracket ([1m], the 1M window). A date is YYYYMMDD, YYYY-MM-DD
+# or MM-YYYY. Anything else (-tts, -image, -native-audio-…, -live) is another model. prices_check reads it too.
+_DATE = r"(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{2}-\d{4})"
+_RELEASE = rf"-(?:preview|exp)(?:-(?:{_DATE}|\d{{2}}-\d{{2}}))?|-latest|-{_DATE}"
+SAME_MODEL_TAIL = rf"(?:{_RELEASE})?(?:-customtools)?(?:\[[^\]]*\])?"
+_SAME_MODEL_TAIL = re.compile(SAME_MODEL_TAIL)
+
+
+def same_model(served: str, row_id: str) -> bool:
+    """Whether ``served`` is ``row_id`` itself or a dated, release, endpoint or bracketed id of the same model."""
+    return served.startswith(row_id) and _SAME_MODEL_TAIL.fullmatch(served, len(row_id)) is not None
 
 
 @dataclass(frozen=True)
@@ -246,15 +261,39 @@ class PriceBook:
         str, ...
     ] = ()  # keys of the user's prices file that are no longer read (said in the header)
 
-    def entry(self, provider: Provider, model: str) -> PriceEntry | None:
-        """The price entry for a model; a dated id (``claude-opus-5-20261001``) resolves to its prefix."""
+    def entry(self, provider: Provider, model: str, at: datetime | None) -> PriceEntry | None:
+        """The price entry for a model: its own row, else the row its alias named on ``at``, else its same-model row.
+
+        An alias is a rolling id a row answers to inside a window (``gemini-pro-latest`` from 2026-10-16); ``at`` is the
+        usage row's time. ``at=None`` (a row without a time, a check of the registry) is "any window": the alias's row
+        when one row names it, unpriced when several do (its day would decide). An alias no window holds on ``at``'s
+        day is unpriced. The lookup never reads the clock. A same-model id (``claude-opus-5-20261001``,
+        ``gemini-3.1-flash-lite-preview``, ``claude-opus-5-5[1m]``) takes the longest row id it extends by
+        ``SAME_MODEL_TAIL``; any other id (``gemini-2.5-flash-preview-tts``) is another model.
+        """
         table = self.models.get(provider, {})
         if model in table:
             return table[model]
+        named = [(alias, row) for row in table.values() for alias in aliases_of(row) if alias.id == model]
+        if named:
+            return _aliased_row(named, at)
         for name in sorted(table, key=len, reverse=True):
-            if model.startswith(name):
+            if same_model(model, name):
                 return table[name]
         return None
+
+
+def _aliased_row(named: list[tuple[Alias, PriceEntry]], at: datetime | None) -> PriceEntry | None:
+    """The row an alias named on ``at``'s day; without a day, the one row naming it (several: none)."""
+    if at is None:
+        return named[0][1] if len(named) == 1 else None
+    day = at.date()
+    return next((row for alias, row in named if alias.holds(day)), None)
+
+
+def aliases_of(entry: PriceEntry) -> tuple[Alias, ...]:
+    """The aliases of a price row; only a token-tier row carries them."""
+    return entry.aliases if isinstance(entry, TokenTierPrice) else ()
 
 
 # ---- loading ---------------------------------------------------------------------------------------------------
@@ -688,12 +727,15 @@ def _token_tier(raw: Mapping[str, Any], where: str) -> TokenTierPrice:
     long_raw = raw.get("long")
     long_entry = None
     threshold = 0
+    inclusive = False
     for key, block in (("long", long_raw), ("next", raw.get("next"))):
         if block is not None and not isinstance(block, Mapping):
             raise ConfigError(f"{where}: {key} must be an object with input/output, got {block!r}")
     if long_raw:
         threshold = _integer(long_raw, "threshold", f"{where}.long", 0)
-        long_entry = _token_tier({k: v for k, v in long_raw.items() if k != "threshold"}, f"{where}.long")
+        inclusive = _flag(long_raw, "inclusive", f"{where}.long", False)
+        rates = {k: v for k, v in long_raw.items() if k not in ("threshold", "inclusive")}
+        long_entry = _token_tier(rates, f"{where}.long")
     next_raw = raw.get("next")
     next_entry = None
     next_from = None
@@ -711,7 +753,8 @@ def _token_tier(raw: Mapping[str, Any], where: str) -> TokenTierPrice:
         cache_write_1h=_number(raw, "cache_write_1h", where, 0),
         long_threshold=threshold,
         long=long_entry,
-        aliases=_names(raw, "aliases", where),
+        long_inclusive=inclusive,
+        aliases=_aliases(raw, f"{where}.aliases"),
         valid_until=_date(raw, "valid_until", where),
     )
 
@@ -917,12 +960,52 @@ def _provider_models(
 ) -> dict[str, PriceEntry]:
     b_models = _section(b_prov, "models", f"{where}: providers.{provider}")
     o_models = _section(o_prov, "models", f"{where} (user file): providers.{provider}")
-    return {
+    models = {
         name: _model_entry(
             b_models.get(name), o_models.get(name), f"{where}: providers.{provider}.models.{name}"
         )
         for name in sorted(set(b_models) | set(o_models))
     }
+    _refuse_shared_aliases(models, f"{where}: providers.{provider}")
+    return models
+
+
+def _refuse_shared_aliases(models: Mapping[str, PriceEntry], where: str) -> None:
+    """One alias names one row of a provider on any day, and never shadows a row id: else file order would decide."""
+    seen: list[tuple[Alias, str]] = []
+    for name, entry in models.items():
+        for alias in aliases_of(entry):
+            if alias.id in models:
+                raise ConfigError(f"{where}: alias {alias.id} of {name} is the id of a row of its own")
+            owner = next((row for other, row in seen if other.id == alias.id and other.overlaps(alias)), None)
+            if owner is not None:
+                raise ConfigError(
+                    f"{where}: alias {alias.id} is listed by both {owner} and {name} on the same days"
+                )
+            seen.append((alias, name))
+
+
+def _aliases(raw: Mapping[str, Any], where: str) -> tuple[Alias, ...]:
+    """``aliases``: a list of ids (always) or ``{"id", "from", "until"}`` objects (absent or null = none)."""
+    value = raw.get("aliases")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{where}: aliases must be a list of ids or {{id, from, until}} objects")
+    return tuple(_alias(item, where) for item in value)
+
+
+def _alias(item: Any, where: str) -> Alias:
+    if isinstance(item, str) and item:
+        return Alias(item)
+    if not isinstance(item, Mapping) or set(item) - {"id", "from", "until"} or not item.get("id"):
+        raise ConfigError(f"{where}: an alias is an id or {{id, from, until}}, got {item!r}")
+    if not isinstance(item["id"], str):
+        raise ConfigError(f"{where}: an alias id must be a string, got {item['id']!r}")
+    alias = Alias(item["id"], _date(item, "from", where), _date(item, "until", where))
+    if alias.start and alias.until and alias.start > alias.until:
+        raise ConfigError(f"{where}: alias {alias.id} starts ({alias.start}) after it ends ({alias.until})")
+    return alias
 
 
 def _without_nulls(value: Any) -> Any:

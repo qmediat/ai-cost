@@ -20,7 +20,7 @@ _PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 class Provider:
     """Who bills for a row: a provider id of the pricebook, which is the registry (ADR-0004).
 
-    The seven the core has real-billing rules for are constants; any other id a prices file lists is a valid provider
+    The eight the core has real-billing rules for are constants; any other id a prices file lists is a valid provider
     for a plugin's rows and is priced at list price (``api``) unless a rule says otherwise. ``value`` keeps the
     enum-era spelling, so ``row.provider.value`` and the JSON output are unchanged.
     """
@@ -34,6 +34,7 @@ class Provider:
     XAI: ClassVar[Provider]
     DEEPSEEK: ClassVar[Provider]
     ALIBABA: ClassVar[Provider]
+    XIAOMI: ClassVar[Provider]
     GITHUB: ClassVar[Provider]
 
     def __new__(cls, value: str) -> Provider:
@@ -68,6 +69,7 @@ Provider.GOOGLE = Provider("google")
 Provider.XAI = Provider("xai")
 Provider.DEEPSEEK = Provider("deepseek")
 Provider.ALIBABA = Provider("alibaba")  # Alibaba Cloud Model Studio — the Qwen models (2026-09-24)
+Provider.XIAOMI = Provider("xiaomi")  # Xiaomi MiMo pay-as-you-go — the mimo models (2026-10-19)
 Provider.GITHUB = Provider("github")
 
 
@@ -500,6 +502,28 @@ class Money:
 
 
 @dataclass(frozen=True)
+class Alias:
+    """Another id a price row answers to (a rolling ``…-latest`` name), inside its window: both ends inclusive, None open.
+
+    A rolling alias moves to a new model over time; the window says which row it named on the day a usage row was made.
+    """
+
+    id: str
+    start: date | None = None  # ``from`` in the registry
+    until: date | None = None
+
+    def holds(self, day: date) -> bool:
+        """Whether the alias named this row on ``day``."""
+        return (self.start is None or self.start <= day) and (self.until is None or day <= self.until)
+
+    def overlaps(self, other: Alias) -> bool:
+        """Whether some day lies in both windows."""
+        starts_before_other_ends = self.start is None or other.until is None or self.start <= other.until
+        other_starts_before_end = other.start is None or self.until is None or other.start <= self.until
+        return starts_before_other_ends and other_starts_before_end
+
+
+@dataclass(frozen=True)
 class TokenTierPrice:
     """USD per 1M tokens for models billed by input / cached / output (Anthropic, OpenAI, Google, xAI)."""
 
@@ -511,7 +535,10 @@ class TokenTierPrice:
     cache_write_1h: float = 0.0
     long_threshold: int = 0
     long: TokenTierPrice | None = None
-    aliases: tuple[str, ...] = ()
+    long_inclusive: bool = (
+        False  # the long tier from the threshold itself ("≥ 200k"); default strictly over it
+    )
+    aliases: tuple[Alias, ...] = ()
     valid_until: date | None = None
     next: TokenTierPrice | None = None  # the announced price after this one
     next_from: date | None = None  # when it applies (default: the day after valid_until)

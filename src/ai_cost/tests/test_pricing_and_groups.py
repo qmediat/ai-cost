@@ -93,8 +93,8 @@ def test_unsplit_cache_write_follows_the_configured_ttl(tmp_path: Path) -> None:
 
 def test_dated_model_id_resolves_to_its_prefix(tmp_path: Path) -> None:
     _, book = _setup(tmp_path)
-    assert book.entry(Provider.ANTHROPIC, "claude-opus-5-20261001") is book.entry(
-        Provider.ANTHROPIC, "claude-opus-5"
+    assert book.entry(Provider.ANTHROPIC, "claude-opus-5-20261001", None) is book.entry(
+        Provider.ANTHROPIC, "claude-opus-5", None
     )
 
 
@@ -136,7 +136,7 @@ def test_gemini_cache_tier_and_long_context_only_for_single_requests(tmp_path: P
 def test_next_price_applies_from_its_date(tmp_path: Path) -> None:
     """A registry entry with ``next`` switches on ``from`` (or the day after ``valid_until``), never before."""
     config, book = _setup(tmp_path)
-    entry = book.entry(Provider.GOOGLE, "gemini-3.8-flash")
+    entry = book.entry(Provider.GOOGLE, "gemini-3.8-flash", None)
     assert (
         entry is not None and getattr(entry, "next", None) is not None
     ), "the fixture registry carries a next block"
@@ -183,6 +183,46 @@ def test_grok_long_tier(tmp_path: Path) -> None:
     )
 
 
+def test_an_anthropic_prompt_counts_its_cache_toward_the_long_tier(tmp_path: Path) -> None:
+    """Haiku 5.5: 20 000 input + 130 000 cache read is a 150 000-token prompt, priced at the > 100 000 tier."""
+    config, book = _setup(tmp_path)
+    row = _row(Provider.ANTHROPIC, "claude-haiku-5-5", Tokens(input=20_000, cache_read=130_000, output=1_000))
+    long_tier = (20_000 * 0.5 + 130_000 * 0.05 + 1_000 * 2.5) / MILLION
+    assert abs(price(row, book, config).usd - long_tier) < 1e-12
+
+
+def test_the_long_tier_starts_over_its_threshold(tmp_path: Path) -> None:
+    """Haiku 5.5 is long "over 100,000": a prompt of exactly 100 000 tokens is billed at the base tier, 100 001 at the long one."""
+    config, book = _setup(tmp_path)
+    at_limit = _row(Provider.ANTHROPIC, "claude-haiku-5-5", Tokens(input=100_000))
+    over = _row(Provider.ANTHROPIC, "claude-haiku-5-5", Tokens(input=100_001))
+    assert abs(price(at_limit, book, config).usd - 100_000 * 0.1 / MILLION) < 1e-12
+    assert abs(price(over, book, config).usd - 100_001 * 0.5 / MILLION) < 1e-12
+
+
+def test_the_context_share_uses_the_selected_tier(tmp_path: Path) -> None:
+    """Cache reads of a long-tier Haiku 5.5 request are attributed at the long tier's 0.05, not the base 0.01."""
+    config, book = _setup(tmp_path)
+    row = _row(Provider.ANTHROPIC, "claude-haiku-5-5", Tokens(input=20_000, cache_read=130_000, output=1_000))
+    group = attribution_group([row], parse_rules([]), book, config, WINDOW)
+    context = sum(line.usd_context for line in group.lines)
+    assert abs(context - 130_000 * 0.05 / MILLION) < 1e-12
+
+
+def test_an_inclusive_long_tier_starts_at_its_threshold(tmp_path: Path) -> None:
+    """xAI's "≥ 200k" (``"inclusive": true``): a prompt of exactly 200 000 tokens is billed at grok-4.6's long tier."""
+    config, book = _setup(tmp_path)
+    row = _row(Provider.XAI, "grok-4.6", Tokens(input=200_000))
+    assert abs(price(row, book, config).usd - 200_000 * 4.0 / MILLION) < 1e-12
+
+
+def test_a_strict_long_tier_bills_its_threshold_at_the_base_rate(tmp_path: Path) -> None:
+    """Google's "prompts > 200k": a prompt of exactly 200 000 tokens stays at gemini-2.5-pro's base tier."""
+    config, book = _setup(tmp_path)
+    row = _row(Provider.GOOGLE, "gemini-2.5-pro", Tokens(prompt=200_000))
+    assert abs(price(row, book, config).usd - 200_000 * 1.25 / MILLION) < 1e-12
+
+
 def test_qwen_flat_rate_and_the_256k_long_tier(tmp_path: Path) -> None:
     config, book = _setup(tmp_path)
     flat = _row(Provider.ALIBABA, "qwen3.8-max", Tokens(input=300_000, cached_input=20_000, output=10_000))
@@ -196,6 +236,20 @@ def test_qwen_flat_rate_and_the_256k_long_tier(tmp_path: Path) -> None:
     assert abs(price(long_, book, config).usd - (300_000 * 1.2 + 10_000 * 4.8) / MILLION) < 1e-9
     short = _row(Provider.ALIBABA, "qwen3.7-plus", Tokens(input=200_000, cached_input=0, output=10_000))
     assert abs(price(short, book, config).usd - (200_000 * 0.4 + 10_000 * 1.6) / MILLION) < 1e-9
+
+
+def test_mimo_flat_rate_on_a_measured_review(tmp_path: Path) -> None:
+    """Xiaomi MiMo's flat USD rates on the usage of a real review (benchmark 2026-10-19: 165 966 prompt tokens, 23 056 out)."""
+    config, book = _setup(tmp_path)
+    fast = _row(
+        Provider.XIAOMI, "mimo-v2.6-pro-ultraspeed", Tokens(input=165_966, cached_input=0, output=23_056)
+    )
+    assert abs(price(fast, book, config).usd - (165_966 * 4.35 + 23_056 * 8.7) / MILLION) < 1e-9
+    cached = _row(
+        Provider.XIAOMI, "mimo-v2.6-pro", Tokens(input=165_963, cached_input=165_888, output=27_768)
+    )
+    expected = ((165_963 - 165_888) * 0.435 + 165_888 * 0.0036 + 27_768 * 0.87) / MILLION
+    assert abs(price(cached, book, config).usd - expected) < 1e-9
 
 
 def test_deepseek_peak_calendar(tmp_path: Path) -> None:
@@ -371,7 +425,9 @@ def test_a_plugin_provider_listed_in_the_prices_file_is_priced_at_list_never_a_k
     over = {"providers": {"acme": {"models": {"acme-1": {"input": 2.0, "output": 6.0}}}}}
     book = parse_pricebook(builtin_prices(), over, "prices")
     acme = Provider.of("acme")
-    assert acme in book.models and book.entry(acme, "acme-1") is not None, "the pricebook is the registry"
+    assert (
+        acme in book.models and book.entry(acme, "acme-1", None) is not None
+    ), "the pricebook is the registry"
     row = UsageRow(
         provider=acme,
         model="acme-1",

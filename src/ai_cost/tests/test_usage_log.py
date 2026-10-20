@@ -294,6 +294,24 @@ def _run_test_log_command_refuses_what_the_reader_would_skip(tmp_path: Path) -> 
     ), "a cost makes any provider loggable"
 
 
+def test_a_logged_alias_is_checked_by_the_lines_own_day(tmp_path: Path) -> None:
+    """``log --at``: gemini-pro-latest is priced on 2026-05-12 (2.5 Pro's window), unpriced on 2026-05-10 (no window)."""
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from .. import cli
+
+    target = str(tmp_path / "u.jsonl")
+    line = ["log", "--provider", "google", "--model", "gemini-pro-latest", "--prompt", "10", "--log", target]
+    with _isolated(tmp_path), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+        priced = cli.main([*line, "--at", "2026-05-12T09:00:00Z"])
+        before = cli.main([*line, "--at", "2026-05-10T09:00:00Z"])
+    assert (priced, before) == (
+        0,
+        2,
+    ), "the reader prices each line by its own day; the writer checks the same day"
+
+
 def test_thoughts_count_as_output_and_the_cli_offers_every_logged_counter(tmp_path: Path) -> None:
     with _isolated(tmp_path):
         _run_test_thoughts_count_as_output_and_the_cli_offers_every_logged_counter(tmp_path)
@@ -513,8 +531,8 @@ def test_the_counters_are_checked_against_the_models_own_price_shape_when_the_bo
     from .fixtures import defaults, paths_in
 
     _, book = defaults(paths_in(tmp_path))
-    tiers = book.entry(Provider.OPENAI, "gpt-5.5")
-    peak = book.entry(Provider.DEEPSEEK, "deepseek-flash")
+    tiers = book.entry(Provider.OPENAI, "gpt-5.5", None)
+    peak = book.entry(Provider.DEEPSEEK, "deepseek-flash", None)
     assert isinstance(tiers, TokenTierPrice) and isinstance(peak, PeakOffpeakPrice)
     assert (
         counters_of(Provider.DEEPSEEK, tiers) == OPENAI_COUNTERS
@@ -557,6 +575,41 @@ def test_the_reader_checks_counters_by_the_models_own_price_shape_when_it_has_th
     assert all("would not be priced" in s.reason for s in collected.skipped), [
         s.reason for s in collected.skipped
     ]
+
+
+def test_an_anthropic_counter_on_an_openai_compatible_provider_line_is_a_skip(tmp_path: Path) -> None:
+    """Alibaba and Xiaomi price input / cached_input: a cache_read there would carry a zero rate, priced or unlisted."""
+    from .fixtures import defaults, paths_in
+
+    _, book = defaults(paths_in(tmp_path))
+    log = _write(
+        tmp_path / "u.jsonl",
+        [
+            _line(
+                provider="xiaomi",
+                model="mimo-v2.6-pro",
+                tokens={"input": 100, "cache_read": 1_000_000, "output": 10},
+            ),
+            _line(
+                provider="alibaba",
+                model="qwen3.8-flash",
+                tokens={"input": 100, "cache_read": 1_000_000, "output": 10},
+            ),
+            _line(
+                provider="xiaomi", model="mimo-unlisted", tokens={"input": 100, "cache_read": 5, "output": 10}
+            ),
+            _line(
+                provider="xiaomi",
+                model="mimo-v2.6-pro",
+                tokens={"input": 100, "cached_input": 40, "output": 10},
+            ),
+        ],
+    )
+    collected, _ = collect_usage_log([log], None, book)
+    assert [(r.provider, r.tokens.cached_input) for r in collected.rows] == [(Provider.XIAOMI, 40)]
+    assert len(collected.skipped) == 3 and all(
+        "would not be priced" in s.reason for s in collected.skipped
+    ), [s.reason for s in collected.skipped]
 
 
 def test_a_web_search_is_a_per_request_counter_of_anthropic_only(tmp_path: Path) -> None:

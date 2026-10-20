@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import email
 import io
 import json
@@ -11,6 +12,7 @@ import time
 import urllib.error
 from collections.abc import Callable
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -27,7 +29,7 @@ from ..config import (
     parse_pricebook,
 )
 from ..errors import ConfigError
-from ..models import BillAccount, BillScope, CheckStatus, PeakOffpeakPrice, Provider, TokenTierPrice
+from ..models import Alias, BillAccount, BillScope, CheckStatus, PeakOffpeakPrice, Provider, TokenTierPrice
 from ..ops import doctor
 from ..prices_check import (
     USER_AGENT,
@@ -49,6 +51,7 @@ from ..prices_check import (
     take_lock,
     wanted_rates,
 )
+from ..pricing import current_price
 from .fixtures import defaults, paths_in, with_test_plans
 
 
@@ -95,14 +98,14 @@ def test_user_prices_override_by_model_and_keep_the_shape(tmp_path: Path) -> Non
         json.dumps({"providers": {"openai": {"models": {"gpt-6-astra": {"input": 12, "output": 60}}}}})
     )
     book = load_pricebook(paths)
-    astra = book.entry(Provider.OPENAI, "gpt-6-astra")
+    astra = book.entry(Provider.OPENAI, "gpt-6-astra", None)
     assert (
         isinstance(astra, TokenTierPrice)
         and astra.input == 12
         and astra.output == 60
         and astra.cached_input == 1
     )
-    assert book.entry(Provider.OPENAI, "gpt-5.5") is not None
+    assert book.entry(Provider.OPENAI, "gpt-5.5", None) is not None
 
 
 def test_override_cannot_change_a_models_shape(tmp_path: Path) -> None:
@@ -146,7 +149,7 @@ def test_user_defined_peak_model_parses(tmp_path: Path) -> None:
         }
     }
     merged = parse_pricebook(book.raw, over, "user.json")
-    assert isinstance(merged.entry(Provider.DEEPSEEK, "deepseek-v5-lite"), PeakOffpeakPrice)
+    assert isinstance(merged.entry(Provider.DEEPSEEK, "deepseek-v5-lite", None), PeakOffpeakPrice)
 
 
 def test_price_parser_finds_amounts_after_the_model_name() -> None:
@@ -157,11 +160,11 @@ def test_price_parser_finds_amounts_after_the_model_name() -> None:
 
 def test_display_name_variants_per_provider(tmp_path: Path) -> None:
     _, book = defaults(paths_in(tmp_path))
-    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5-1")
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5-1", None)
     assert fable is not None and "Claude Fable 5.1" in name_variants(
         Provider.ANTHROPIC, "claude-fable-5-1", fable
     )
-    flash = book.entry(Provider.GOOGLE, "gemini-3.8-flash")
+    flash = book.entry(Provider.GOOGLE, "gemini-3.8-flash", None)
     assert flash is not None and "Gemini 3.8 Flash" in name_variants(
         Provider.GOOGLE, "gemini-3.8-flash", flash
     )
@@ -169,7 +172,7 @@ def test_display_name_variants_per_provider(tmp_path: Path) -> None:
 
 def test_a_batch_table_before_the_standard_one_still_confirms(tmp_path: Path) -> None:
     _, book = defaults(paths_in(tmp_path))
-    entry = book.entry(Provider.OPENAI, "gpt-5.6-sol")
+    entry = book.entry(Provider.OPENAI, "gpt-5.6-sol", None)
     assert entry is not None
     page = page_text(
         "<h2>Batch</h2><table><tr><td>gpt-5.6-sol</td><td>$2.00</td><td>$0.20</td><td>$10.00</td></tr></table><h2>Standard</h2><table><tr><td>gpt-5.6-sol</td><td>$4.00</td><td>$0.40</td><td>$20.00</td></tr></table>"
@@ -366,13 +369,13 @@ def test_expected_amounts_follow_the_active_price_and_every_deepseek_tariff(tmp_
     prices = builtin_prices()
     prices["providers"]["google"]["models"]["gemini-3.8-flash"]["next"]["from"] = "2020-01-01"
     book = parse_pricebook(prices, {}, "prices")
-    flash = book.entry(Provider.GOOGLE, "gemini-3.8-flash")
+    flash = book.entry(Provider.GOOGLE, "gemini-3.8-flash", None)
     assert flash is not None and wanted_rates(flash, Provider.GOOGLE)[0] == [
         ("input", 1.5),
         ("output", 7.5),
         ("cached_input", 0.15),
     ], "the page is compared with today's price, the next block's cache rate included"
-    deepseek = book.entry(Provider.DEEPSEEK, "deepseek-flash")
+    deepseek = book.entry(Provider.DEEPSEEK, "deepseek-flash", None)
     assert (
         deepseek is not None and len(wanted_rates(deepseek, Provider.DEEPSEEK)[0]) == 6
     ), "peak and off-peak, all three rates"
@@ -399,6 +402,324 @@ def test_update_leaves_a_model_whose_next_price_is_already_active(tmp_path: Path
         "u", "fetched", {"gemini-3.8-flash": ModelCheck(CheckStatus.CHANGED, [1.5, 7.5], [1.6, 8.0])}
     )
     assert apply_check(result, book, paths.user_prices_file()) == []
+
+
+def test_gemini_4_argon_is_priced_at_two_and_ten_then_four_and_twenty() -> None:
+    """2 / 10 / 0.1 per 1M through valid_until, 4 / 20 / 0.2 from the next block's date (flat, no long tier)."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    argon = book.entry(Provider.GOOGLE, "gemini-4-argon", None)
+    assert (
+        isinstance(argon, TokenTierPrice) and argon.long is None
+    ), "a flat token-tier row in the shipped registry"
+    last_day = current_price(argon, datetime(2026, 11, 30, 23, 59, tzinfo=timezone.utc))
+    first_day = current_price(argon, datetime(2026, 12, 1, tzinfo=timezone.utc))
+    assert (last_day.input, last_day.output, last_day.cached_input) == (2.0, 10.0, 0.1)
+    assert (first_day.input, first_day.output, first_day.cached_input) == (4.0, 20.0, 0.2)
+
+
+# (input, output, cached input) USD per 1M, Standard tier, ai.google.dev/gemini-api/docs/pricing on 2026-10-16
+GOOGLE_ROWS_2026_10_16 = {
+    "gemini-3.6-flash": (0.75, 3.75, 0.075),
+    "gemini-3.5-flash-lite": (0.3, 2.5, 0.03),
+    "gemini-3.1-flash-lite": (0.25, 1.5, 0.025),
+    "gemini-2.5-flash": (0.3, 2.5, 0.03),
+    "gemini-2.5-flash-lite": (0.1, 0.4, 0.01),
+}
+
+
+def test_the_google_flash_lines_the_key_serves_are_priced() -> None:
+    """Each id the key serves has its own row (not a prefix match) with the page's input, output and cached rates."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    when = datetime(2026, 10, 16, tzinfo=timezone.utc)
+    rates = {}
+    for model in GOOGLE_ROWS_2026_10_16:
+        entry = book.models[Provider.GOOGLE].get(model)
+        assert isinstance(entry, TokenTierPrice), f"{model} has a row of its own"
+        price = current_price(entry, when)
+        rates[model] = (price.input, price.output, price.cached_input)
+    assert rates == GOOGLE_ROWS_2026_10_16
+
+
+def test_gemini_3_6_flash_doubles_on_2027_01_01() -> None:
+    """The 3.6 Flash row carries the announced 1.50 / 7.50 / 0.15 from 2027-01-01, as 3.8 Flash does."""
+    flash = parse_pricebook(builtin_prices(), {}, "prices").models[Provider.GOOGLE]["gemini-3.6-flash"]
+    assert isinstance(flash, TokenTierPrice)
+    last_day = current_price(flash, datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc))
+    first_day = current_price(flash, datetime(2027, 1, 1, tzinfo=timezone.utc))
+    assert (last_day.input, last_day.output, last_day.cached_input) == (0.75, 3.75, 0.075)
+    assert (first_day.input, first_day.output, first_day.cached_input) == (1.5, 7.5, 0.15)
+
+
+def test_gemini_3_5_flash_keeps_its_last_listed_price() -> None:
+    """Served by the key, no longer on the page: priced at 1.50 / 9.00 / 0.15 as listed on 2026-08-03."""
+    flash = parse_pricebook(builtin_prices(), {}, "prices").models[Provider.GOOGLE]["gemini-3.5-flash"]
+    assert isinstance(flash, TokenTierPrice)
+    assert (flash.input, flash.output, flash.cached_input) == (1.5, 9.0, 0.15)
+
+
+def test_each_rolling_alias_prices_as_its_measured_target() -> None:
+    """The targets measured on 2026-10-16 (modelVersion of a call): a usage row naming an alias takes that row."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    measured = {
+        "gemini-pro-latest": "gemini-3.1-pro-preview",
+        "gemini-flash-latest": "gemini-3.8-flash",
+        "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
+    }
+    table = book.models[Provider.GOOGLE]
+    when = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
+    resolved = {alias: book.entry(Provider.GOOGLE, alias, when) for alias in measured}
+    assert resolved == {alias: table[target] for alias, target in measured.items()}
+
+
+def test_two_rows_listing_one_alias_are_a_config_error() -> None:
+    """A user row copied from a shipped one with its aliases would price the alias by file order: refused."""
+    copy_row = {"input": 1.0, "output": 2.0, "aliases": [{"id": "gemini-pro-latest", "from": "2026-11-01"}]}
+    over = {"providers": {"google": {"models": {"gemini-pro-copy": copy_row}}}}
+    try:
+        parse_pricebook(builtin_prices(), over, "prices")
+    except ConfigError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected a ConfigError")
+    for word in ("providers.google", "gemini-pro-latest", "gemini-3.1-pro-preview", "gemini-pro-copy"):
+        assert word in message, word
+
+
+def test_an_override_of_the_aliased_row_keeps_its_alias() -> None:
+    """The same row id in the user file replaces the shipped row: its alias is not listed twice."""
+    row = {"aliases": [{"id": "gemini-pro-latest", "from": "2026-10-20"}]}
+    over = {"providers": {"google": {"models": {"gemini-3.1-pro-preview": row}}}}
+    book = parse_pricebook(builtin_prices(), over, "prices")
+    target = book.models[Provider.GOOGLE]["gemini-3.1-pro-preview"]
+    assert (
+        book.entry(Provider.GOOGLE, "gemini-pro-latest", datetime(2026, 10, 20, tzinfo=timezone.utc))
+        is target
+    )
+
+
+def test_a_dated_alias_prices_a_row_by_the_day_it_was_made() -> None:
+    """gemini-pro-latest answered as 2.5-pro on 2026-05-11 and as 3.1-pro-preview on 2026-10-16."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    table = book.models[Provider.GOOGLE]
+    may = book.entry(Provider.GOOGLE, "gemini-pro-latest", datetime(2026, 5, 11, 9, tzinfo=timezone.utc))
+    october = book.entry(Provider.GOOGLE, "gemini-pro-latest", datetime(2026, 10, 16, 9, tzinfo=timezone.utc))
+    assert (may, october) == (table["gemini-2.5-pro"], table["gemini-3.1-pro-preview"])
+
+
+def test_an_alias_outside_every_window_is_unpriced() -> None:
+    """flash-latest was first measured on 2026-10-16: a row of 2026-09-01 naming it is unpriced, never a guess."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    assert (
+        book.entry(Provider.GOOGLE, "gemini-flash-latest", datetime(2026, 9, 1, tzinfo=timezone.utc)) is None
+    )
+
+
+def test_an_alias_equal_to_another_rows_id_is_a_config_error() -> None:
+    """An alias that is a row id would never be read (the row wins) or shadow it: refused at load."""
+    row = {"aliases": ["gemini-2.5-flash"]}
+    over = {"providers": {"google": {"models": {"gemini-3.8-flash": row}}}}
+    try:
+        parse_pricebook(builtin_prices(), over, "prices")
+    except ConfigError as exc:
+        assert "alias gemini-2.5-flash of gemini-3.8-flash" in str(exc)
+    else:
+        raise AssertionError("expected a ConfigError")
+
+
+def test_malformed_aliases_are_config_errors() -> None:
+    """An alias is an id or {id, from, until}; an unknown key, a missing id or a reversed window is refused."""
+    for bad, word in (
+        ({"id": "x", "since": "2026-01-01"}, "an alias is an id"),
+        ({"from": "2026-01-01"}, "an alias is an id"),
+        ({"id": "x", "from": "2026-02-01", "until": "2026-01-01"}, "starts (2026-02-01) after it ends"),
+    ):
+        over = {"providers": {"google": {"models": {"gemini-2.5-flash": {"aliases": [bad]}}}}}
+        try:
+            parse_pricebook(builtin_prices(), over, "prices")
+        except ConfigError as exc:
+            assert word in str(exc), (bad, str(exc))
+        else:
+            raise AssertionError(f"{bad}: expected a ConfigError")
+
+
+def test_a_rows_own_id_beats_an_alias() -> None:
+    """Built past the load check (which refuses it): the row named by the id wins over a row aliasing that id."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    table = dict(book.models[Provider.GOOGLE])
+    flash = table["gemini-2.5-flash"]
+    assert isinstance(flash, TokenTierPrice)
+    table["gemini-2.5-flash"] = dataclasses.replace(flash, aliases=(Alias("gemini-3.8-flash"),))
+    shadowed = dataclasses.replace(book, models={**book.models, Provider.GOOGLE: table})
+    assert shadowed.entry(Provider.GOOGLE, "gemini-3.8-flash", None) is table["gemini-3.8-flash"]
+
+
+def test_an_alias_wins_over_a_prefix_match() -> None:
+    """An id that is both an alias of one row and starts with another row's id takes the aliased row."""
+    prices = builtin_prices()
+    models = prices["providers"]["google"]["models"]
+    models["gemini-2.5-flash"]["aliases"] = ["gemini-3.8-flash-latest"]
+    book = parse_pricebook(prices, {}, "prices")
+    aliased = book.models[Provider.GOOGLE]["gemini-2.5-flash"]
+    assert (
+        book.entry(Provider.GOOGLE, "gemini-3.8-flash-latest", None) is aliased
+    ), "not the gemini-3.8-flash prefix row"
+
+
+def test_a_preview_id_resolves_to_its_row_by_prefix() -> None:
+    """The page lists no separate -preview row: ``gemini-3.1-flash-lite-preview`` takes gemini-3.1-flash-lite."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    assert "gemini-3.1-flash-lite-preview" not in book.models[Provider.GOOGLE]
+    row = book.models[Provider.GOOGLE]["gemini-3.1-flash-lite"]
+    assert book.entry(Provider.GOOGLE, "gemini-3.1-flash-lite-preview", None) is row
+
+
+# (input, cache write 5m, cache write 1h, cache read, output) USD per 1M, platform.claude.com pricing on 2026-10-16
+CLAUDE_5_5_ROWS = {
+    "claude-opus-5-5": (4.0, 5.0, 8.0, 0.2, 20.0),
+    "claude-sonnet-5-5": (2.0, 2.5, 4.0, 0.1, 10.0),
+    "claude-haiku-5-5": (0.1, 0.125, 0.2, 0.01, 0.5),
+}
+
+
+def _claude_rates(entry: TokenTierPrice) -> tuple[float, ...]:
+    return (entry.input, entry.cache_write_5m, entry.cache_write_1h, entry.cache_read, entry.output)
+
+
+def test_the_claude_5_5_rows_are_priced() -> None:
+    """Opus, Sonnet and Haiku 5.5 each have a row of their own with the page's five rates."""
+    table = parse_pricebook(builtin_prices(), {}, "prices").models[Provider.ANTHROPIC]
+    rates = {}
+    for model in CLAUDE_5_5_ROWS:
+        entry = table.get(model)
+        assert isinstance(entry, TokenTierPrice), f"{model} has a row of its own"
+        rates[model] = _claude_rates(entry)
+    assert rates == CLAUDE_5_5_ROWS
+
+
+def test_haiku_5_5_prompts_over_100k_take_the_long_tier() -> None:
+    """Haiku 5.5 is the one 5.5 model whose long prompts cost more: 0.50 / 0.625 / 1 / 0.05 / 2.50 above 100 000."""
+    haiku = parse_pricebook(builtin_prices(), {}, "prices").models[Provider.ANTHROPIC]["claude-haiku-5-5"]
+    assert isinstance(haiku, TokenTierPrice) and isinstance(haiku.long, TokenTierPrice)
+    assert haiku.long_threshold == 100_000
+    assert _claude_rates(haiku.long) == (0.5, 0.625, 1.0, 0.05, 2.5)
+
+
+def test_claude_opus_5_5_takes_its_own_row_not_opus_5() -> None:
+    """Until 2026-10-16 the prefix rule priced Opus 5.5 at Opus 5's 5/25; it has a row of its own (4/20)."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    table = book.models[Provider.ANTHROPIC]
+    assert book.entry(Provider.ANTHROPIC, "claude-opus-5-5", None) is table["claude-opus-5-5"]
+
+
+def test_a_bracketed_window_id_takes_its_model_row() -> None:
+    """``[1m]`` names the 1M window, billed at the model's rate: it resolves to the model's own row."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    table = book.models[Provider.ANTHROPIC]
+    models = ("claude-opus-5-5", "claude-sonnet-5-5")
+    resolved = {m: book.entry(Provider.ANTHROPIC, f"{m}[1m]", None) for m in models}
+    assert resolved == {m: table[m] for m in resolved}
+
+
+def test_a_dated_id_resolves_to_its_row() -> None:
+    """A snapshot date after the row id (``claude-opus-5-20261001``) is the same model."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    opus = book.models[Provider.ANTHROPIC]["claude-opus-5"]
+    assert book.entry(Provider.ANTHROPIC, "claude-opus-5-20261001", None) is opus
+
+
+def test_audio_image_and_live_ids_are_other_models() -> None:
+    """TTS, image and native-audio ids bill at their own rates: no text row prices them by prefix."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    others = (
+        "gemini-2.5-flash-preview-tts",
+        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-lite-image",
+        "gemini-3.8-flash-tts",
+        "gemini-2.5-pro-preview-tts",
+        "gemini-2.5-flash-native-audio-preview-09-2025",
+        "gemini-3.8-flash-live",
+    )
+    assert {model: book.entry(Provider.GOOGLE, model, None) for model in others} == dict.fromkeys(others)
+
+
+def test_dated_preview_and_exp_ids_take_their_row() -> None:
+    """``-preview-<MM-YYYY>``, ``-exp-<date>`` and ``-<YYYY-MM-DD>`` are snapshots of the row's model."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    table = book.models[Provider.GOOGLE]
+    ids = {
+        "gemini-2.5-flash-preview-09-2025": "gemini-2.5-flash",
+        "gemini-2.5-flash-exp-20250301": "gemini-2.5-flash",
+        "gemini-2.5-flash-lite-2026-01-15": "gemini-2.5-flash-lite",
+    }
+    assert {m: book.entry(Provider.GOOGLE, m, None) for m in ids} == {m: table[row] for m, row in ids.items()}
+
+
+def test_a_distinct_id_that_extends_a_row_id_is_unpriced() -> None:
+    """``gemini-3.8-flash-lite-x`` is another model: unpriced and listed, never the 3.8-flash row's rate."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    assert "gemini-3.8-flash" in book.models[Provider.GOOGLE]
+    assert book.entry(Provider.GOOGLE, "gemini-3.8-flash-lite-x", None) is None
+
+
+def test_gemini_3_pro_preview_keeps_its_last_documented_price() -> None:
+    """No longer on the page (2026-10-16): 2 / 12 / 0.2, > 200k 4 / 18 / 0.4, as 3.1 Pro Preview's same tier."""
+    pro = parse_pricebook(builtin_prices(), {}, "prices").models[Provider.GOOGLE]["gemini-3-pro-preview"]
+    assert isinstance(pro, TokenTierPrice) and isinstance(pro.long, TokenTierPrice)
+    assert (pro.input, pro.output, pro.cached_input, pro.long_threshold) == (2.0, 12.0, 0.2, 200_000)
+    assert (pro.long.input, pro.long.output, pro.long.cached_input) == (4.0, 18.0, 0.4)
+
+
+def test_endpoint_and_month_day_preview_ids_take_their_row() -> None:
+    """``-customtools`` is listed under 3.1 Pro Preview's row; ``-preview-05-06`` is a dated 2.5 Pro preview."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    table = book.models[Provider.GOOGLE]
+    ids = {
+        "gemini-3.1-pro-preview-customtools": "gemini-3.1-pro-preview",
+        "gemini-2.5-pro-preview-05-06": "gemini-2.5-pro",
+    }
+    assert {m: book.entry(Provider.GOOGLE, m, None) for m in ids} == {m: table[row] for m, row in ids.items()}
+
+
+def test_pro_latest_before_its_first_measurement_is_unpriced() -> None:
+    """gemini-pro-latest was first measured on 2026-05-11: a row of the day before names no known model."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    day_before = datetime(2026, 5, 10, 12, tzinfo=timezone.utc)
+    assert book.entry(Provider.GOOGLE, "gemini-pro-latest", day_before) is None
+
+
+def test_the_long_tier_cache_rates_confirm_a_price() -> None:
+    """Haiku 5.5's > 100k cache read and writes are part of what the drift check confirms."""
+    haiku = parse_pricebook(builtin_prices(), {}, "prices").models[Provider.ANTHROPIC]["claude-haiku-5-5"]
+    wanted, _ = wanted_rates(haiku, Provider.ANTHROPIC)
+    long_cache = {name: rate for name, rate in wanted if name.startswith("long cache")}
+    assert long_cache == {"long cache_read": 0.05, "long cache_write_5m": 0.625, "long cache_write_1h": 1.0}
+
+
+def test_another_models_id_in_the_header_ends_the_row() -> None:
+    """A TTS id after the display name is another model's row: its figures never confirm the text model."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    flash = book.models[Provider.GOOGLE]["gemini-2.5-flash"]
+    page = "Gemini 2.5 Flash gemini-2.5-flash-preview-tts $0.30 $2.50 $0.03"
+    assert match_model([page], Provider.GOOGLE, "gemini-2.5-flash", flash).status is not CheckStatus.CONFIRMED
+
+
+def test_long_tier_inclusive_is_a_boolean() -> None:
+    """``"inclusive": "yes"`` is no flag: a ConfigError naming the row's long block."""
+    over = {"providers": {"xai": {"models": {"grok-4.6": {"long": {"inclusive": "yes"}}}}}}
+    try:
+        parse_pricebook(builtin_prices(), over, "prices")
+    except ConfigError as exc:
+        assert "grok-4.6.long" in str(exc) and "inclusive" in str(exc)
+    else:
+        raise AssertionError("expected a ConfigError")
+
+
+def test_a_lookup_without_a_day_takes_an_alias_only_one_row_names() -> None:
+    """at=None is "any window": flash-latest (one row) resolves, pro-latest (two rows, by day) is unpriced."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    flash = book.models[Provider.GOOGLE]["gemini-3.8-flash"]
+    assert book.entry(Provider.GOOGLE, "gemini-flash-latest", None) is flash
+    assert book.entry(Provider.GOOGLE, "gemini-pro-latest", None) is None
 
 
 def test_explicit_paths_never_read_the_environment(tmp_path: Path) -> None:
@@ -796,11 +1117,13 @@ def test_the_printed_registry_matches_what_the_book_prices_with() -> None:
     model = next(iter(base["providers"]["openai"]["models"]))
     nested = parse_pricebook(base, {"providers": {"openai": {"models": {model: None}}}}, "prices")
     assert nested.raw["providers"]["openai"]["models"][model] == base["providers"]["openai"]["models"][model]
-    assert nested.entry(Provider.OPENAI, model) is not None, "a null model override is absent, at any depth"
+    assert (
+        nested.entry(Provider.OPENAI, model, None) is not None
+    ), "a null model override is absent, at any depth"
     field_null = parse_pricebook(
         base, {"providers": {"openai": {"models": {model: {"cached_input": None}}}}}, "prices"
     )
-    entry = field_null.entry(Provider.OPENAI, model)
+    entry = field_null.entry(Provider.OPENAI, model, None)
     assert (
         isinstance(entry, TokenTierPrice)
         and entry.cached_input == base["providers"]["openai"]["models"][model]["cached_input"]
@@ -810,7 +1133,7 @@ def test_the_printed_registry_matches_what_the_book_prices_with() -> None:
     ), "one reading"
     unknown = parse_pricebook(base, {"providers": {"openai": {"models": {"gpt-nope": None}}}}, "prices")
     assert (
-        unknown.entry(Provider.OPENAI, "gpt-nope") is None
+        unknown.entry(Provider.OPENAI, "gpt-nope", None) is None
     ), "a null override of an unknown model is no override"
 
 
@@ -822,12 +1145,12 @@ def test_an_empty_value_clears_a_shipped_block_while_null_keeps_it() -> None:
     cleared = parse_pricebook(
         base, {"providers": {"google": {"models": {flash: {"next": {}, "valid_until": ""}}}}}, "prices"
     )
-    entry = cleared.entry(Provider.GOOGLE, flash)
+    entry = cleared.entry(Provider.GOOGLE, flash, None)
     assert isinstance(entry, TokenTierPrice) and entry.next is None and entry.valid_until is None, "cleared"
     kept = parse_pricebook(
         base, {"providers": {"google": {"models": {flash: {"next": None, "valid_until": None}}}}}, "prices"
     )
-    kept_entry = kept.entry(Provider.GOOGLE, flash)
+    kept_entry = kept.entry(Provider.GOOGLE, flash, None)
     assert (
         isinstance(kept_entry, TokenTierPrice) and kept_entry.next is not None
     ), "null = no override: the shipped block stays"
@@ -845,7 +1168,7 @@ def test_an_empty_section_in_a_user_file_is_no_override_outside_the_clearable_bl
     assert book.raw["providers"] == base["providers"], "an empty providers object prints the shipped registry"
     nested = parse_pricebook(base, {"providers": {"openai": {"models": {}}}}, "prices")
     assert nested.raw["providers"]["openai"]["models"] == base["providers"]["openai"]["models"]
-    assert nested.entry(Provider.OPENAI, next(iter(base["providers"]["openai"]["models"]))) is not None
+    assert nested.entry(Provider.OPENAI, next(iter(base["providers"]["openai"]["models"])), None) is not None
 
 
 def test_a_null_text_setting_in_the_user_file_means_the_default(tmp_path: Path) -> None:
@@ -1162,7 +1485,7 @@ def test_outside_scope_clients_is_a_list_of_names() -> None:
 def test_a_changed_cache_rate_in_the_models_row_is_caught(tmp_path: Path) -> None:
     """Anthropic lists every cache rate in the model's row: a changed one is a change (DEF-AC-01)."""
     _, book = defaults(paths_in(tmp_path))
-    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5-1")
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5-1", None)
     assert isinstance(fable, TokenTierPrice)
     rates = [fable.input, fable.cache_write_5m, fable.cache_write_1h, fable.cache_read, fable.output]
     row = "".join(f"<td>${rate:g}</td>" for rate in rates)
@@ -1177,7 +1500,7 @@ def test_a_changed_cache_rate_in_the_models_row_is_caught(tmp_path: Path) -> Non
 def test_a_cache_rate_listed_apart_is_named_when_the_row_lacks_it(tmp_path: Path) -> None:
     """Alibaba shows cached input as a share in prose: the price confirms on its pair, the rate is said, never a change."""
     _, book = defaults(paths_in(tmp_path))
-    qwen = book.entry(Provider.ALIBABA, "qwen3.8-flash")
+    qwen = book.entry(Provider.ALIBABA, "qwen3.8-flash", None)
     assert isinstance(qwen, TokenTierPrice) and qwen.cached_input
     row = f"<tr><td>qwen3.8-flash</td><td>${qwen.input:g}</td><td>${qwen.output:g}</td></tr>"
     row = f"<table>{row}<tr><td>qwen3.8-max</td><td>$2</td><td>$6</td></tr></table>"
@@ -1201,7 +1524,7 @@ def _anthropic_rows(*rows: tuple[str, list[float]]) -> str:
 def test_a_neighbours_row_never_confirms_a_model(tmp_path: Path) -> None:
     """The live page's case: Claude Fable 5's cache read changed, the next row (Mythos 5) still shows the old one."""
     _, book = defaults(paths_in(tmp_path))
-    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5")
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5", None)
     assert isinstance(fable, TokenTierPrice)
     own = [fable.input, fable.output, fable.cache_write_5m, fable.cache_write_1h]
     page = _anthropic_rows(
@@ -1220,7 +1543,7 @@ def test_a_neighbours_row_never_confirms_a_model(tmp_path: Path) -> None:
 
 def test_openai_lists_cached_input_in_the_row_and_a_change_there_is_caught(tmp_path: Path) -> None:
     _, book = defaults(paths_in(tmp_path))
-    sol = book.entry(Provider.OPENAI, "gpt-5.6-sol")
+    sol = book.entry(Provider.OPENAI, "gpt-5.6-sol", None)
     assert isinstance(sol, TokenTierPrice) and sol.cached_input
     cells = [sol.input, sol.cached_input, sol.output]
     row = "".join(f"<td>${rate:.2f}</td>" for rate in cells)
@@ -1237,7 +1560,7 @@ def test_openai_lists_cached_input_in_the_row_and_a_change_there_is_caught(tmp_p
 
 def test_a_changed_long_context_rate_is_a_change(tmp_path: Path) -> None:
     _, book = defaults(paths_in(tmp_path))
-    pro = book.entry(Provider.GOOGLE, "gemini-2.5-pro")
+    pro = book.entry(Provider.GOOGLE, "gemini-2.5-pro", None)
     assert isinstance(pro, TokenTierPrice) and pro.long is not None
     rates = [pro.input, pro.long.input, pro.output, pro.long.output, pro.cached_input, pro.long.cached_input]
     section = "Gemini 2.5 Pro Input price " + " ".join(f"${rate:g}" for rate in rates)
@@ -1250,7 +1573,7 @@ def test_a_changed_long_context_rate_is_a_change(tmp_path: Path) -> None:
 def test_a_page_in_columns_keeps_the_span(tmp_path: Path) -> None:
     """DeepSeek names both models, then every figure: a row bound would give the first name nothing."""
     _, book = defaults(paths_in(tmp_path))
-    flash = book.entry(Provider.DEEPSEEK, "deepseek-flash")
+    flash = book.entry(Provider.DEEPSEEK, "deepseek-flash", None)
     assert isinstance(flash, PeakOffpeakPrice)
     figures = [
         getattr(tariff, rate)
@@ -1260,7 +1583,7 @@ def test_a_page_in_columns_keeps_the_span(tmp_path: Path) -> None:
     page = "MODEL deepseek-flash deepseek-v4-pro VERSION DeepSeek-V4.1-Flash DeepSeek-V4-Pro-0813 PRICE "
     page += " ".join(f"${rate:g}" for rate in figures)
     assert match_model([page], Provider.DEEPSEEK, "deepseek-flash", flash).status is CheckStatus.CONFIRMED
-    pro = book.entry(Provider.DEEPSEEK, "deepseek-v4-pro")
+    pro = book.entry(Provider.DEEPSEEK, "deepseek-v4-pro", None)
     assert isinstance(pro, PeakOffpeakPrice)
     theirs = " ".join(
         f"${getattr(tariff, rate):g}"
@@ -1316,7 +1639,7 @@ def test_the_check_line_names_what_changed_and_quiet_prints_only_that() -> None:
 def test_a_changed_check_names_what_its_nearest_row_lacks(tmp_path: Path) -> None:
     """The live page's worked example holds 16 amounts after the name: the model's own row is the one to compare."""
     _, book = defaults(paths_in(tmp_path))
-    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5")
+    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5", None)
     assert isinstance(opus, TokenTierPrice)
     own = [opus.input + 1, opus.output, opus.cache_write_5m, opus.cache_write_1h, opus.cache_read]
     page = _anthropic_rows(("Claude Opus 5", own))
@@ -1391,7 +1714,7 @@ def _vendor_rows(provider: Provider, book: Any) -> Any:
 def test_a_row_ends_at_a_neighbour_written_as_an_id(tmp_path: Path) -> None:
     """A page whose rows name models by id: the next id ends the row as a display name does."""
     _, book = defaults(paths_in(tmp_path))
-    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5")
+    fable = book.entry(Provider.ANTHROPIC, "claude-fable-5", None)
     assert isinstance(fable, TokenTierPrice)
     own = [fable.input, fable.output, fable.cache_write_5m, fable.cache_write_1h]
     page = " ".join(
@@ -1409,7 +1732,7 @@ def test_a_row_ends_at_a_neighbour_written_as_an_id(tmp_path: Path) -> None:
 
 def test_the_models_own_id_and_endpoint_do_not_end_its_section_another_version_does(tmp_path: Path) -> None:
     _, book = defaults(paths_in(tmp_path))
-    pro = book.entry(Provider.GOOGLE, "gemini-3.1-pro-preview")
+    pro = book.entry(Provider.GOOGLE, "gemini-3.1-pro-preview", None)
     assert isinstance(pro, TokenTierPrice) and pro.long is not None
     rates = [pro.input, pro.long.input, pro.output, pro.long.output, pro.cached_input, pro.long.cached_input]
     section = "Gemini 3.1 Pro Preview gemini-3.1-pro-preview and gemini-3.1-pro-preview-customtools Try it "
@@ -1419,7 +1742,7 @@ def test_the_models_own_id_and_endpoint_do_not_end_its_section_another_version_d
         match_model([section], Provider.GOOGLE, "gemini-3.1-pro-preview", pro, rows).status
         is CheckStatus.CONFIRMED
     )
-    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5")
+    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5", None)
     assert isinstance(opus, TokenTierPrice)
     figures = " ".join(
         f"${rate:g}" for rate in (opus.input, opus.output, opus.cache_write_5m, opus.cache_write_1h)
@@ -1445,7 +1768,7 @@ def test_two_equal_rates_need_the_figure_twice() -> None:
 def test_a_changed_row_still_names_the_rates_listed_apart(tmp_path: Path) -> None:
     """A changed price that `update` then applies keeps its warning: the rates its row does not show."""
     _, book = defaults(paths_in(tmp_path))
-    qwen = book.entry(Provider.ALIBABA, "qwen3.8-flash")
+    qwen = book.entry(Provider.ALIBABA, "qwen3.8-flash", None)
     assert isinstance(qwen, TokenTierPrice) and qwen.cached_input
     page = f"qwen3.8-flash ${qwen.input + 0.05:g} ${qwen.output:g} qwen3.8-max $2 $6"
     check = match_model([page], Provider.ALIBABA, "qwen3.8-flash", qwen)
@@ -1455,7 +1778,7 @@ def test_a_changed_row_still_names_the_rates_listed_apart(tmp_path: Path) -> Non
 def test_a_figure_the_pair_took_never_answers_a_rate_listed_apart(tmp_path: Path) -> None:
     """grok-4.20's output and long-context input are both 2.5: the row's one $2.5 is the output's."""
     _, book = defaults(paths_in(tmp_path))
-    grok = book.entry(Provider.XAI, "grok-4.20-0309-reasoning")
+    grok = book.entry(Provider.XAI, "grok-4.20-0309-reasoning", None)
     assert isinstance(grok, TokenTierPrice) and grok.long is not None and grok.long.input == grok.output
     page = f"grok-4.20-0309-reasoning ${grok.input:g} ${grok.output:g} grok-4.6 $2 $6"
     check = match_model([page], Provider.XAI, "grok-4.20-0309-reasoning", grok)
@@ -1465,7 +1788,7 @@ def test_a_figure_the_pair_took_never_answers_a_rate_listed_apart(tmp_path: Path
 def test_two_rows_of_one_model_never_pool_their_figures(tmp_path: Path) -> None:
     """Its standard row and its batch row (under its id) are two rows: neither alone holds the changed price."""
     _, book = defaults(paths_in(tmp_path))
-    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5")
+    opus = book.entry(Provider.ANTHROPIC, "claude-opus-5", None)
     assert isinstance(opus, TokenTierPrice)
     standard = [opus.input + 1, opus.output, opus.cache_write_5m, opus.cache_write_1h]
     page = (

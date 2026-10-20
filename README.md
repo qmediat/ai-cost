@@ -289,6 +289,17 @@ account plan) needs its `providers.<name>.billing`, and a provider used on a pla
 source; `prices show --format json --snapshot` prints it). An override may change numbers, never a price's shape;
 a `null` anywhere in your file means "no override" (the shipped value stays), and to clear a shipped block set it to an
 empty value: `"next": {}`, `"long": {}`, `"valid_until": ""`; a plan set to `null` is removed.
+A row's `aliases` are other ids it is billed under — a rolling name such as `gemini-pro-latest` — each a bare id (any
+day) or `{"id": "gemini-pro-latest", "from": "2026-10-16"}` / `{"id": …, "until": "2026-10-15"}` (both ends
+inclusive). A usage row's model is looked up as: the row with that id; else the row whose alias window holds the day
+the usage row was made (none holds it: unpriced); else the row whose id it extends by a same-model suffix only
+(`-preview`, `-exp`, either with a date — `MM-DD` included —, `-latest`, a date, then the endpoint `-customtools`,
+then an optional `[…]` such as `[1m]`) — any other
+extension (`-tts`, `-image`, `-live`) is another model, unpriced. To move an alias when the vendor does, close its
+window on the old row and open it on the new one in your file, e.g. under `providers.google.models`:
+`"gemini-3.1-pro-preview": {"aliases": [{"id": "gemini-pro-latest", "from": "2026-10-16", "until": "2026-12-31"}]}`
+and `"gemini-4-argon": {"aliases": [{"id": "gemini-pro-latest", "from": "2027-01-01"}]}` (a list replaces the
+shipped list whole). Windows of one alias that overlap in two rows, or an alias equal to a row id, are refused.
 `auto_check_days: 0` turns the price-drift check off. `reconcile.tolerance_pct` (5) is the gap `reconcile` accepts.
 Env: `AI_COST_CONFIG`, `AI_COST_PRICES`, `AI_COST_CONFIG_DIR`, `AI_COST_STATE_DIR`, `AI_COST_USAGE_LOG` (else
 `$XDG_DATA_HOME/ai-cost/usage.jsonl`), `AI_COST_REPORTS_DIR` (else `$XDG_DATA_HOME/ai-cost/reports`), `AI_COST_OFFLINE=1`,

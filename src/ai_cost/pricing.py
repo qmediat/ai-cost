@@ -66,12 +66,35 @@ def current_price(price: TokenTierPrice, at: datetime | None) -> TokenTierPrice:
     return price
 
 
+def prompt_length(tokens: Tokens) -> int:
+    """The prompt length a long-context tier is decided by: every input token of the request.
+
+    Google reports the prompt total (cached tokens included) as ``prompt``. Anthropic's ``input`` excludes the cache:
+    its rule counts all input tokens, cache reads and writes included ("a request's prompt length counts all of its
+    input tokens, including cache reads and cache writes"). OpenAI-family ``input`` already includes ``cached_input``.
+    """
+    if tokens.prompt:
+        return tokens.prompt
+    writes = tokens.cache_write_5m + tokens.cache_write_1h + tokens.cache_write_unsplit
+    return tokens.input + tokens.cache_read + writes
+
+
 def _tier(price: TokenTierPrice, tokens: Tokens) -> TokenTierPrice:
-    """The long-context tier applies to a single request above the threshold, never to aggregated usage (C2)."""
-    volume = tokens.input or tokens.prompt
-    if price.long and price.long_threshold and volume >= price.long_threshold and tokens.requests <= 1:
-        return price.long
-    return price
+    """The long tier applies to a single request past its threshold, never to aggregated usage (C2).
+
+    Past is the row's fact: strictly over by default ("prompts > 200k", "over 100,000"), from the threshold itself
+    when the row's ``long`` block says ``inclusive`` ("≥ 200k").
+    """
+    if not (price.long and price.long_threshold) or tokens.requests > 1:
+        return price
+    volume = prompt_length(tokens)
+    past = volume >= price.long_threshold if price.long_inclusive else volume > price.long_threshold
+    return price.long if past else price
+
+
+def rates_for(row: UsageRow, entry: TokenTierPrice) -> TokenTierPrice:
+    """The rates a token-tier row is billed at: the price of its day, at the tier its prompt length selects."""
+    return _tier(current_price(entry, row.at), row.tokens)
 
 
 ANTHROPIC_COUNTERS = frozenset(
@@ -85,19 +108,20 @@ PEAK_OFFPEAK_COUNTERS = frozenset({"cache_hit", "cache_miss", "output"})
 TOKEN_TIER_COUNTERS = (
     ANTHROPIC_COUNTERS | OPENAI_COUNTERS
 )  # a user-added provider priced by tiers: either family
+# the built-in providers whose usage is OpenAI's counters (input incl. cached / cached_input / output), whatever entry
+# prices them: OpenAI, xAI, Alibaba Model Studio and Xiaomi MiMo answer in that shape
+_OPENAI_SHAPED = (Provider.OPENAI, Provider.XAI, Provider.ALIBABA, Provider.XIAOMI)
 _COUNTERS_OF: Mapping[Provider, frozenset[str]] = {
+    **dict.fromkeys(_OPENAI_SHAPED, OPENAI_COUNTERS),
     Provider.ANTHROPIC: ANTHROPIC_COUNTERS,
-    Provider.OPENAI: OPENAI_COUNTERS,
-    Provider.XAI: OPENAI_COUNTERS,
     Provider.GOOGLE: GOOGLE_COUNTERS,
     Provider.DEEPSEEK: PEAK_OFFPEAK_COUNTERS,
     Provider.GITHUB: frozenset(),  # per-unit billing: a logged GitHub request carries a cost, never token counters
 }
 _TIER_FAMILY: Mapping[Provider, frozenset[str]] = {  # what a token-tier entry of a built-in provider reads
+    **dict.fromkeys(_OPENAI_SHAPED, OPENAI_COUNTERS),
     Provider.ANTHROPIC: ANTHROPIC_COUNTERS,
     Provider.GOOGLE: GOOGLE_COUNTERS,
-    Provider.OPENAI: OPENAI_COUNTERS,
-    Provider.XAI: OPENAI_COUNTERS,
     Provider.DEEPSEEK: OPENAI_COUNTERS,  # its chat API is OpenAI-compatible: a tiers-priced DeepSeek model reads those
 }
 DEEPSEEK_NATIVE = frozenset(
@@ -160,7 +184,7 @@ def price_token_tiers(row: UsageRow, entry: PriceEntry, book: PriceBook, config:
     """
     assert isinstance(entry, TokenTierPrice)
     tokens = normalize(row.tokens, config.cache_ttl_default)
-    price = _tier(current_price(entry, row.at), tokens)
+    price = rates_for(row, entry)
     if row.provider == Provider.GOOGLE:
         uncached = max(0, tokens.prompt - tokens.cached)
         usd = (
@@ -247,7 +271,7 @@ def entry_for(row: UsageRow, book: PriceBook) -> PriceEntry | None:
     """The price entry a row is billed with; GitHub rows share one per-unit entry."""
     if row.provider == Provider.GITHUB:
         return book.github
-    return book.entry(row.provider, row.model)
+    return book.entry(row.provider, row.model, row.at)
 
 
 UNTRACKED_NOTE = "provider report − this machine's records"  # a provider day's difference (ADR-0008)

@@ -164,7 +164,7 @@ def parse_line(entry: Any, source_name: str, unknown: set[str], book: PriceBook 
     if cost is None and not any(counts.values()):
         raise ValueError("neither tokens nor cost")
     model = _text(entry, "model")
-    priced_as = book.entry(provider, model) if book is not None else None
+    priced_as = book.entry(provider, model, at) if book is not None else None
     if folds_to_tiers(provider, priced_as):
         counts = as_tier_family(
             counts

@@ -285,7 +285,9 @@ def _amounts(usage: Usage) -> tuple[dict[str, int], float | None]:
     return counters, amount
 
 
-def _in_the_models_family(usage: Usage, counters: dict[str, int], book: PriceBook | None) -> dict[str, int]:
+def _in_the_models_family(
+    usage: Usage, counters: dict[str, int], book: PriceBook | None, at: datetime | None
+) -> dict[str, int]:
     """A DeepSeek response's cache counters for a model the user prices by token tiers: input = hit + miss, cached = hit.
 
     The API always answers with ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``; a tiers-priced model reads
@@ -293,14 +295,14 @@ def _in_the_models_family(usage: Usage, counters: dict[str, int], book: PriceBoo
     reader's rule too; both spellings on one line are refused there).
     """
     provider = Provider.of(usage.provider)
-    entry = book.entry(provider, usage.model) if book is not None else None
+    entry = book.entry(provider, usage.model, at) if book is not None else None
     return as_tier_family(counters) if folds_to_tiers(provider, entry) else counters
 
 
-def _priced(usage: Usage, counters: Mapping[str, int], book: PriceBook | None) -> None:
-    """Every counter one the row's pricing reads; with a pricebook, an unlisted model needs a cost."""
+def _priced(usage: Usage, counters: Mapping[str, int], book: PriceBook | None, at: datetime | None) -> None:
+    """Every counter one the row's pricing reads; with a pricebook, a model unlisted on the line's day needs a cost."""
     provider = Provider.of(usage.provider)  # raises for an id no pricebook could list
-    entry = book.entry(provider, usage.model) if book is not None else None
+    entry = book.entry(provider, usage.model, at) if book is not None else None
     consumed = counters_of(provider, entry)  # by the model's own price shape when the book knows it
     stray = sorted({ALIASES.get(name, name) for name in counters} - consumed) if consumed is not None else []
     if stray:
@@ -312,17 +314,18 @@ def _priced(usage: Usage, counters: Mapping[str, int], book: PriceBook | None) -
         )
 
 
-def validated(usage: Usage, book: PriceBook | None = None) -> Usage:
+def validated(usage: Usage, book: PriceBook | None = None, at: datetime | None = None) -> Usage:
     """The usage as the reader will accept it, or a ``ValueError`` saying why the line would be skipped or unpriced.
 
     Counters are non-negative and at least one is positive unless a cost is given; a cost is finite and non-negative;
     the provider is a well-formed id and every counter is one its formula reads; with a pricebook, a model it does not
-    list needs a cost.
+    list on the line's day ``at`` (the day the reader prices it by; None = no day known, any alias window) needs a
+    cost.
     """
     _well_formed(usage)
     counters, amount = _amounts(usage)
-    counters = _in_the_models_family(usage, counters, book)
-    _priced(usage, counters, book)
+    counters = _in_the_models_family(usage, counters, book, at)
+    _priced(usage, counters, book, at)
     return Usage(usage.provider, usage.model, counters, amount)  # the normalised counters and amount
 
 
@@ -342,7 +345,8 @@ def record(
     """
     if tokens is not None and not isinstance(tokens, Mapping):
         raise ValueError(f"tokens must be an object of counters, got {type(tokens).__name__}")
-    usage = validated(Usage(provider, model, dict(tokens or {}), cost), book)
+    at = now()
+    usage = validated(Usage(provider, model, dict(tokens or {}), cost), book, at)
     unknown = sorted(set(keys) - {f.name for f in fields(Attribution)})
     if (
         unknown
@@ -350,6 +354,6 @@ def record(
         raise ValueError(
             f"unknown key(s) {', '.join(unknown)}: the optional keys are {', '.join(f.name for f in fields(Attribution))}"
         )
-    line = entry(usage, meta=Attribution(**keys))  # the values are checked by Attribution itself
+    line = entry(usage, at, meta=Attribution(**keys))  # the values are checked by Attribution itself
     append(path or default_path(), line)
     return line

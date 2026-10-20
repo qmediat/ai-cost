@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
-from .config import Paths, PriceBook, deep_merge
+from .config import SAME_MODEL_TAIL, Paths, PriceBook, deep_merge
 from .errors import ToolError
 from .models import CheckStatus, PeakOffpeakPrice, PriceEntry, Provider, TokenTierPrice
 from .pricing import current_price
@@ -292,7 +292,8 @@ def occurrences(
     (``claude-opus-5-5``) does, and so does the needle itself again (the model's next row, or an example).
     """
     name = re.compile((_WHOLE if rows.heads else "{}").format(re.escape(needle)), re.I)
-    mine = re.compile("|".join(rf"{re.escape(n)}(?![A-Za-z0-9.]|-\d)" for n in own), re.I) if own else None
+    own_names = "|".join(rf"{re.escape(n)}{SAME_MODEL_TAIL}(?![A-Za-z0-9.-])" for n in own)
+    mine = re.compile(own_names, re.I) if own else None
     out = []
     for found in name.finditer(text):
         row = text[found.end() : found.start() + span]
@@ -328,7 +329,7 @@ def name_variants(provider: Provider, model: str, entry: PriceEntry) -> list[str
     names = [model]
     parts = model.split("-")
     if isinstance(entry, TokenTierPrice):
-        names.extend(entry.aliases)
+        names.extend(alias.id for alias in entry.aliases)  # every window: a page may name any of them
     if provider == Provider.ANTHROPIC and len(parts) >= 3:
         family = parts[1].capitalize()
         version = ".".join(parts[2:4]) if len(parts) >= 4 and parts[3].isdigit() else parts[2]
@@ -341,12 +342,12 @@ def name_variants(provider: Provider, model: str, entry: PriceEntry) -> list[str
 
 
 # vendors whose page lists a model's cache and long-context rates in the model's own row, beside input and output
-# (measured on the live pages 2026-09-30: every Anthropic, Google and OpenAI rate in the confirming row; Alibaba shows
-# cached input as a share in prose, xAI's models page none for grok-4.6/4.7) — only there those rates are part of what
-# confirms the price
-CACHE_IN_ROW = frozenset({Provider.ANTHROPIC, Provider.GOOGLE, Provider.OPENAI})
+# (measured on the live pages 2026-09-30: every Anthropic, Google and OpenAI rate in the confirming row; 2026-10-19: Xiaomi's
+# cache-hit rate in the model's row; Alibaba shows cached input as a share in prose, xAI's models page none for
+# grok-4.6/4.7) — only there those rates are part of what confirms the price
+CACHE_IN_ROW = frozenset({Provider.ANTHROPIC, Provider.GOOGLE, Provider.OPENAI, Provider.XIAOMI})
 CACHE_RATES = ("cached_input", "cache_read", "cache_write_5m", "cache_write_1h")
-LONG_RATES = ("input", "output", "cached_input")
+LONG_RATES = ("input", "output", *CACHE_RATES)
 Labelled = list[tuple[str, float]]
 
 

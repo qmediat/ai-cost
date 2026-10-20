@@ -9,7 +9,7 @@ import math
 import sys
 from collections.abc import Sequence
 from dataclasses import fields
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,7 @@ from .process import self_command, transient_warning
 from .providers.deepseek_export import import_export, store_path
 from .reconcile import Reported, run_reconcile
 from .render import plain, render_json, render_markdown, render_text
-from .timeutil import parse_cli_ts
+from .timeutil import now, parse_cli_ts
 
 
 def emit(text: str) -> None:
@@ -569,12 +569,12 @@ def _log_usage(args: argparse.Namespace) -> Usage:
     return Usage(args.provider, args.model, tokens, args.cost)
 
 
-def _checked_usage(usage: Usage, cost: float | None, book: PriceBook) -> Usage:
-    """The line as the reader will accept it (``validated``), with ``--cost`` filled in; a problem is a UsageError."""
+def _checked_usage(usage: Usage, cost: float | None, book: PriceBook, at: datetime) -> Usage:
+    """The line as the reader will accept it on its day (``validated``), with ``--cost`` filled in; a UsageError."""
     if cost is not None and usage.cost is None:
         usage = Usage(usage.provider, usage.model, usage.tokens, cost)
     try:
-        return validated(usage, book)
+        return validated(usage, book, at)
     except ValueError as exc:
         raise UsageError(f"log: {exc}") from exc
 
@@ -592,9 +592,10 @@ def _log_meta(args: argparse.Namespace) -> Attribution:
 
 def cmd_log(args: argparse.Namespace, paths: Paths) -> int:
     """Append one usage line and echo it."""
-    usage = _checked_usage(_log_usage(args), args.cost, load_pricebook(paths))
+    given = parse_cli_ts(args.at, "--at") if args.at else None
+    at = given or now()  # the line's day: what the reader prices it by
+    usage = _checked_usage(_log_usage(args), args.cost, load_pricebook(paths), at)
     meta = _log_meta(args)
-    at = parse_cli_ts(args.at, "--at") if args.at else None
     line = log_entry(usage, at, meta)
     target = args.log or paths.usage_log or default_log_path()  # the Paths given, never the process env alone
     try:

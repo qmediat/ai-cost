@@ -26,7 +26,7 @@ from .groups import (
 )
 from .models import Provider, RowKind, Scope, Tokens, TokenTierPrice, UsageRow, Window
 from .permodel import Payment, payments_of
-from .pricing import current_price, entry_for
+from .pricing import entry_for, rates_for
 
 MIXED = "mixed"
 UNATTRIBUTED = "unattributed"
@@ -85,7 +85,7 @@ def _context_usd(rows: Sequence[UsageRow], book: PriceBook) -> float:
             continue
         entry = entry_for(row, book)
         if isinstance(entry, TokenTierPrice):
-            total += row.tokens.cache_read * current_price(entry, row.at).cache_read / 1e6
+            total += row.tokens.cache_read * rates_for(row, entry).cache_read / 1e6
     return total
 
 

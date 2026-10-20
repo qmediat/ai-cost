@@ -28,6 +28,13 @@
           "cache_read": 1,
           "output": 50
         },
+        "claude-opus-5-5": {
+          "input": 4,
+          "cache_write_5m": 5,
+          "cache_write_1h": 8,
+          "cache_read": 0.2,
+          "output": 20
+        },
         "claude-opus-5": {
           "input": 5,
           "cache_write_5m": 6.25,
@@ -56,6 +63,13 @@
           "cache_read": 0.5,
           "output": 25
         },
+        "claude-sonnet-5-5": {
+          "input": 2,
+          "cache_write_5m": 2.5,
+          "cache_write_1h": 4,
+          "cache_read": 0.1,
+          "output": 10
+        },
         "claude-sonnet-5": {
           "input": 2,
           "cache_write_5m": 2.5,
@@ -69,6 +83,21 @@
           "cache_write_1h": 6,
           "cache_read": 0.3,
           "output": 15
+        },
+        "claude-haiku-5-5": {
+          "input": 0.1,
+          "cache_write_5m": 0.125,
+          "cache_write_1h": 0.2,
+          "cache_read": 0.01,
+          "output": 0.5,
+          "long": {
+            "threshold": 100000,
+            "input": 0.5,
+            "cache_write_5m": 0.625,
+            "cache_write_1h": 1,
+            "cache_read": 0.05,
+            "output": 2.5
+          }
         },
         "claude-haiku-4-5": {
           "input": 1,
@@ -122,8 +151,20 @@
     "google": {
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
       "unit": "USD per 1M tokens (paid tier)",
-      "notes": "gemini-3.8-flash / 3.7-flash: $0.75 / $3.75 through 2026-12-31, $1.50 / $7.50 from 2027-01-01 (cached 0.075 → 0.15).",
+      "notes": "gemini-3.8-flash / 3.7-flash: $0.75 / $3.75 through 2026-12-31, $1.50 / $7.50 from 2027-01-01 (cached 0.075 → 0.15). gemini-4-argon: $2 / $10 through 2026-11-30, $4 / $20 from 2026-12-01 (cached 0.10 → 0.20), flat (no long-prompt tier). Rolling aliases are dated: each names the row Google served under it in its window (modelVersion of a call). pro-latest → 2.5-pro from 2026-05-11 (its first measurement; an earlier row naming it is unpriced) through 2026-10-15, → 3.1-pro-preview from 2026-10-16 (measured that day); flash-latest → 3.8-flash and flash-lite-latest → 3.5-flash-lite from 2026-10-16 only — no earlier measurement exists, so an earlier row naming them is unpriced. Re-measure when Google moves them. gemini-3.5-flash: $1.50 / $9.00 (cached 0.15), listed on the page on 2026-08-03 at these rates (the m3-assets-suite pricing snapshot of that day); not listed since. gemini-3-pro-preview: not listed on the page on 2026-10-16; priced as last documented — the m3-assets-suite pricing snapshot of 2026-05-08 recorded $2.00 / $12.00 and \"3.1 same per-token tier as 3.0\", so the cached rate and the >200k tier are 3.1 Pro Preview's (0.20; 4.00 / 18.00 / 0.40).",
       "models": {
+        "gemini-4-argon": {
+          "input": 2.0,
+          "cached_input": 0.1,
+          "output": 10.0,
+          "valid_until": "2026-11-30",
+          "next": {
+            "input": 4.0,
+            "cached_input": 0.2,
+            "output": 20.0,
+            "from": "2026-12-01"
+          }
+        },
         "gemini-3.8-flash": {
           "input": 0.75,
           "cached_input": 0.075,
@@ -134,7 +175,13 @@
             "cached_input": 0.15,
             "output": 7.5,
             "from": "2027-01-01"
-          }
+          },
+          "aliases": [
+            {
+              "id": "gemini-flash-latest",
+              "from": "2026-10-16"
+            }
+          ]
         },
         "gemini-3.7-flash": {
           "input": 0.75,
@@ -148,12 +195,72 @@
             "from": "2027-01-01"
           }
         },
+        "gemini-3.6-flash": {
+          "input": 0.75,
+          "cached_input": 0.075,
+          "output": 3.75,
+          "valid_until": "2026-12-31",
+          "next": {
+            "input": 1.5,
+            "cached_input": 0.15,
+            "output": 7.5,
+            "from": "2027-01-01"
+          }
+        },
+        "gemini-3.5-flash": {
+          "input": 1.5,
+          "cached_input": 0.15,
+          "output": 9.0
+        },
+        "gemini-3.5-flash-lite": {
+          "input": 0.3,
+          "cached_input": 0.03,
+          "output": 2.5,
+          "aliases": [
+            {
+              "id": "gemini-flash-lite-latest",
+              "from": "2026-10-16"
+            }
+          ]
+        },
+        "gemini-3.1-flash-lite": {
+          "input": 0.25,
+          "cached_input": 0.025,
+          "output": 1.5
+        },
         "gemini-3-flash-preview": {
           "input": 0.5,
           "cached_input": 0.05,
           "output": 3.0
         },
+        "gemini-2.5-flash": {
+          "input": 0.3,
+          "cached_input": 0.03,
+          "output": 2.5
+        },
+        "gemini-2.5-flash-lite": {
+          "input": 0.1,
+          "cached_input": 0.01,
+          "output": 0.4
+        },
         "gemini-3.1-pro-preview": {
+          "input": 2.0,
+          "cached_input": 0.2,
+          "output": 12.0,
+          "long": {
+            "threshold": 200000,
+            "input": 4.0,
+            "cached_input": 0.4,
+            "output": 18.0
+          },
+          "aliases": [
+            {
+              "id": "gemini-pro-latest",
+              "from": "2026-10-16"
+            }
+          ]
+        },
+        "gemini-3-pro-preview": {
           "input": 2.0,
           "cached_input": 0.2,
           "output": 12.0,
@@ -173,7 +280,14 @@
             "input": 2.5,
             "cached_input": 0.25,
             "output": 15.0
-          }
+          },
+          "aliases": [
+            {
+              "id": "gemini-pro-latest",
+              "from": "2026-05-11",
+              "until": "2026-10-15"
+            }
+          ]
         }
       }
     },
@@ -189,7 +303,8 @@
             "threshold": 200000,
             "input": 4.0,
             "cached_input": 1.0,
-            "output": 12.0
+            "output": 12.0,
+            "inclusive": true
           }
         },
         "grok-4.6": {
@@ -200,7 +315,8 @@
             "threshold": 200000,
             "input": 4.0,
             "cached_input": 1.0,
-            "output": 12.0
+            "output": 12.0,
+            "inclusive": true
           }
         },
         "grok-4.20-0309-reasoning": {
@@ -211,7 +327,8 @@
             "threshold": 200000,
             "input": 2.5,
             "cached_input": 0.4,
-            "output": 5.0
+            "output": 5.0,
+            "inclusive": true
           }
         },
         "grok-build-0.1": {
@@ -222,8 +339,25 @@
             "threshold": 200000,
             "input": 2.0,
             "cached_input": 0.4,
-            "output": 4.0
+            "output": 4.0,
+            "inclusive": true
           }
+        }
+      }
+    },
+    "xiaomi": {
+      "source": "https://mimo.mi.com/docs/en-US/price/pay-as-you-go",
+      "unit": "USD per 1M tokens, pay-as-you-go overseas (an account billed in USD), real-time inference; cache writes free for a limited time; the page's CNY table is the domestic account's",
+      "models": {
+        "mimo-v2.6-pro": {
+          "input": 0.435,
+          "cached_input": 0.0036,
+          "output": 0.87
+        },
+        "mimo-v2.6-pro-ultraspeed": {
+          "input": 4.35,
+          "cached_input": 0.036,
+          "output": 8.7
         }
       }
     },
@@ -249,7 +383,8 @@
             "threshold": 256000,
             "input": 1.2,
             "cached_input": 0.12,
-            "output": 4.8
+            "output": 4.8,
+            "inclusive": true
           }
         },
         "qwen3.6-flash": {
@@ -260,7 +395,8 @@
             "threshold": 256000,
             "input": 1.0,
             "cached_input": 0.1,
-            "output": 4.0
+            "output": 4.0,
+            "inclusive": true
           }
         }
       }

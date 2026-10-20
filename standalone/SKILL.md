@@ -60,7 +60,7 @@ def band(prov, t, counts):                                            # the pric
     if prov == "deepseek":                                                              # DeepSeek's peak: Mon–Fri 01:00–04:00 and 06:00–10:00 UTC (the package's prices.json)
         u = t.astimezone(dt.timezone.utc)
         return "peak" if u.weekday() < 5 and (1 <= u.hour < 4 or 6 <= u.hour < 10) else "off-peak"
-    if prov == "google" and (whole(counts.get("prompt")) or 0) >= 200000: return "long"     # the long-context tier of one request (the package: prompt >= 200000); a counter that is not a count says nothing here
+    if prov == "google" and (whole(counts.get("prompt")) or 0) > 200000: return "long"      # the long-context tier of one request: strictly over the row's threshold, as Google says "> 200k" (the package: over it, from it only where the row's long block says inclusive); a counter that is not a count says nothing here
     return "-"
 def whole(v):                                          # a counter as the package's count() takes it: a non-negative int up to 2**53, or a float that is one (1200.0); else None
     if type(v) is int or (isinstance(v, float) and math.isfinite(v) and v.is_integer()): return int(v) if 0 <= v <= 2**53 else None

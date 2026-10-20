@@ -5,6 +5,73 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-10-20
+
+### Added
+
+- Xiaomi MiMo (provider `xiaomi`, pay-as-you-go overseas, USD): `mimo-v2.6-pro` (0.435 / 0.87 USD per 1M input /
+  output, cache hits 0.0036) and `mimo-v2.6-pro-ultraspeed` (4.35 / 8.70, cache hits 0.036), read on the pricing page
+  2026-10-19 (cache writes free for a limited time). A usage-log line for MiMo carries `provider: xiaomi` with
+  OpenAI-style counters (`input` / `cached_input` / `output`).
+- `prices check` confirms Xiaomi's cache-hit rate too: the pricing page lists it in the model's row.
+- Google: `gemini-4-argon` priced (2/10 USD per 1M through 2026-11-30, 4/20 from 2026-12-01, cached 0.10 → 0.20;
+  flat, no long-prompt tier).
+- Google: the Flash lines the key serves, Standard tier, read on the pricing page 2026-10-16 — `gemini-3.6-flash`
+  (0.75/3.75 USD per 1M through 2026-12-31, 1.50/7.50 from 2027-01-01, cached 0.075 → 0.15), `gemini-3.5-flash-lite`
+  (0.30/2.50, cached 0.03), `gemini-3.1-flash-lite` (0.25/1.50, cached 0.025; a `-preview` id takes this row),
+  `gemini-2.5-flash` (0.30/2.50, cached 0.03) and `gemini-2.5-flash-lite` (0.10/0.40, cached 0.01); and
+  `gemini-3.5-flash` (1.50/9.00, cached 0.15), listed on the page on 2026-08-03 at these rates and not since
+  (`prices check` shows it `??`, as it does 3.7 Flash); and `gemini-3-pro-preview` (2/12, cached 0.20; > 200k 4/18,
+  cached 0.40), no longer on the page on 2026-10-16, at its last documented price (2.00/12.00 in a 2026-05-08
+  snapshot, 3.1 Pro Preview's same per-token tier). Before, one run naming any of them aborted the report (exit 5,
+  `no price for google/<id> and no reported cost`) unless `--unpriced skip` left it out.
+- Anthropic: `claude-opus-5-5` (4 / 5 / 8 / 0.20 / 20 USD per 1M: input / cache write 5m / 1h / cache read / output),
+  `claude-sonnet-5-5` (2 / 2.50 / 4 / 0.10 / 10) and `claude-haiku-5-5` (0.10 / 0.125 / 0.20 / 0.01 / 0.50 up to
+  100 000 prompt tokens, 0.50 / 0.625 / 1 / 0.05 / 2.50 above), read on the pricing page 2026-10-16. Until now the
+  prefix rule priced Opus 5.5 at Opus 5's 5 / 25 — 25 % above its 4 / 20 — in the API-equivalent figures, and Sonnet
+  5.5 at Sonnet 5's rates.
+
+### Changed
+
+- A price row's `aliases` price a usage row that names one, by the day the row was made. An alias is a bare id (any
+  day) or `{"id": …, "from": "YYYY-MM-DD"}` / `{"id": …, "until": "YYYY-MM-DD"}` (both ends inclusive);
+  `PriceBook.entry(provider, model, at)` looks up the row's own id, then the row whose alias window holds the usage
+  row's day (outside every window: unpriced; a row without a time takes an alias only one row names), then the
+  same-model rule below; the lookup never reads the clock, and `at` is required. `ai-cost log` (and `log.record`)
+  checks a line against the day it is stamped with (`--at`, else now) — the day the reader prices it by. Google's
+  rolling aliases as measured (the `modelVersion` of a call): `gemini-pro-latest` → `gemini-2.5-pro` from
+  2026-05-11 (its first measurement; earlier days are unpriced) through 2026-10-15 and → `gemini-3.1-pro-preview` from 2026-10-16; `gemini-flash-latest` →
+  `gemini-3.8-flash` and `gemini-flash-lite-latest` → `gemini-3.5-flash-lite` from 2026-10-16 (no earlier
+  measurement: an earlier row naming them stays unpriced). Before, one run naming an alias aborted the report (exit
+  5) unless `--unpriced skip`. `prices check` reads every alias of a row as a name the page may use.
+  At load, one alias on overlapping days in two rows of a provider, and an alias equal to a row id, are configuration
+  errors naming the provider, the alias and the rows; a user override of the aliased row itself replaces it.
+- A long-context tier is decided by the request's whole prompt (`pricing.prompt_length`): Google's reported prompt
+  total, else input plus cache reads and writes — Anthropic counts cached tokens toward the prompt length, so a Haiku
+  5.5 request of 20 000 input + 130 000 cache read is priced at its > 100 000 tier (before: by the 20 000 alone).
+  Where the tier starts is a fact of the row: strictly over its threshold by default, as Google and Anthropic say
+  ("> 200k", "over 100,000" — a prompt of exactly the threshold is billed at the base tier), and from the threshold
+  itself where the row's `long` block says `"inclusive": true` — set on the xAI rows ("≥ 200k") and the Alibaba rows
+  (the "256K–1M" tier). The standalone skill's Google rule says the same. The cache-read share an attribution line reports
+  (`usd_context`) uses the rates of the tier the request was billed at (`pricing.rates_for`), not the base tier's.
+  `prices check` confirms a long tier's cache read and write rates too.
+- The prefix rule prices only a served id of the SAME model, a closed set of shapes after the row id: `-preview`,
+  `-preview-<date>`, `-exp`, `-exp-<date>`, `-latest`, `-<date>` (`YYYYMMDD`, `YYYY-MM-DD`, `MM-YYYY`; after
+  `-preview` / `-exp` also `MM-DD`, as in `gemini-2.5-pro-preview-05-06`), then the endpoint `-customtools`
+  (`gemini-3.1-pro-preview-customtools`, listed under its model's row), then optionally a bracket (`claude-opus-5-5[1m]`, the 1M window at the model's rate). Any other id that starts with a row
+  id — `gemini-2.5-flash-preview-tts`, `gemini-2.5-flash-image`, `…-native-audio-…`, `…-live`,
+  `gemini-3.8-flash-lite-x` — is another model: unpriced and listed, never a neighbour's (text) rate. The drift
+  check reads the same rule (`config.SAME_MODEL_TAIL`): in a row's header only such a name is the model's own, so a
+  TTS id printed after a model's display name ends its row instead of lending it the TTS figures.
+- Development only: ruff also refuses an empty or over-broad `pytest.raises`, an always-failing assert and a blanket
+  `noqa` (`PT010`, `PT011`, `PT012`, `PT015`, `PGH004`); the suite had none. Nothing in the published package changes.
+
+### Fixed
+
+- A usage-log line of `alibaba` (and now `xiaomi`) naming another family's counter — `cache_read`, `cache_write_*` —
+  was accepted and those tokens priced at zero; both OpenAI-compatible providers now read `input` / `cached_input` /
+  `output` only, and such a line is a counted skip (`would not be priced`), as it is for every other provider.
+
 ## [2.9.0] - 2026-10-06
 
 ### Added
