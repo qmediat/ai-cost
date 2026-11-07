@@ -12,7 +12,7 @@ permissions:
 jobs:
   test:
     name: Python ${{ matrix.python }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }} # ubuntu-latest is 26.04 since 2026-10: no Python 3.9 there (the skills repo's lint.yml does the same)
     strategy:
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
