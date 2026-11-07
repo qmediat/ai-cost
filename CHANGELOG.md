@@ -5,6 +5,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.10.1] - 2026-11-07
+
+### Changed
+
+- Google's price registry read against the pricing and deprecations pages on 2026-11-07 (`checked_at`): `gemini-2.5-pro`
+  and `gemini-2.5-flash` shut down on 2026-12-01 and their API requests route to `gemini-3.8-flash` and
+  `gemini-3.5-flash-lite` — from that day their rows carry the rates of the model that answers them (2.5-pro's > 200k
+  tier ends with it; 3.8-flash's rise to 1.5 / 7.5 / 0.15 USD per 1M on 2027-01-01 follows as a nested `next`), so a
+  request sent to a retired id is priced as Google bills it, never left unpriced or at the old rate. A `next` block may
+  itself carry a `next`: the chain is walked to the rate in force on the row's day.
+- The Google source URL is the page that serves now (`aistudio.google.com/docs/pricing`; the old `ai.google.dev` address
+  answers 301 to it), so the drift check reads the page instead of the redirect. `gemini-3.7-flash`'s endpoint routes to
+  3.8-flash at the same rates (noted, no row change).
+
 ## [2.10.0] - 2026-10-20
 
 ### Added

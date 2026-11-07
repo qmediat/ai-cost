@@ -12,7 +12,7 @@ import time
 import urllib.error
 from collections.abc import Callable
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -415,6 +415,52 @@ def test_gemini_4_argon_is_priced_at_two_and_ten_then_four_and_twenty() -> None:
     first_day = current_price(argon, datetime(2026, 12, 1, tzinfo=timezone.utc))
     assert (last_day.input, last_day.output, last_day.cached_input) == (2.0, 10.0, 0.1)
     assert (first_day.input, first_day.output, first_day.cached_input) == (4.0, 20.0, 0.2)
+
+
+def test_gemini_2_5_pro_is_priced_as_what_answers_it_after_its_shutdown() -> None:
+    """Shut down 2026-12-01, its requests route to gemini-3.8-flash (the deprecations page): its own rates and long tier
+    through 2026-11-30, 3.8-flash's 0.75 / 3.75 / 0.075 from 2026-12-01 and 1.5 / 7.5 / 0.15 from 2027-01-01 (a nested
+    next); gemini-2.5-flash routes to gemini-3.5-flash-lite at 0.3 / 2.5 / 0.03 the same day."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    pro = book.entry(Provider.GOOGLE, "gemini-2.5-pro", None)
+    assert isinstance(pro, TokenTierPrice) and pro.long is not None and pro.valid_until == date(2026, 11, 30)
+    last_day = current_price(pro, datetime(2026, 11, 30, 23, 59, tzinfo=timezone.utc))
+    routed = current_price(pro, datetime(2026, 12, 1, tzinfo=timezone.utc))
+    risen = current_price(pro, datetime(2027, 1, 1, tzinfo=timezone.utc))
+    assert (last_day.input, last_day.output, last_day.cached_input, last_day.long is not None) == (
+        1.25,
+        10.0,
+        0.125,
+        True,
+    )
+    assert (routed.input, routed.output, routed.cached_input, routed.long) == (0.75, 3.75, 0.075, None)
+    assert (risen.input, risen.output, risen.cached_input) == (1.5, 7.5, 0.15)
+    flash = book.entry(Provider.GOOGLE, "gemini-2.5-flash", None)
+    assert isinstance(flash, TokenTierPrice) and flash.valid_until == date(2026, 11, 30)
+    assert flash.next is not None and flash.next_from == date(
+        2026, 12, 1
+    ), "its next block is dated the shutdown day"
+    lite = current_price(flash, datetime(2026, 12, 1, tzinfo=timezone.utc))
+    assert (lite.input, lite.output, lite.cached_input) == (
+        0.3,
+        2.5,
+        0.03,
+    )  # 3.5-flash-lite's rates, the same figures as its own
+
+
+def test_every_dated_shipped_row_carries_its_next_block() -> None:
+    """A shipped row with valid_until and no next would price nothing past that day (doctor: "NO next block") and a
+    test on its rates would turn red then: every dated row of the registry names what follows."""
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    dated = [
+        (f"{provider.value}/{model}", entry)
+        for provider, table in book.models.items()
+        for model, entry in table.items()
+        if isinstance(entry, TokenTierPrice) and entry.valid_until is not None
+    ]
+    assert dated, "the registry ships dated rows (argon, 3.8-flash, 2.5-pro …)"
+    missing = [name for name, entry in dated if entry.next is None]
+    assert missing == [], f"dated rows without a next block: {missing}"
 
 
 # (input, output, cached input) USD per 1M, Standard tier, ai.google.dev/gemini-api/docs/pricing on 2026-10-16
@@ -1559,14 +1605,18 @@ def test_openai_lists_cached_input_in_the_row_and_a_change_there_is_caught(tmp_p
 
 
 def test_a_changed_long_context_rate_is_a_change(tmp_path: Path) -> None:
+    """On a row whose long tier has no end date (gemini-3.1-pro-preview); gemini-2.5-pro's ends with its 2026-12-01
+    shutdown, so a test on it would turn red that day (the check compares the rates in force today)."""
     _, book = defaults(paths_in(tmp_path))
-    pro = book.entry(Provider.GOOGLE, "gemini-2.5-pro", None)
-    assert isinstance(pro, TokenTierPrice) and pro.long is not None
+    pro = book.entry(Provider.GOOGLE, "gemini-3.1-pro-preview", None)
+    assert isinstance(pro, TokenTierPrice) and pro.long is not None and pro.valid_until is None
     rates = [pro.input, pro.long.input, pro.output, pro.long.output, pro.cached_input, pro.long.cached_input]
-    section = "Gemini 2.5 Pro Input price " + " ".join(f"${rate:g}" for rate in rates)
-    assert match_model([section], Provider.GOOGLE, "gemini-2.5-pro", pro).status is CheckStatus.CONFIRMED
-    moved = section.replace(f"${pro.long.output:g}", "$18")
-    check = match_model([moved], Provider.GOOGLE, "gemini-2.5-pro", pro)
+    section = "Gemini 3.1 Pro Preview Input price " + " ".join(f"${rate:g}" for rate in rates)
+    assert (
+        match_model([section], Provider.GOOGLE, "gemini-3.1-pro-preview", pro).status is CheckStatus.CONFIRMED
+    )
+    moved = section.replace(f"${pro.long.output:g}", "$19")
+    check = match_model([moved], Provider.GOOGLE, "gemini-3.1-pro-preview", pro)
     assert check.status is CheckStatus.CHANGED and check.missing == [f"long output {pro.long.output:g}"]
 
 
