@@ -5,6 +5,55 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-11-14
+
+### Added
+
+- `prices check` names the models a vendor's page lists that the price book has no row for (`new <id>` lines and a
+  closing count, under `--quiet` too; `doctor` repeats them from the last check, less those priced since). Each
+  provider section of `prices.json` says how the vendor writes a model: `model_ids` (one regex), or — where the page
+  names models, not ids — `model_names` with `model_name_id` (`Claude Mythos 5.2` → `claude-mythos-5-2`). `no_row`
+  (regexes) lists the ids that need no row: audio / image / embedding ids, retired families, another name of a priced
+  model; a user file's `no_row` adds to the shipped list. An id the pricer already resolves to a row (a `-preview`
+  twin, a dated snapshot) is priced, never new.
+- New rows, read on the vendors' pages 2026-11-14: `claude-fable-5-2` and `claude-mythos-5-2` (8 / 40 USD per 1M,
+  cache writes 10 / 16, reads 0.20), `claude-mythos-5`, `claude-opus-4-5`, `claude-sonnet-4-5`; `gpt-6.1-sol` (2 / 10,
+  cached 0.10), `gpt-6.1-terra` (1 / 5, cached 0.05), `gpt-6-sol` (2 / 10, cached 0.20), `gpt-6-luna` (0.10 / 0.50,
+  cached 0.01), `gpt-5.3-codex` (1.75 / 14, cached 0.175); `gemini-4-hydrogen` (1.50 / 7.50, cached 0.075),
+  `gemini-4-carbon` (2 / 10, cached 0.10 through 2026-11-30; 4 / 20, cached 0.20 from 2026-12-01); `grok-4.5` and
+  `grok-4.3` with their ≥ 200k tiers; `mimo-v2.6-flash` (0.14 / 0.28, cache hits 0.0028); `qwen3.7-max` (2.5 / 7.5).
+
+### Changed
+
+- The drift check reads a page's markdown twin (`<url>.md`) beside the page, and the twin decides for every model it
+  prices. Google's pricing page answers a script shell to a plain request, so since the page moved no Google row could
+  be confirmed; OpenAI's and xAI's twins carry the rows their HTML leaves out. On 2026-11-14 every row of every vendor
+  is confirmed or absent from its page (three retired Gemini ids).
+- **One row decides.** A model's price is confirmed by its FIRST row with amounts — its id first, then its aliases,
+  then its display name, each in page order — and by nothing else; until now any row after any mention of the model
+  that carried the expected figures confirmed it, so a price that halved or doubled came back `confirmed` wherever the
+  page also printed a batch (0.5x), fast (2x) or long-prompt table. Measured on the live pages: of 55 confirmed rows,
+  a book at 0.5x or 2x is confirmed for none — except four Google rows whose section prints the announced next rate
+  beside today's.
+- What decides which row is first: the markdown twin when it prices the model (a row with amounts, or a row excluded
+  as another tier), else the page; a table under a Batch / Flex / Fast / Ultrafast / Priority heading, tab or tab
+  label, and a row the vendor labels as its long-prompt tier (`grok-4.7 (≥ 200k prompt tokens)`), are never the
+  standard row; an HTML heading is kept as such a marker.
+- Where a row ends before its first amount: at a priced model's name and at anything the vendor's `model_ids` /
+  `model_names` match (a model, priced or not) — never at the family name in a sentence, a model named as a markdown
+  link, a notice box (`{% callout %}`) or the model's own dated snapshot (`gemini-2.5-flash` and `gemini-2.5-pro` are
+  read again). After the first amount any model name ends the row, as before. A model's own long-prompt row continues
+  its row where the vendor's page is what confirms those rates (`Claude Haiku 5.5 (for prompts over 100,000 tokens)`).
+- A model's row is read up to 900 characters after its name (was 600): Gemini 4 Hydrogen's table starts further from
+  its heading than the old span reached.
+
+### Known
+
+- A single rate that moves inside the deciding row can still be confirmed where that row prints the same figure
+  twice: OpenAI's long-context columns (2x input and cached input, 1.5x output) and Google's announced next rates sit
+  in the standard row. On a page laid out in columns (DeepSeek) the "row" is the block of both models. Which region's
+  row is first (Alibaba: International) is the page's order, not a marker.
+
 ## [2.10.1] - 2026-11-07
 
 ### Changed

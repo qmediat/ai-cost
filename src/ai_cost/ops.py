@@ -1092,7 +1092,7 @@ def doctor(paths: Paths, config: Config, book: PriceBook, emit: Emit) -> int:
     emit(f"ai-cost {__version__} doctor")
     _doctor_sources(paths, config, book, line, emit)
     _doctor_prices(book, line)
-    _doctor_state(paths, line, emit, config.github.bill is not None)
+    _doctor_state(paths, line, emit, config.github.bill is not None, book)
     emit(f"doctor: {'all good' if problems == 0 else f'{problems} issue(s)'}")
     return 0 if problems == 0 else 1
 
@@ -1195,7 +1195,9 @@ def _doctor_prices(book: PriceBook, line: Line) -> None:
                 )
 
 
-def _doctor_state(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> None:
+def _doctor_state(
+    paths: Paths, line: Line, emit: Emit, bill: bool = False, book: PriceBook | None = None
+) -> None:
     """The last price check, the state directory, the tools and the scheduled jobs."""
     last = load_result(paths)
     emit(
@@ -1206,6 +1208,10 @@ def _doctor_state(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> N
         emit(
             f"  --  {provider}/{model}: listed apart from its row on the vendor page — confirm by hand: {rates}"
         )
+    for provider, model in _unlisted(last, book):
+        emit(
+            f"  --  {provider}/{model}: on the vendor's page, not in the price book — add its row, or name it under the provider's no_row"
+        )
     state = paths.state_dir
     if _writable(state):
         line(
@@ -1215,6 +1221,27 @@ def _doctor_state(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> N
         line(False, f"state dir {state} is not writable — AI_COST_STATE_DIR, or fix the permissions")
     _doctor_tools(emit)
     _doctor_reports(paths, line, emit, bill)
+
+
+def _unlisted(last: CheckResult | None, book: PriceBook | None) -> list[tuple[str, str]]:
+    """The models the last price check found on a vendor's page without a row — less those priced since."""
+    if last is None:
+        return []
+    priced = (
+        {provider.value: provider for provider in book.models} if book else {}
+    )  # a state file may name any id
+
+    def has_row(provider: str, model: str) -> bool:
+        return (
+            book is not None and provider in priced and book.entry(priced[provider], model, None) is not None
+        )
+
+    return [
+        (provider, model)
+        for provider, prov in last.providers.items()
+        for model in prov.unlisted
+        if not has_row(provider, model)
+    ]
 
 
 def _unchecked_rates(last: CheckResult | None) -> list[tuple[str, str, str]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import json
 import math
@@ -52,7 +53,15 @@ from .ops import (
     remove_schedule,
     run_auto_check,
 )
-from .prices_check import ModelCheck, apply_check, check_prices, exit_code, merged_registry_json, save_result
+from .prices_check import (
+    CheckResult,
+    ModelCheck,
+    apply_check,
+    check_prices,
+    exit_code,
+    merged_registry_json,
+    save_result,
+)
 from .process import self_command, transient_warning
 from .providers.deepseek_export import import_export, store_path
 from .reconcile import Reported, run_reconcile
@@ -397,6 +406,15 @@ def _emit_check(model: str, check: ModelCheck, quiet: bool) -> None:
         emit(f"   ~  {model:<26} listed apart from its row: {', '.join(check.unchecked)} — confirm by hand")
 
 
+def _emit_unlisted(result: CheckResult) -> None:
+    """The closing line of `prices check` when a vendor's page names models the price book has no row for."""
+    unlisted = sum(len(prov.unlisted) for prov in result.providers.values())
+    if unlisted:
+        emit(
+            f"\n{unlisted} model(s) on vendor pages without a price row: add the row to prices.json, or name the id under the provider's `no_row`."
+        )
+
+
 def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
     """Show / check / update."""
     if args.action == "show":
@@ -405,15 +423,14 @@ def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
         raise ToolError("AI_COST_OFFLINE=1 — price check disabled", code=2)
     book = load_pricebook(paths)
     providers = [p.strip() for p in args.providers.split(",")] if args.providers else None
-    result = check_prices(book, providers)
-    applied = apply_check(result, book, paths.user_prices_file()) if args.action == "update" else []
-    save_result(paths, result)
-    (paths.state_dir / "prices-check.lock").unlink(missing_ok=True)
-    unresolved = sum(
-        check.status is CheckStatus.CHANGED
-        for prov in result.providers.values()
-        for check in prov.models.values()
-    )
+    try:
+        result = check_prices(book, providers)
+        applied = apply_check(result, book, paths.user_prices_file()) if args.action == "update" else []
+        save_result(paths, result)
+    finally:  # a check that raised (a price-book key that is no regex) must not hold the next one off
+        with contextlib.suppress(OSError):  # never the error that hides the check's own
+            (paths.state_dir / "prices-check.lock").unlink(missing_ok=True)
+    unresolved = len(result.drift())
     if args.format == "json":
         emit(
             json.dumps(
@@ -425,9 +442,12 @@ def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
         emit(f"{name:<10} {prov.status}")
         for model, check in prov.models.items():
             _emit_check(model, check, args.quiet)
+        for model in prov.unlisted:
+            emit(f"   new {model:<26} on the vendor's page, not in the price book")
     for provider, model, new_in, new_out in applied:
         emit(f"applied {provider}/{model} → input {new_in} output {new_out} ({paths.user_prices_file()})")
     code = exit_code(unresolved)
+    _emit_unlisted(result)
     if code:
         emit(
             f"\n{unresolved} suspected change(s) not applied. Verify on the vendor page, then `ai-cost prices update` or edit {paths.user_prices_file()}."

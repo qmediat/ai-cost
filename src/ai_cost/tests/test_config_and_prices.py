@@ -8,6 +8,7 @@ import email
 import io
 import json
 import os
+import re
 import time
 import urllib.error
 from collections.abc import Callable
@@ -34,21 +35,29 @@ from ..ops import doctor
 from ..prices_check import (
     USER_AGENT,
     CheckResult,
+    Discovery,
     ModelCheck,
     ProviderCheck,
     apply_check,
     auto_check,
     check_due,
+    check_prices,
+    discovery,
     exit_code,
     fetch,
+    fetch_variants,
     load_result,
     match_model,
     name_variants,
     numbers_near,
+    page_rows,
     page_text,
     save_result,
     state_file,
     take_lock,
+    twin_text,
+    unlisted_models,
+    vendor_rows,
     wanted_rates,
 )
 from ..pricing import current_price
@@ -747,6 +756,10 @@ def test_another_models_id_in_the_header_ends_the_row() -> None:
     flash = book.models[Provider.GOOGLE]["gemini-2.5-flash"]
     page = "Gemini 2.5 Flash gemini-2.5-flash-preview-tts $0.30 $2.50 $0.03"
     assert match_model([page], Provider.GOOGLE, "gemini-2.5-flash", flash).status is not CheckStatus.CONFIRMED
+    rows = vendor_rows(book, Provider.GOOGLE)
+    assert match_model([page], Provider.GOOGLE, "gemini-2.5-flash", flash, rows).status is not (
+        CheckStatus.CONFIRMED
+    ), "with the rows check_prices builds too: the TTS id has no row, and it is a model"
 
 
 def test_long_tier_inclusive_is_a_boolean() -> None:
@@ -1732,7 +1745,6 @@ def test_doctor_names_the_rates_the_last_check_found_listed_apart() -> None:
 
 def test_the_vendors_rows_end_at_any_of_its_model_names_and_a_name_is_whole(tmp_path: Path) -> None:
     """As check_prices builds them: every model's names of the vendor; an id inside a longer id is another model."""
-    from ..prices_check import page_rows
 
     _, book = defaults(paths_in(tmp_path))
     models = book.models[Provider.ANTHROPIC]
@@ -1755,7 +1767,6 @@ def test_the_vendors_rows_end_at_any_of_its_model_names_and_a_name_is_whole(tmp_
 
 
 def _vendor_rows(provider: Provider, book: Any) -> Any:
-    from ..prices_check import page_rows
 
     models = book.models[provider]
     return page_rows(provider, [n for m, e in models.items() for n in name_variants(provider, m, e)])
@@ -1850,3 +1861,370 @@ def test_two_rows_of_one_model_never_pool_their_figures(tmp_path: Path) -> None:
         [page], Provider.ANTHROPIC, "claude-opus-5", opus, _vendor_rows(Provider.ANTHROPIC, book)
     )
     assert check.status is CheckStatus.CHANGED, "the id after an amount starts the model's next row"
+
+
+def test_a_model_on_the_vendors_page_without_a_row_is_named() -> None:
+    rule = Discovery(re.compile(r"gemini-\d[\d.]*-[a-z][a-z0-9.-]*", re.I), (re.compile(r"-tts$", re.I),))
+    page = "Gemini-4-Argon $2 · `gemini-4-hydrogen`. $1.50 · gemini-3.8-flash-tts $0.50 · gemini-flash-latest"
+    assert unlisted_models([page, page], ["gemini-4-argon"], rule) == ["gemini-4-hydrogen"]
+    assert (
+        unlisted_models([page], ["gemini-4-argon"], Discovery(None)) == []
+    ), "no model_ids: nothing is looked for"
+
+
+def test_the_shipped_price_book_names_how_every_token_vendor_writes_a_model_id() -> None:
+    book = parse_pricebook(builtin_prices(), {}, "prices")
+    for provider, models in book.models.items():
+        if models:
+            assert discovery(book, provider).ids is not None, provider.value
+    page = "gemini-4-argon $2.00 $10.00 $0.10 gemini-9-neon $1.00 $2.00 gemini-9-neon-tts $3"
+    with mock.patch("ai_cost.prices_check.fetch_variants", return_value=[page]):
+        result = check_prices(book, ["google"])
+    assert result.providers["google"].unlisted == ["gemini-9-neon"], "audio ids are the shipped no_row"
+    twin = "gemini-3.1-flash-lite-preview $0.25 gemini-9-neon $1"
+    with mock.patch("ai_cost.prices_check.fetch_variants", return_value=[twin]):
+        assert check_prices(book, ["google"]).providers["google"].unlisted == [
+            "gemini-9-neon"
+        ], "an id the pricer resolves to a row (a -preview twin) is priced"
+    family = "claude-fable-5-2 $8 claude-saga-6 $9 claude-in-amazon-bedrock"
+    with mock.patch("ai_cost.prices_check.fetch_variants", return_value=[family]):
+        assert check_prices(book, ["anthropic"]).providers["anthropic"].unlisted == ["claude-saga-6"]
+    again = CheckResult.from_json(result.to_json())
+    assert again.providers["google"].unlisted == ["gemini-9-neon"], "the state file keeps them for doctor"
+
+
+def test_a_no_row_entry_that_is_not_a_regex_is_a_config_error() -> None:
+    prices = builtin_prices()
+    prices["providers"]["google"]["no_row"] = ["("]
+    book = parse_pricebook(prices, {}, "prices")
+    try:
+        discovery(book, Provider.GOOGLE)
+    except ConfigError as exc:
+        assert "providers.google.no_row" in str(exc)
+    else:
+        raise AssertionError("an unbalanced pattern must be a ConfigError")
+    for key, value in (("no_row", [7]), ("model_ids", {"a": 1}), ("model_ids", ["a", "b"])):
+        prices = builtin_prices()
+        prices["providers"]["google"][key] = value
+        try:
+            discovery(parse_pricebook(prices, {}, "prices"), Provider.GOOGLE)
+        except ConfigError as exc:
+            assert f"providers.google.{key}" in str(exc)
+        else:
+            raise AssertionError(f"{key}={value!r} must be a ConfigError")
+
+
+def test_the_markdown_twin_of_a_page_is_read_beside_it() -> None:
+    pages = {
+        "https://vendor.example/prices": "<html><script>app()</script></html>",
+        "https://vendor.example/prices.md": "| m-1 | $2.00, prompts <= 200k tokens $4.00, prompts > 200k |",
+    }
+    with mock.patch("ai_cost.prices_check.fetch", side_effect=lambda url, timeout=15: pages[url]):
+        shell, twin = fetch_variants("https://vendor.example/prices")
+    assert shell.strip() == "" and "$4.00, prompts > 200k" in twin, "a twin's <= … > is prose, not a tag"
+
+    def no_twin(url: str, timeout: int = 15) -> str:
+        if url.endswith(".md"):
+            raise urllib.error.HTTPError(url, 404, "not found", None, None)  # type: ignore[arg-type]
+        return "<p>m-1 $2</p>"
+
+    with mock.patch("ai_cost.prices_check.fetch", side_effect=lambda url, timeout=15: pages[url]):
+        only = fetch_variants("https://vendor.example/prices.md")
+    assert (
+        len(only) == 1 and "$4.00, prompts > 200k" in only[0]
+    ), "a markdown source is read as markdown, once"
+    with mock.patch("ai_cost.prices_check.fetch", side_effect=no_twin):
+        assert fetch_variants("https://vendor.example/prices") == [" m-1 $2 "]
+    with mock.patch(
+        "ai_cost.prices_check.fetch", side_effect=lambda url, timeout=15: "<html><b>m-1</b></html>"
+    ):
+        assert (
+            fetch_variants("https://vendor.example/p")[1] == " m-1 "
+        ), "an HTML answer to .md is read as a page"
+
+
+def test_a_row_of_another_service_tier_never_confirms_the_standard_price(tmp_path: Path) -> None:
+    """The shapes of the vendors' markdown pages (2026-11-14): a price that halved or doubled must not come back
+    confirmed because a batch table or a long-prompt row happens to carry the stale figure."""
+    _, book = defaults(paths_in(tmp_path))
+    openai = (
+        "### Standard pricing data | gpt-6-sol | $2.00 | $10.00 | $0.20 | | gpt-6-luna | $0.10 | $0.50 | $0.01 | "
+        "### Batch pricing data #### Batch | gpt-6-sol | $1.00 | $5.00 | $0.10 | #### Flex | gpt-6-sol | $1.00 | $5.00 "
+        "| $0.10 | ### Fast pricing data | gpt-6-sol | $4.00 | $20.00 | $0.40 |"
+    )
+    sol, rows = book.entry(Provider.OPENAI, "gpt-6-sol", None), _vendor_rows(Provider.OPENAI, book)
+    assert isinstance(sol, TokenTierPrice)
+    assert match_model([openai], Provider.OPENAI, "gpt-6-sol", sol, rows).status is CheckStatus.CONFIRMED
+    for factor in (0.5, 2):
+        stale = dataclasses.replace(
+            sol, input=sol.input * factor, output=sol.output * factor, cached_input=sol.cached_input * factor
+        )
+        check = match_model([openai], Provider.OPENAI, "gpt-6-sol", stale, rows)
+        assert (
+            check.status is CheckStatus.CHANGED
+        ), f"x{factor}: the batch / fast table confirmed a stale price"
+    xai = (
+        "| grok-4.7 (< 200k prompt tokens) | 500k | $2.00 | $0.50 | $6.00 | "
+        "| grok-4.7 (≥ 200k prompt tokens) | 500k | $4.00 | $1.00 | $12.00 | | grok-4.6 (< 200k prompt tokens) |"
+    )
+    grok, rows = book.entry(Provider.XAI, "grok-4.7", None), _vendor_rows(Provider.XAI, book)
+    assert isinstance(grok, TokenTierPrice)
+    assert match_model([xai], Provider.XAI, "grok-4.7", grok, rows).status is CheckStatus.CONFIRMED
+    doubled = dataclasses.replace(grok, input=4.0, output=12.0)
+    assert match_model([xai], Provider.XAI, "grok-4.7", doubled, rows).status is CheckStatus.CHANGED
+
+
+def test_a_batch_tab_of_the_models_own_section_ends_its_standard_row(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    google = (
+        '## Gemini 4 Hydrogen {% id="gemini-4-hydrogen" %} {% tab title="Standard" %} * Input price * $1.50 --- * '
+        'Output price * $7.50 --- * Context caching price * $0.075 {% /tab %} {% tab title="Batch" %} * Input price '
+        "* $0.75 --- * Output price * $3.75 --- * Context caching price * $0.0375"
+    )
+    hydrogen, rows = book.entry(Provider.GOOGLE, "gemini-4-hydrogen", None), _vendor_rows(
+        Provider.GOOGLE, book
+    )
+    assert isinstance(hydrogen, TokenTierPrice)
+    assert (
+        match_model([google], Provider.GOOGLE, "gemini-4-hydrogen", hydrogen, rows).status
+        is CheckStatus.CONFIRMED
+    )
+    halved = dataclasses.replace(hydrogen, input=0.75, output=3.75, cached_input=0.0375)
+    check = match_model([google], Provider.GOOGLE, "gemini-4-hydrogen", halved, rows)
+    assert (
+        check.status is CheckStatus.CHANGED
+    ), "the Batch tab of the model's own section ends its standard row"
+
+
+def test_the_markdown_twin_decides_when_it_prices_the_model(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    sol, rows = book.entry(Provider.OPENAI, "gpt-6-sol", None), _vendor_rows(Provider.OPENAI, book)
+    assert isinstance(sol, TokenTierPrice)
+    page = "Batch gpt-6-sol $1.00 $5.00 $0.10 Standard gpt-6-sol $2.00 $10.00 $0.20"  # a page's text has no markers
+    twin = "### Standard pricing data | gpt-6-sol | $2.00 | $10.00 | $0.20 |"
+    halved = dataclasses.replace(sol, input=1.0, output=5.0, cached_input=0.1)
+    assert match_model([page, twin], Provider.OPENAI, "gpt-6-sol", halved, rows).status is CheckStatus.CHANGED
+    table = "Standard gpt-6-sol $2.00 $10.00 $0.20 Batch gpt-6-sol $1.00 $5.00 $0.10"
+    prose = "| Model | Notes | | gpt-6-sol | see the table | " + "| --- " * 200 + "| $2.00 |"
+    for twin_without_a_row in ("no model here", prose):
+        check = match_model([table, twin_without_a_row], Provider.OPENAI, "gpt-6-sol", sol, rows)
+        assert (
+            check.status is CheckStatus.CONFIRMED
+        ), "a twin without a row of the model leaves the page to decide"
+    batch_only = "### Batch pricing data | gpt-6-sol | $1.00 | $5.00 | $0.10 |"
+    check = match_model([page, batch_only], Provider.OPENAI, "gpt-6-sol", halved, rows)
+    assert (
+        check.status is CheckStatus.NOT_FOUND
+    ), "a twin that prices the model only in another tier still decides"
+
+
+def test_prose_before_a_models_table_does_not_end_its_row(tmp_path: Path) -> None:
+    """Google's page (2026-11-14): the family name in a sentence, another model as a link, a deprecation notice."""
+    _, book = defaults(paths_in(tmp_path))
+    rows = _vendor_rows(Provider.GOOGLE, book)
+    argon = book.entry(Provider.GOOGLE, "gemini-4-argon", None)
+    assert isinstance(argon, TokenTierPrice)
+    section = (
+        '## Gemini 4 Argon {% id="gemini-4-argon" %} Our efficient Gemini 4 frontier reasoning model. It delivers '
+        "Gemini 4 intelligence compared to [Gemini 4 Carbon](/docs/pricing#gemini-4-carbon) across complex tasks. "
+        '{% tab title="Standard" %} * Input price * $2.00 through November 30, 2026. $4.00 starting December 1, 2026. '
+        "--- * Output price * $10.00 through November 30. $20.00 starting December 1. --- * Context caching price * "
+        "$0.10 through November 30. $0.20 starting December 1."
+    )
+    assert (
+        match_model([section], Provider.GOOGLE, "gemini-4-argon", argon, rows).status is CheckStatus.CONFIRMED
+    )
+    flash = TokenTierPrice(input=0.3, output=2.5, cached_input=0.03)
+    raw = (
+        '## Gemini 2.5 Flash {% id="gemini-2.5-flash" %}\n{% callout type="caution" %} Requests to `gemini-2.5-flash` '
+        "will route to [Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`)](/docs/models/gemini-3.5-flash-lite).\n"
+        '{% /callout %}\n{% tab title="Standard" %} * Input price * $0.30 --- * Output price * $2.50 --- * Context '
+        "caching price * $0.03"
+    )
+    check = match_model([twin_text(raw)], Provider.GOOGLE, "gemini-2.5-flash", flash, rows)
+    assert check.status is CheckStatus.CONFIRMED, "a notice names the replacing model before the table"
+    after = "| gemini-4-argon | $2.00 | $10.00 | gemini-4-carbon | $0.10 |"
+    check = match_model([after], Provider.GOOGLE, "gemini-4-argon", argon, rows)
+    assert (
+        check.status is CheckStatus.CHANGED
+    ), "(guard) after an amount another model's name still ends the row"
+
+
+def test_a_models_own_long_prompt_row_belongs_to_its_row_where_the_vendor_lists_it_there(
+    tmp_path: Path,
+) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    haiku, rows = book.entry(Provider.ANTHROPIC, "claude-haiku-5-5", None), _vendor_rows(
+        Provider.ANTHROPIC, book
+    )
+    assert isinstance(haiku, TokenTierPrice) and haiku.long is not None
+    page = (
+        "| Claude Haiku 5.5 (for prompts up to 100,000 tokens) | $0.10 / MTok | $0.125 / MTok | $0.20 / MTok | $0.01 "
+        "/ MTok | $0.50 / MTok | | Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $0.625 / MTok "
+        "| $1 / MTok | $0.05 / MTok | $2.50 / MTok | | Claude Haiku 4.5 | $1 / MTok |"
+    )
+    assert (
+        match_model([page], Provider.ANTHROPIC, "claude-haiku-5-5", haiku, rows).status
+        is CheckStatus.CONFIRMED
+    )
+    moved = page.replace("$2.50 / MTok", "$3 / MTok")
+    check = match_model([moved], Provider.ANTHROPIC, "claude-haiku-5-5", haiku, rows)
+    assert check.status is CheckStatus.CHANGED and check.missing == ["long output 2.5"]
+
+
+def test_a_vendor_that_writes_display_names_has_its_new_models_seen(tmp_path: Path) -> None:
+    """Anthropic's pricing page names models as `Claude Mythos 5.2`, never by id (both variants, 2026-11-14)."""
+    _, book = defaults(paths_in(tmp_path))
+    page = (
+        "| Claude Fable 5.2 | $8 / MTok | | Claude Saga 6.1 ([limited availability](https://x.example)) | $9 / MTok | "
+        "| Claude Opus 4.1 ([retired](https://x.example)) | $15 / MTok | Claude in Amazon Bedrock, Claude 5 family"
+    )
+    with mock.patch("ai_cost.prices_check.fetch_variants", return_value=[page]):
+        assert check_prices(book, ["anthropic"]).providers["anthropic"].unlisted == ["claude-saga-6-1"]
+    assert book.entry(Provider.ANTHROPIC, "claude-mythos-5-2", None) is not None, "priced on the page: 8 / 40"
+
+
+def test_a_users_no_row_adds_to_the_shipped_list() -> None:
+    book = parse_pricebook(
+        builtin_prices(), {"providers": {"openai": {"no_row": ["^gpt-9-zeta$"]}}}, "prices"
+    )
+    page = "gpt-9-zeta $1 gpt-4o-mini $2 gpt-9-eta $3"
+    with mock.patch("ai_cost.prices_check.fetch_variants", return_value=[page]):
+        assert check_prices(book, ["openai"]).providers["openai"].unlisted == ["gpt-9-eta"]
+
+
+def test_a_new_model_of_tomorrow_is_not_hidden_by_the_shipped_exclusions(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    pages = {
+        "alibaba": (
+            "qwen3.9-max-preview qwen4-max qwen3.7-max-2026-06-08",
+            ["qwen3.9-max-preview", "qwen4-max"],
+        ),
+        "openai": ("gpt-7-sol-2027-01-05 GPT-6 Astra o5 gpt-6-astra", ["gpt-7-sol-2027-01-05", "o5"]),
+        "google": ("gemini-5-flash-preview-12-2026 gemini-3.8-flash-tts", ["gemini-5-flash-preview-12-2026"]),
+    }
+    for provider, (page, want) in pages.items():
+        with mock.patch("ai_cost.prices_check.fetch_variants", return_value=[page]):
+            assert check_prices(book, [provider]).providers[provider].unlisted == want, provider
+
+
+def test_a_table_further_from_the_name_than_the_old_span_is_read(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    hydrogen, rows = book.entry(Provider.GOOGLE, "gemini-4-hydrogen", None), _vendor_rows(
+        Provider.GOOGLE, book
+    )
+    assert hydrogen is not None
+    page = "gemini-4-hydrogen " + "word " * 140 + "$1.50 $7.50 $0.075"  # 700 characters of description first
+    assert (
+        match_model([page], Provider.GOOGLE, "gemini-4-hydrogen", hydrogen, rows).status
+        is CheckStatus.CONFIRMED
+    )
+    far = "gemini-4-hydrogen " + "word " * 200 + "$1.50 $7.50 $0.075"
+    assert (
+        match_model([far], Provider.GOOGLE, "gemini-4-hydrogen", hydrogen, rows).status
+        is CheckStatus.NOT_FOUND
+    )
+
+
+def test_prices_check_prints_the_new_models_and_doctor_forgets_one_priced_since(tmp_path: Path) -> None:
+    from .. import cli
+    from ..ops import _unlisted
+
+    paths = paths_in(tmp_path)
+    _, book = defaults(paths)
+    page = "gemini-4-argon $2.00 $10.00 $0.10 gemini-9-neon $1.00"
+    out = io.StringIO()
+    online = dataclasses.replace(paths, offline=False)
+    pages = mock.patch("ai_cost.prices_check.fetch_variants", return_value=[page])
+    with pages, mock.patch.object(Paths, "from_env", return_value=online), redirect_stdout(out):
+        cli.main(["prices", "check", "--providers", "google", "--quiet"])
+    text = out.getvalue()
+    assert "new gemini-9-neon" in text and "1 model(s) on vendor pages without a price row" in text
+    result = CheckResult("2026-11-14T00:00:00Z")
+    result.providers["google"] = ProviderCheck("u", "fetched", {}, ["gemini-9-neon", "gemini-4-hydrogen"])
+    assert _unlisted(result, book) == [("google", "gemini-9-neon")], "hydrogen has its row now"
+    assert _unlisted(None, book) == []
+
+
+def test_the_first_row_with_amounts_decides_and_a_later_table_cannot_confirm(tmp_path: Path) -> None:
+    """Alibaba's page shape (2026-11-14): International first, then the same model's US row at other rates."""
+    _, book = defaults(paths_in(tmp_path))
+    rows = vendor_rows(book, Provider.ALIBABA)
+    qwen = book.entry(Provider.ALIBABA, "qwen3.7-max", None)
+    assert isinstance(qwen, TokenTierPrice)
+    page = (
+        "| qwen3.7-max > Currently equivalent to qwen3.7-max-2026-05-20 | International | 0<Token≤1M | $2.5 | $7.5 | "
+        "| qwen3.7-max-2026-06-08 | International | $2.5 | $7.5 | "
+        "| qwen3.7-max > Currently equivalent to qwen3.7-max-2026-05-20 | US | 0<Token≤1M | $2.5 | $7.5 |"
+    )
+    assert match_model([page], Provider.ALIBABA, "qwen3.7-max", qwen, rows).status is CheckStatus.CONFIRMED
+    moved = page.replace(
+        "| International | 0<Token≤1M | $2.5 | $7.5 |", "| International | 0<Token≤1M | $3.0 | $9.0 |"
+    )
+    check = match_model([moved], Provider.ALIBABA, "qwen3.7-max", qwen, rows)
+    assert check.status is CheckStatus.CHANGED, "the US row and the dated snapshot's row still show 2.5 / 7.5"
+    assert check.seen == [3.0, 9.0], "the model's own dated snapshot in its cell does not end the row"
+
+
+def test_the_id_decides_before_the_display_name(tmp_path: Path) -> None:
+    """Google's section shape: the heading (the display name) reaches only the first figure; the id's row is whole."""
+    _, book = defaults(paths_in(tmp_path))
+    rows = vendor_rows(book, Provider.GOOGLE)
+    hydrogen = book.entry(Provider.GOOGLE, "gemini-4-hydrogen", None)
+    assert isinstance(hydrogen, TokenTierPrice)
+    section = (
+        "## Gemini 4 Hydrogen "
+        + "about the model " * 52
+        + "[`gemini-4-hydrogen`](/docs/models/gemini-4-hydrogen) "
+        '{% tab title="Standard" %} * Input price * $1.50 --- * Output price * $7.50 --- * Context caching * $0.075'
+    )
+    check = match_model([section], Provider.GOOGLE, "gemini-4-hydrogen", hydrogen, rows)
+    assert check.status is CheckStatus.CONFIRMED and check.seen == [1.5, 7.5, 0.075]
+    heading = numbers_near(section, "Gemini 4 Hydrogen", 900)
+    assert heading != check.seen, "the heading's 900 characters do not hold the whole row: it must not decide"
+
+
+def test_an_unpriced_models_id_before_the_first_amount_ends_the_row(tmp_path: Path) -> None:
+    _, book = defaults(paths_in(tmp_path))
+    rows = vendor_rows(book, Provider.GOOGLE)
+    flash = TokenTierPrice(input=0.3, output=2.5, cached_input=0.03)
+    neighbour = "gemini-2.5-flash gemini-9-neon $0.30 $2.50 $0.03 gemini-2.5-flash-preview-tts $0.50 $10.00"
+    check = match_model([neighbour], Provider.GOOGLE, "gemini-2.5-flash", flash, rows)
+    assert (
+        check.status is CheckStatus.NOT_FOUND
+    ), "gemini-9-neon has no row, and it is a model: the figures are its"
+    prose = "gemini-2.5-flash, our Gemini 2 workhorse — $0.30 $2.50 $0.03"
+    assert (
+        match_model([prose], Provider.GOOGLE, "gemini-2.5-flash", flash, rows).status is CheckStatus.CONFIRMED
+    )
+
+
+def test_a_template_that_names_a_group_the_pattern_lacks_is_a_config_error() -> None:
+    prices = builtin_prices()
+    prices["providers"]["anthropic"]["model_name_id"] = "claude-{1}-{3}"
+    try:
+        discovery(parse_pricebook(prices, {}, "prices"), Provider.ANTHROPIC)
+    except ConfigError as exc:
+        assert "providers.anthropic.model_name_id" in str(exc)
+    else:
+        raise AssertionError("group 3 of a two-group pattern must be a ConfigError")
+    prices = builtin_prices()
+    prices["providers"]["anthropic"]["model_names"] = r"Claude ([A-Z][a-z]+) (\d+)(?:\.(\d+))?"
+    prices["providers"]["anthropic"]["model_name_id"] = "claude-{1}-{2}-{3}"
+    book = parse_pricebook(prices, {}, "prices")
+    with mock.patch(
+        "ai_cost.prices_check.fetch_variants", return_value=["Claude Saga 6.1 $9 · Claude Saga 7 $9"]
+    ):
+        unlisted = check_prices(book, ["anthropic"]).providers["anthropic"].unlisted
+    assert unlisted == [
+        "claude-saga-6-1"
+    ], "a name whose optional group took no part makes no id (and no traceback)"
+
+
+def test_doctor_reads_a_state_file_that_names_a_provider_the_book_does_not_have(tmp_path: Path) -> None:
+    from ..ops import _unlisted
+
+    _, book = defaults(paths_in(tmp_path))
+    result = CheckResult("2026-11-14T00:00:00Z")
+    result.providers["acme corp"] = ProviderCheck("u", "fetched", {}, ["acme-1"])
+    assert _unlisted(result, book) == [("acme corp", "acme-1")]

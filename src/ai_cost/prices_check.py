@@ -7,8 +7,12 @@ detached when the last one is older than ``auto_check_days``; reports never wait
 
 from __future__ import annotations
 
+import bisect
 import contextlib
+import dataclasses
+import functools
 import html
+import http.client
 import json
 import os
 import re
@@ -24,8 +28,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
-from .config import SAME_MODEL_TAIL, Paths, PriceBook, deep_merge
-from .errors import ToolError
+from .config import SAME_MODEL_TAIL, Paths, PriceBook, builtin_prices, deep_merge
+from .errors import ConfigError, ToolError
 from .models import CheckStatus, PeakOffpeakPrice, PriceEntry, Provider, TokenTierPrice
 from .pricing import current_price
 from .process import self_command
@@ -36,7 +40,7 @@ from .values import money
 # presents itself as a browser to get past that.
 USER_AGENT = f"ai-cost/{__version__} (+https://github.com/qmediat/ai-cost)"
 AMOUNT = re.compile(r"\$\s?(\d+(?:[.,]\d+)?)")
-SCAN_SPAN = 600
+SCAN_SPAN = 900
 LOCK_SECONDS = 600
 
 
@@ -61,6 +65,8 @@ class ProviderCheck:
     url: str
     status: str
     models: dict[str, ModelCheck] = field(default_factory=dict)
+    # model ids the vendor's page names that the price book neither prices nor lists as no_row: new models
+    unlisted: list[str] = field(default_factory=list)
 
 
 def _amount(item: Any) -> float:
@@ -120,6 +126,7 @@ class CheckResult:
                         }
                         for m, c in prov.models.items()
                     },
+                    "unlisted": prov.unlisted,
                 }
                 for name, prov in self.providers.items()
             },
@@ -150,7 +157,7 @@ class CheckResult:
                     _labels(check.get("unchecked")),
                 )
             result.providers[name] = ProviderCheck(
-                str(prov.get("url", "")), str(prov.get("status", "")), checks
+                str(prov.get("url", "")), str(prov.get("status", "")), checks, _labels(prov.get("unlisted"))
             )
         return result
 
@@ -225,15 +232,51 @@ def fetch(
 
 
 def page_text(raw: str) -> str:
-    """Visible text of an HTML page, whitespace collapsed."""
+    """Visible text of an HTML page, whitespace collapsed; a heading is kept as a `## ` marker."""
     raw = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", raw)
+    # a heading stays a section marker (`## Batch ¶`), as in a twin: where it starts and where its own text ends
+    raw = re.sub(r"(?i)<h[1-4](?:\s[^>]*)?>", " ## ", raw)
+    raw = re.sub(r"(?i)</h[1-4]>", f" {HEADING_END} ", raw)
     text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", raw))
     return re.sub(r"\s+", " ", text)
 
 
+MARKDOWN_TWIN = ".md"
+HEADING_END = (
+    "\u00b6"  # where a heading's own text ends once whitespace is collapsed: its body is not its title
+)
+
+
 def fetch_variants(url: str, timeout: int = 15) -> list[str]:
-    """The page text as the checker sees it, as the list of variants the matching step walks (one today)."""
-    return [page_text(fetch(url, timeout))]
+    """The page text as the checker sees it, as the list of variants the matching step walks.
+
+    The page itself, then its markdown twin (``<url>.md``) where the vendor serves one: a page rendered by script
+    answers with an empty shell, and its twin carries the whole table. A vendor without a twin gives one variant —
+    the provider's status line counts them.
+    """
+    if url.endswith(MARKDOWN_TWIN):  # a source that is the markdown itself: read as one, it has no twin
+        return [twin_text(fetch(url, timeout))]
+    texts = [page_text(fetch(url, timeout))]
+    # no twin: the status line says "1 page variant"
+    with contextlib.suppress(urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        texts.append(twin_text(fetch(url + MARKDOWN_TWIN, timeout)))
+    return texts
+
+
+def twin_text(raw: str) -> str:
+    """A markdown twin's text, whitespace collapsed — its ``<= 200k … >`` is prose, never a tag to strip.
+
+    A vendor that answers ``<url>.md`` with an HTML page (no twin, a catch-all route) is read as the page it is.
+    """
+    if raw.lstrip("\ufeff \t\r\n")[:1] == "<":
+        return page_text(raw)
+    marked = re.sub(r"(?m)^(#{1,4} [^\n]*)$", rf"\1 {HEADING_END}", _CALLOUT.sub(" ", raw))
+    return re.sub(r"\s+", " ", html.unescape(marked))
+
+
+# a notice box of a markdown page: it names the model that replaces a deprecated one before that model's own table,
+# and a row ends at the next model name — the notice is prose about the row, never part of it
+_CALLOUT = re.compile(r"\{%\s*callout\b.*?\{%\s*/callout\s*%\}", re.S)
 
 
 # ---- matching -----------------------------------------------------------------------------------------------------
@@ -248,6 +291,15 @@ class Rows:
     """
 
     heads: re.Pattern[str] | None
+    # the names the price book has rows for: before a row's first amount only one of THESE ends it — the vendor's
+    # family name in a sentence (`Our efficient Gemini 4 frontier reasoning model`) is prose, not the next row
+    known: re.Pattern[str] | None = None
+    # the vendor lists a model's long-prompt rates as part of what its row confirms (``CACHE_IN_ROW``): the model's
+    # own long-labelled row (`Claude Haiku 5.5 (for prompts over 100,000 tokens)`) then continues its standard row
+    long_in_row: bool = False
+    # how the vendor writes a model (the price book's ``model_ids`` / ``model_names``): a head that matches is a model,
+    # priced or not, and ends a row; a head that matches none and has no row is the family name in a sentence
+    models: tuple[re.Pattern[str], ...] = ()
 
 
 # vendors whose page is laid out in columns, not rows (measured on the live pages 2026-09-30)
@@ -255,7 +307,7 @@ COLUMN_PAGES = frozenset({Provider.DEEPSEEK})
 WHOLE_SPAN = Rows(None)
 
 
-def page_rows(provider: Provider, names: Sequence[str]) -> Rows:
+def page_rows(provider: Provider, names: Sequence[str], models: Sequence[re.Pattern[str]] = ()) -> Rows:
     """How the page's rows end: at the next model name, in either form the vendor writes one.
 
     A name starts with the first word of a display name (``Claude ``, ``Gemini ``, ``Grok ``, case as shown) or with
@@ -274,14 +326,63 @@ def page_rows(provider: Provider, names: Sequence[str]) -> Rows:
     alternatives = "|".join(form for form in forms if form)
     if not alternatives:
         return WHOLE_SPAN
-    return Rows(re.compile(rf"(?<![A-Za-z0-9])(?:{alternatives})(?=[\s-]?[A-Za-z0-9])"))
+    exact = "|".join(re.escape(name) for name in sorted(set(names), key=len, reverse=True))
+    return Rows(
+        re.compile(rf"(?<![A-Za-z0-9])(?:{alternatives})(?=[\s-]?[A-Za-z0-9])"),
+        re.compile(rf"(?i:{exact})(?![A-Za-z0-9]|[.-][A-Za-z0-9])"),
+        provider in CACHE_IN_ROW,
+        tuple(models),
+    )
 
 
 _WHOLE = r"(?<![A-Za-z0-9.-]){}(?![A-Za-z0-9]|[.-][A-Za-z0-9])"  # a name, not part of a longer one
 
+# A markdown page says which service tier a table belongs to: a heading (`### Batch pricing data`) or a tab
+# (`{% tab title="Flex" %}`). The rates of another tier are a fixed multiple of the standard ones (batch 0.5x, fast 2x),
+# so such a row would "confirm" a price that halved or doubled; it never confirms, and it ends a standard row.
+_SECTION = re.compile(
+    rf'(?:(?:\b(Standard|Batch|Flex|Fast|Ultrafast|Priority) )?#{{2,4}} |tab title=")([^|#"%{HEADING_END}]{{0,60}})'
+)
+_OTHER_TIER = re.compile(r"\b(?:batch|flex|fast|ultrafast|priority|long[- ]context)\b", re.I)
+# a row the vendor labels as its long-prompt tier (`grok-4.7 (≥ 200k prompt tokens)`): the same rule
+_LONG_ROW = re.compile(r"\s*\(\s*(?:≥|>=|>|for prompts over)")
+
+
+@functools.lru_cache(maxsize=4)  # one scan per page text, not per model name
+def _tier_starts(text: str) -> tuple[list[int], list[bool]]:
+    """Where each section of ``text`` starts, and whether it is another service tier than the standard one."""
+    found = list(_SECTION.finditer(text))
+    return [m.start() for m in found], [_other_tier(m.group(1), m.group(2)) for m in found]
+
+
+def _other_tier(label: str | None, title: str) -> bool:
+    """Whether a section is another service tier than the standard one.
+
+    By the tab label a page prints before a heading (`Fast ### Grouped Pricing Table data`, `Standard ### …`) when it
+    is a tier word, else by the heading itself.
+    """
+    if label:
+        return label != "Standard"
+    return bool(_OTHER_TIER.search(title))
+
+
+def _standard_row(text: str, start: int, end: int, tiers: tuple[list[int], list[bool]]) -> str | None:
+    """The row ``text[end:]`` of a name at ``start`` cut at the next other-tier section; ``None`` inside one."""
+    starts, other = tiers
+    index = bisect.bisect_right(starts, start) - 1
+    if (index >= 0 and other[index]) or _LONG_ROW.match(text, end):
+        return None
+    cut = next((starts[i] for i in range(index + 1, len(starts)) if other[i]), len(text))
+    return text[end:cut]
+
 
 def occurrences(
-    text: str, needle: str, span: int = SCAN_SPAN, rows: Rows = WHOLE_SPAN, own: Sequence[str] = ()
+    text: str,
+    needle: str,
+    span: int = SCAN_SPAN,
+    rows: Rows = WHOLE_SPAN,
+    own: Sequence[str] = (),
+    excluded: list[int] | None = None,
 ) -> list[list[float]]:
     """Dollar amounts in the row after EVERY occurrence of ``needle`` as a whole name (menus, prose, tables).
 
@@ -292,16 +393,30 @@ def occurrences(
     (``claude-opus-5-5``) does, and so does the needle itself again (the model's next row, or an example).
     """
     name = re.compile((_WHOLE if rows.heads else "{}").format(re.escape(needle)), re.I)
-    own_names = "|".join(rf"{re.escape(n)}{SAME_MODEL_TAIL}(?![A-Za-z0-9.-])" for n in own)
-    mine = re.compile(own_names, re.I) if own else None
+    own_names = [rf"{re.escape(n)}{SAME_MODEL_TAIL}(?![A-Za-z0-9.-])" for n in own]
+    if (
+        rows.heads
+    ):  # the needle with a same-model tail (its dated snapshot, its -preview twin): the same row's model
+        own_names.append(rf"{re.escape(needle)}(?=[-\[]){SAME_MODEL_TAIL}(?![A-Za-z0-9.-])")
+    mine = re.compile("|".join(own_names), re.I) if own_names else None
     out = []
+    tiers = _tier_starts(text)
     for found in name.finditer(text):
-        row = text[found.end() : found.start() + span]
-        out.append([float(m.replace(",", "")) for m in AMOUNT.findall(row[: _row_end(row, rows, mine)])])
+        standard = _standard_row(text, found.start(), found.end(), tiers)
+        if standard is None:
+            if (
+                excluded is not None
+            ):  # a row of another tier: the text prices the model, in a table that never confirms
+                excluded.append(found.start())
+            continue
+        row = standard[: found.start() + span - found.end()]
+        out.append(
+            [float(m.replace(",", "")) for m in AMOUNT.findall(row[: _row_end(row, rows, mine, name)])]
+        )
     return out
 
 
-def _row_end(row: str, rows: Rows, mine: re.Pattern[str] | None) -> int:
+def _row_end(row: str, rows: Rows, mine: re.Pattern[str] | None, name: re.Pattern[str] | None = None) -> int:
     """Where the next model's name starts in ``row`` (its end when none does).
 
     The model's other names are passed over only in the row's header, before its first amount (Google prints the id
@@ -311,11 +426,34 @@ def _row_end(row: str, rows: Rows, mine: re.Pattern[str] | None) -> int:
     the model's own with a word (``…-customtools``) in the header is read as one of its endpoints — without that,
     gemini-3.1-pro-preview is not found on the live Google page (measured 2026-09-30).
     """
+    links = [found.span() for found in _PROSE_LINK.finditer(row)] if rows.heads else []
+    pooled = 0  # the end of the model's own long-row label: a head inside it (`Haiku 5.5` in its name) is that label
     for head in rows.heads.finditer(row) if rows.heads else ():
+        if head.start() < pooled:
+            continue
         in_header = not AMOUNT.search(row, 0, head.start())
-        if not (in_header and mine and mine.match(row, head.start())):
+        own = bool(mine and mine.match(row, head.start()))
+        linked = any(start <= head.start() < end for start, end in links)
+        prose = bool(
+            rows.known
+            and not rows.known.match(row, head.start())
+            and not any(model.match(row, head.start()) for model in rows.models)
+        )
+        again = name.match(row, head.start()) if name and rows.long_in_row else None
+        if again and _LONG_ROW.match(row, again.end()):
+            pooled = (
+                again.end()
+            )  # the model's own long-prompt row: its rates belong to what this row confirms
+            continue
+        if not (in_header and (own or linked or prose)):
             return head.start()
     return len(row)
+
+
+# another model named as a markdown link in a row's header (`compared to [Gemini 4 Carbon](/docs/pricing#…)`, the
+# link's address included): prose
+# about the model, before its table — passed over like the model's own names; after an amount it starts a row
+_PROSE_LINK = re.compile(r"\[[^\]\[|]{1,60}\]\([^)\s]{0,200}\)")
 
 
 def numbers_near(text: str, needle: str, span: int = SCAN_SPAN) -> list[float] | None:
@@ -402,39 +540,153 @@ def _lacks(wanted: Labelled, apart: Labelled, amounts: Sequence[float]) -> tuple
 def _occurrences(
     texts: Sequence[str], provider: Provider, model: str, entry: PriceEntry, rows: Rows
 ) -> Iterator[list[float]]:
+    """The model's rows, from the variant that prices it, in the order that decides.
+
+    The variant: the markdown twin when it prices the model — a row with amounts, or a row excluded as another tier
+    (the twin says which tier a table belongs to; the page's own text does not, so it never overrides an exclusion) —
+    else the page. The order: the id first, then its aliases, then its display name, each in page order.
+    """
     names = name_variants(provider, model, entry)
-    for text in texts:
-        for name in names:  # the model's OTHER names: its own again starts another of its rows
-            yield from occurrences(text, name, rows=rows, own=[n for n in names if n.lower() != name.lower()])
+    for text in reversed(texts):
+        excluded: list[int] = []
+        found = [
+            amounts
+            for name in names  # the model's OTHER names: its own again starts another of its rows
+            for amounts in occurrences(
+                text, name, rows=rows, own=[n for n in names if n.lower() != name.lower()], excluded=excluded
+            )
+        ]
+        yield from found
+        if any(found) or excluded:
+            return
 
 
 def match_model(
     texts: Sequence[str], provider: Provider, model: str, entry: PriceEntry, rows: Rows | None = None
 ) -> ModelCheck:
-    """Confirmed when the row after any occurrence of any name carries every expected amount.
+    """Confirmed when the model's FIRST row with amounts carries every expected amount (``_occurrences``'s order).
 
-    ``rows`` says where a row ends (``page_rows`` over every model of the vendor; by default over this model's names).
-    A CHANGED check names what its nearest row lacks (the fewest missing amounts, then the richest row); a confirmed one
-    names the rates listed apart that its row lacks.
+    One row decides: a later table of the page (another tier, another region, an example) can neither confirm a stale
+    price nor be mistaken for a change. ``rows`` says where a row ends (``page_rows`` over every model of the vendor;
+    by default over this model's names). A CHANGED check names what the row lacks; a confirmed one names the rates
+    listed apart that its row does not show.
     """
     wanted, apart = wanted_rates(entry, provider)
     expected = [rate for _, rate in wanted]
-    rows = rows or page_rows(provider, name_variants(provider, model, entry))
-    best: tuple[int, int, list[float]] | None = (
-        None  # (amounts it lacks, − its size, the row): the nearest first
+    # without the vendor's other rows nothing says which names are models: every head then ends a row, as before
+    rows = rows or dataclasses.replace(page_rows(provider, name_variants(provider, model, entry)), known=None)
+    decides = next(
+        (amounts for amounts in _occurrences(texts, provider, model, entry, rows) if amounts), None
     )
-    for amounts in _occurrences(texts, provider, model, entry, rows):
-        if not amounts:
-            continue
-        lacks, unchecked = _lacks(wanted, apart, amounts)
-        if not lacks:
-            return ModelCheck(CheckStatus.CONFIRMED, expected, amounts, unchecked=unchecked)
-        if best is None or (len(lacks), -len(amounts)) < best[:2]:
-            best = (len(lacks), -len(amounts), amounts)
-    if best is None:
+    if decides is None:
         return ModelCheck(CheckStatus.NOT_FOUND, expected)
-    missing, unchecked = _lacks(wanted, apart, best[2])
-    return ModelCheck(CheckStatus.CHANGED, expected, best[2], missing=missing, unchecked=unchecked)
+    missing, unchecked = _lacks(wanted, apart, decides)
+    status = CheckStatus.CHANGED if missing else CheckStatus.CONFIRMED
+    return ModelCheck(status, expected, decides, missing=missing, unchecked=unchecked)
+
+
+# ---- new models -----------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Discovery:
+    """How one vendor writes a model id, and the ids its page lists that the price book leaves no_row by design."""
+
+    ids: re.Pattern[str] | None
+    no_row: tuple[re.Pattern[str], ...] = ()
+    # a vendor that writes display names, not ids (``Claude Mythos 5.2``): the name's groups fill ``name_id``
+    names: re.Pattern[str] | None = None
+    name_id: str = ""
+
+
+def _patterns(raw: Any, where: str, flags: int = re.IGNORECASE) -> tuple[re.Pattern[str], ...]:
+    """Regexes of the price book, compiled; one that is not a regex is a ``ConfigError`` naming its place."""
+    items = [raw] if isinstance(raw, str) else [] if raw is None else raw
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        raise ConfigError(f"{where}: a regular expression, or a list of them")
+    try:
+        return tuple(re.compile(item, flags) for item in items)
+    except re.error as exc:
+        raise ConfigError(f"{where}: not a regular expression ({exc})") from exc
+
+
+def _one(raw: Any, where: str) -> re.Pattern[str] | None:
+    """A key that holds ONE regular expression, read as written: a vendor writes its ids and names in one case."""
+    found = _patterns(raw, where, 0)
+    if len(found) > 1:
+        raise ConfigError(f"{where}: one regular expression (alternatives go inside it)")
+    return found[0] if found else None
+
+
+def _section_of(raw: Mapping[str, Any], provider: Provider) -> Mapping[str, Any]:
+    providers = raw.get("providers")
+    section = providers.get(provider.value) if isinstance(providers, Mapping) else None
+    return section if isinstance(section, Mapping) else {}
+
+
+def discovery(book: PriceBook, provider: Provider) -> Discovery:
+    """The provider's ``model_ids`` / ``model_names`` / ``no_row`` keys of the price book (absent: nothing is looked for).
+
+    ``no_row`` is the shipped list AND the user's: a user file that names one id keeps every shipped exclusion.
+    """
+    section, where = _section_of(book.raw, provider), f"prices: providers.{provider.value}"
+    shipped = _section_of(builtin_prices(), provider).get("no_row")
+    name_id = section.get("model_name_id", "")
+    if not isinstance(name_id, str):
+        raise ConfigError(f"{where}.model_name_id: a template such as claude-{{1}}-{{2}}")
+    names = _one(section.get("model_names"), f"{where}.model_names")
+    slots = [int(slot) for slot in _SLOT.findall(name_id)]
+    if names is not None and any(slot == 0 or slot > names.groups for slot in slots):
+        raise ConfigError(f"{where}.model_name_id: names a group model_names does not have")
+    return Discovery(
+        _one(section.get("model_ids"), f"{where}.model_ids"),
+        _no_row(shipped, section.get("no_row"), f"{where}.no_row"),
+        names,
+        name_id,
+    )
+
+
+def _no_row(shipped: Any, merged: Any, where: str) -> tuple[re.Pattern[str], ...]:
+    """The shipped exclusions and the price book's own, each once (a user file without the key leaves the shipped)."""
+    both = _patterns(shipped, f"{where} (shipped)") + _patterns(merged, where)
+    return tuple({pattern.pattern: pattern for pattern in both}.values())
+
+
+_SLOT = re.compile(r"\{(\d+)\}")  # a group of ``model_names`` in a ``model_name_id`` template
+
+
+def _named_id(found: re.Match[str], template: str) -> str | None:
+    """The id a display name stands for: each ``{n}`` of the template is group n, lower case, dots as dashes.
+
+    ``None`` when a group the template names took no part in this match (an optional group): no id is made up.
+    """
+    groups = {int(slot): found.group(int(slot)) for slot in _SLOT.findall(template)}
+    if any(text is None for text in groups.values()):
+        return None
+    return _SLOT.sub(lambda slot: groups[int(slot.group(1))].lower().replace(".", "-"), template)
+
+
+def unlisted_models(texts: Sequence[str], known: Sequence[str], rule: Discovery) -> list[str]:
+    """Model ids the page names that are neither priced (``known``: rows and their aliases) nor listed as no_row."""
+    priced = {name.lower() for name in known}
+    seen: set[str] = set()
+    for text in texts:
+        if rule.ids is not None:
+            seen.update(match.group(0).lower().rstrip(".-") for match in rule.ids.finditer(text))
+        if rule.names is not None and rule.name_id:
+            named = (_named_id(match, rule.name_id) for match in rule.names.finditer(text))
+            seen.update(name for name in named if name)
+    return sorted(
+        name for name in seen if name not in priced and not any(skip.search(name) for skip in rule.no_row)
+    )
+
+
+def vendor_rows(book: PriceBook, provider: Provider, rule: Discovery | None = None) -> Rows:
+    """The rows of a vendor's page as the check reads them: every priced model's names, and how the vendor writes one."""
+    rule = rule or discovery(book, provider)
+    models = book.models.get(provider, {})
+    names = [name for m, e in models.items() for name in name_variants(provider, m, e)]
+    return page_rows(provider, names, [pattern for pattern in (rule.ids, rule.names) if pattern is not None])
 
 
 def check_prices(book: PriceBook, providers: Sequence[str] | None = None, timeout: int = 15) -> CheckResult:
@@ -458,12 +710,21 @@ def check_prices(book: PriceBook, providers: Sequence[str] | None = None, timeou
             continue
         entry.status = f"fetched ({len(texts)} page variant{'s' if len(texts) != 1 else ''})"
         models = book.models.get(provider, {})
-        rows = page_rows(
-            provider, [name for m, e in models.items() for name in name_variants(provider, m, e)]
-        )
+        rule = discovery(book, provider)
+        rows = vendor_rows(book, provider, rule)
         for model, price_entry in models.items():
             entry.models[model] = match_model(texts, provider, model, price_entry, rows)
+        known = [name for m, e in models.items() for name in _ids(m, e)]
+        found = unlisted_models(texts, known, rule)
+        # priced as the pricer decides it: a same-model id (a `-preview` twin, a dated snapshot) has its row
+        entry.unlisted = [name for name in found if book.entry(provider, name, None) is None]
     return result
+
+
+def _ids(model: str, entry: PriceEntry) -> list[str]:
+    """A row's id and the alias ids it prices."""
+    aliases = [alias.id for alias in entry.aliases] if isinstance(entry, TokenTierPrice) else []
+    return [model, *aliases]
 
 
 # ---- applying -----------------------------------------------------------------------------------------------------
