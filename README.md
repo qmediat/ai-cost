@@ -9,8 +9,8 @@
 
 # ai-cost
 
-One command tells what your AI-assisted work cost, from what Claude Code, Codex CLI, Gemini CLI and Grok Build CLI
-already wrote to disk — nothing is sent anywhere.
+One command tells what the AI-assisted work of any project cost: it reads what Claude Code, Codex CLI, Gemini CLI and
+Grok Build CLI already wrote to disk and the calls your own app reports — nothing is sent anywhere.
 
 ## Install
 
@@ -30,13 +30,22 @@ ai-cost report --session latest
 | API-only cost | The same tokens with no subscription | 175.02 USD |
 | Vendor quote | What an outside firm would charge | profile `consultancy-eu` |
 
-## Supports · version 2.11.1
+## Your own app
+
+```bash
+ai-cost log --provider openai --model gpt-5.5 --input 1200 --output 300 --ref job-42
+```
+
+One line per request, from a shell, Python, Node or any language that can append to a file.
+
+## Supports · version 2.11.2
 
 | | |
 |---|---|
 | Reads | Claude Code · Codex CLI · Gemini CLI · Grok Build CLI · GitHub usage report and counts · your own app's usage log |
 | Prices | Anthropic · OpenAI · Google · xAI · DeepSeek · Alibaba · Xiaomi · GitHub |
 | Runs on | macOS · Linux |
+| Needs | No Claude Code, no account, no network |
 
 ## Docs
 

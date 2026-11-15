@@ -5,6 +5,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.11.2] - 2026-11-15
+
+### Changed
+
+- The README says what the tool is for any project: it reads the coding CLIs' files and the calls your own app
+  reports, and needs no Claude Code. `AGENTS.md` gains "Add it to a project": install, where the usage log is, how an
+  app writes its line, how projects are told apart, the budget check for CI.
+
+### Development only
+
+- `scripts/check_addresses.py` fails when any address-shaped text (a domain with a last label of two or more letters)
+  in the repository is outside `qmediat.io`, GitHub's no-reply addresses, the `example.*` domains or an exact
+  per-file allowlist entry, with no shape exempt; CI checks the tracked files, and a release reads every file it
+  exports or publishes and refuses while one stands.
+
+A documentation and tooling release: the program behaves as 2.11.0 does.
+
 ## [2.11.1] - 2026-11-15
 
 ### Changed

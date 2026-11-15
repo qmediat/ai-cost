@@ -15,6 +15,7 @@ the architecture decision records are kept with the development source, not in t
 PYTHONPATH=src python3 -m ai_cost selftest      # or python3 -m pytest — the tests live in src/ai_cost/tests/
 python3 scripts/build.py src dist/ai-cost   # the shipped single file, reproducibly (fixed timestamps: a rebuild is byte-identical)
 python3 scripts/check_supports.py           # the README's "Supports · version" heading and __version__ name the package version
+python3 scripts/check_addresses.py          # every address-shaped text is in qmediat.io or on its allowed list (tracked files; --walk: every file)
 ```
 
 A release bumps the version in `pyproject.toml` and `src/ai_cost/__init__.py` and the README heading
