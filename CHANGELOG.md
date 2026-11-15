@@ -5,6 +5,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.11.1] - 2026-11-15
+
+### Changed
+
+- The README is one screen: install, run, what is supported and where to read on. The reference it held moved, unchanged
+  in substance, to `docs/`: `COMMANDS.md` (every command, the window, one session, exit codes), `ANSWERS.md` (real,
+  API-only, vendor; a sample; attribution), `SOURCES.md`, `CONFIGURATION.md`, `USAGE-LOG.md` (the usage log and
+  plugins), `JSON.md`, `LIMITS.md`, `DEVELOPMENT.md` and `TRADEMARKS.md`; per project, per day, reconcile and the
+  provider day reports stay in `SETUP.md`, which now links the reference files instead of repeating them.
+- `AGENTS.md`: what an AI agent runs to operate the tool and to work on the code, where things are, the rules
+  (`CLAUDE.md` imports it).
+- The README's "Supports" list (what it reads, what it prices, where it runs) under `## Supports · version X.Y.Z`;
+  `scripts/check_supports.py` fails when that version, or `__version__` in the code, differs from the `[project]`
+  version of `pyproject.toml`, in CI and before a release.
+
+A documentation release: the program behaves as 2.11.0 does.
+
 ## [2.11.0] - 2026-11-14
 
 ### Added

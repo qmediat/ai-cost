@@ -20,7 +20,7 @@ description: >-
 
 `ai-cost` is one executable file (a zipapp built from the package `src/ai_cost/`, Python 3.9+, stdlib only). It reads
 local files and sends nothing; the network is used only when asked for — the optional price-drift check, and
-`--github` for live GitHub counts through `gh`. Human docs: `README.md`; setup step by step, with a Verify per step
+`--github` for live GitHub counts through `gh`. Human docs: `README.md` (one screen) and the reference in `docs/`; setup step by step, with a Verify per step
 (for the person and for the agent operating the tool): `docs/SETUP.md`
 (https://github.com/qmediat/ai-cost/blob/main/docs/SETUP.md);
 design: the design note and ADRs kept with the development source (not shipped); sources and assumptions: `references/pricing-sources.md`,
@@ -40,7 +40,7 @@ design: the design note and ADRs kept with the development source (not shipped);
 | "what did yesterday cost, per project", "daily report" | `ai-cost daily` (yesterday, UTC; `--date YYYY-MM-DD` for another day) → `<reports>/<date>/global.md`, one `<project>.md` per project, `index.json`; `ai-cost install --schedule-reports [--at HH:MM]` makes it a morning job |
 | "does the tool agree with the provider's console / invoice" | `ai-cost reconcile --provider xai --usd <console figure> [--tokens N] --hours 24` — exit 1 above `reconcile.tolerance_pct` (5); `doctor` shows the last one |
 | "what are we spending per day / budget" | `ai-cost monitor --append` (exit 3 on breach) — also the line to put in a scheduler |
-| "my app / script calls the API: count that too" | the program appends one line per request to the usage log (README: "Let an app or script report its own calls") — `ai-cost log --from-response resp.json --provider openai` or `ai_cost.log.record(...)`; the next `report` includes it |
+| "my app / script calls the API: count that too" | the program appends one line per request to the usage log (`docs/USAGE-LOG.md`) — `ai-cost log --from-response resp.json --provider openai` or `ai_cost.log.record(...)`; the next `report` includes it |
 | "something is off / it does not see my sources" | `ai-cost doctor` |
 
 Prefer `--format md` for the user and `--format json --detail` when you need the rows. `AI_COST_OFFLINE=1` skips the

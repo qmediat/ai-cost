@@ -44,6 +44,8 @@ jobs:
       # The same versions as the private gate the code was written against; Dependabot does not track pip
       # installs in workflows, so bump these together with that gate.
       - run: python -m pip install --upgrade pip ruff==0.16.8 black==26.5.1 mypy==2.3.1
+      - name: The README's "Supports · version" heading names the package version
+        run: python scripts/check_supports.py
       - run: ruff check src
       - run: black --check src
       - run: mypy --strict src/ai_cost

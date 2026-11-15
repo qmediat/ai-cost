@@ -1,0 +1,23 @@
+# Sources it reads
+
+`ai-cost` reads what is already on disk and sends nothing anywhere; the network is used only when asked for (the
+price-drift check, `providers.github.bill`, `--github`). Where each CLI keeps its files, and the variables that move
+them: [CONFIGURATION.md](CONFIGURATION.md#where-things-live).
+
+| source | files | one row per, and what it reads | billing evidence in the file | the row's working directory |
+|---|---|---|---|---|
+| Claude Code | `~/.claude/projects/<project>/<session>.jsonl` + `<session>/**/*.jsonl` (subagents) | assistant message (streamed repeats of one `message.id` counted once): tokens per model incl. cache write 5 m / 1 h, cache read, server tools | none — `providers.anthropic.billing` decides (`subscription` for a Claude plan) | the project directory of the transcript (its entries' `cwd`) |
+| Codex CLI | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | (model, UTC day) of a session with turns inside the window, summed per turn inside the window: input / cached / output | a turn that names a ChatGPT plan (`rate_limits.plan_type`) is a plan turn; the rest follow `providers.openai.billing` and stay `unknown` without it (a Codex app session may name no plan in any turn) | `session_meta.payload.cwd` (the header's `cwd`); `originator` is the row's client (`codex_exec`, `codex_work_desktop` for the Codex app) |
+| Gemini CLI | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (`.json` in older versions) | model message (`type: "gemini"`, one per `id`: streamed repeats of one message id counted once); `input` includes `cached`, `thoughts` are billed as output | none — `providers.google.billing` | the folder, mapped to its path through `~/.gemini/projects.json` (by name, or by the sha256 of the path older versions used) |
+| Grok Build CLI | `~/.grok/sessions/<cwd, URL-encoded>/<session>/usage.json` (`GROK_HOME` overrides the home) | turn × model (`turns[].modelUsage`): `inputTokens` (includes `cachedReadTokens`), `outputTokens` + `reasoningTokens` as output, `modelCalls` as the requests | none — `providers.xai.billing`; the CLI's own cost (`costUsdTicks / 1e10`) is used by `real` under `providers.xai.trust_cli_cost` (default true), `api` prices at list | the session directory's name, decoded |
+| usage log | `$XDG_DATA_HOME/ai-cost/usage.jsonl` (`AI_COST_USAGE_LOG` overrides) + config `usage_logs` | one JSON line = one request that any program writes — `ai-cost log` or the schema in [USAGE-LOG.md](USAGE-LOG.md); provider-native counters, `cost` when the program knows it, `event_id` read once | the line's `billing` (`api` by default when it has tokens or a cost) | none; `session` / `ref` can name a CLI session, and the row then takes that session's scope |
+| GitHub usage report (opt-in: `providers.github.bill`) | `gh api <organizations\|users>/<name>/settings/billing/usage?year&month` — once per month the window touches | line of the report (UTC day × product × SKU × repository) of a day that lies whole inside the window and has ended; Copilot always, Actions only for a repository named with `--github` | the report's own amounts: API-only = gross, real = net, a seat (`UserMonths`) = a subscription share; the days the window only touches, the other products and the months not read are listed in the report's "GitHub usage report" section (JSON `github_bill`, amounts as text) with exact amounts — never prorated, never estimated | `<organization>/<repository>` (or the organization) — not a directory, so `--project` leaves them out |
+| GitHub counts (opt-in: `--github owner/repo`) | `gh` API: Copilot reviews submitted in the window, Actions **billable** minutes per runner OS (`/actions/runs/{id}/timing`; a run without it shows its elapsed time, never priced), private/public | review / run | a Copilot review is a count (it has no price); minutes: a plan that covers `github-actions` or `actions_plan_exhausted` — and with `providers.github.bill` set every such row is a count (the usage report has the amounts) | none |
+| plugins | whatever they read ([USAGE-LOG.md](USAGE-LOG.md#a-plugin-for-a-source-of-your-own)) | as they say | as they say | as they say |
+
+A row's billing comes first from its file (a named plan, a log line's `billing`), then from `providers.<name>.billing`,
+and stays `unknown` otherwise: an unknown row is priced in the API-only group and left out of `real` whatever
+figure it carries (a figure without a rule is an estimate, not a charge); the report header counts them. A reported
+`cost` is the charge of a row that says it paid per use. Everything a file cannot say (a torn line, a counter that is
+not a number, a turn without a timestamp) is a **counted skip**, listed by `doctor` and `report --format json`
+(`skipped[]`), never a silent zero.
