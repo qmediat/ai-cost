@@ -99,11 +99,26 @@ _ONE_SESSION = (
 )
 
 
-def _real_section(group: RealGroup, hours: float, one_session: bool = False) -> list[str]:
+_FILTERED = (
+    "Labels {said}: a selection of the period carries no subscription fee (a plan row costs 0 here; its list price "
+    "is in section 2) + pay-per-token API keys at list price. No promos, no negotiated discounts."
+)
+
+
+def _no_share_basis(report: Report) -> str:
+    """Why the real group carries no plan share ("" when it does): one session, or a label filter."""
+    if report.selection is not None:
+        return _ONE_SESSION
+    if report.where:
+        said = ", ".join(f"{key}={value}" for key, value in sorted(report.where.items()))
+        return _FILTERED.format(said=said)
+    return ""
+
+
+def _real_section(group: RealGroup, hours: float, no_share: str = "") -> list[str]:
     basis = (
-        _ONE_SESSION
-        if one_session
-        else f"Subscriptions prorated to the window ({hours:.1f} h of a 730 h month) + pay-per-token API keys at list price. No promos, no negotiated discounts."
+        no_share
+        or f"Subscriptions prorated to the window ({hours:.1f} h of a 730 h month) + pay-per-token API keys at list price. No promos, no negotiated discounts."
     )
     lines = [
         "",
@@ -256,7 +271,7 @@ def _attribution_section(group: AttributionGroup) -> list[str]:
     ]
     return [
         "",
-        "## 4. Attribution (by branch / workspace / PR, then by the paths a turn touched)",
+        f"## 4. Attribution ({group.heading})",
         "",
         f"Policy: {group.policy}.",
         "",
@@ -495,7 +510,7 @@ def _cost_sections(report: Report, hours: float) -> list[str]:
     """Real cost, API-only and per model, with the estimates' cell directly under the first cost table shown."""
     cell, out = _estimates_cell(report.estimates), []
     if report.real:
-        out += _real_section(report.real, hours, one_session=report.selection is not None) + cell
+        out += _real_section(report.real, hours, _no_share_basis(report)) + cell
         cell = []
     if report.api:
         out += _api_section(report.api) + cell
@@ -506,7 +521,11 @@ def _cost_sections(report: Report, hours: float) -> list[str]:
 def _summary_section(report: Report) -> list[str]:
     if not (report.real and report.api):
         return []
-    real = "Real (API keys; no subscription share for one session)" if report.selection else None
+    real = (
+        "Real (API keys; no subscription share for one session)"
+        if report.selection
+        else "Real (API keys; no subscription share for a label filter)" if report.where else None
+    )
     rows: list[list[Any]] = [
         [real or "Real (subscriptions share + API keys)", _fmt_usd(report.real.total_usd)],
         ["API-only equivalent", _fmt_usd(report.api.total_usd)],
@@ -546,7 +565,9 @@ def plain(value: Any) -> Any:
     if isinstance(value, Provider):  # a dataclass, but serialised as its id like the enum it replaced
         result = value.value
     elif dataclasses.is_dataclass(value) and not isinstance(value, type):
-        names = [f.name for f in dataclasses.fields(value)] + _properties(value)
+        names = [f.name for f in dataclasses.fields(value) if not f.metadata.get("internal")] + _properties(
+            value
+        )
         result = {name: plain(getattr(value, name)) for name in names}
     elif isinstance(value, dict):
         result = {str(k.value if isinstance(k, (Enum, Provider)) else k): plain(v) for k, v in value.items()}
@@ -567,8 +588,13 @@ def render_json(report: Report, detail: bool) -> str:
     data = plain(report)
     if not detail:
         data.pop("rows", None)
+    for row in data.get("rows", ()):
+        if not row["labels"]:
+            del row["labels"]  # a row without an app's labels reads as it always did
     if data.get("estimates") is None:
         data.pop("estimates", None)  # a report without an estimate reads as it always did
+    if not data.get("where"):
+        data.pop("where", None)  # nor does one without a label filter
     return json.dumps(data, indent=2)
 
 

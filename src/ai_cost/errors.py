@@ -30,3 +30,7 @@ class PricingError(ToolError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, code=5)
+
+
+class ApiError(ValueError):
+    """The library interface's one error (``ai_cost.api``): a call, a period or an instance it cannot use, named."""

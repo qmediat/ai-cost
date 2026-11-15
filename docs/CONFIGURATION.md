@@ -9,6 +9,9 @@ account plan) needs its `providers.<name>.billing`, and a provider used on a pla
 
 ## Where things live
 
+An app installation (`--instance DIR`, `ai_cost.api.Instance`) has every one of these under its own directory and
+reads no variable below ([EMBED.md](EMBED.md#the-instance-directory)).
+
 Override in the environment when your CLIs do:
 
 | what | default | override |
@@ -19,7 +22,7 @@ Override in the environment when your CLIs do:
 | daily reports | `$XDG_DATA_HOME/ai-cost/reports/<date>/` | `AI_COST_REPORTS_DIR`, `daily --out DIR` |
 | Claude Code, Codex CLI, Gemini CLI, Grok Build CLI homes | `~/.claude`, `~/.codex`, `~/.gemini`, `~/.grok` | `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME` (the CLIs' own variables) |
 | plugins | the `ai_cost.plugins` entry points and config `plugins` | `AI_COST_PLUGINS` |
-| network | the price-drift check, the GitHub usage report (`providers.github.bill`) and `--github` only | `AI_COST_OFFLINE=1` disables the check and the usage report (its amounts are then missing, said in the report) |
+| network | the price-drift check, the GitHub usage report (`providers.github.bill`), `--github` and `collect` (ssh) only | `AI_COST_OFFLINE=1` disables the check and the usage report (its amounts are then missing, said in the report) and refuses `collect` |
 
 ## config.json
 

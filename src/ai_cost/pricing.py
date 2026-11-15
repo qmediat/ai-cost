@@ -26,6 +26,7 @@ from .models import (
     TokenTierPrice,
     UsageRow,
 )
+from .timeutil import in_utc
 
 MILLION = 1_000_000.0
 Pricer = Callable[[UsageRow, PriceEntry, PriceBook, Config], Money]
@@ -61,7 +62,7 @@ def current_price(price: TokenTierPrice, at: datetime | None) -> TokenTierPrice:
     if price.next is None or at is None:
         return price
     switch = price.next_from or (price.valid_until + timedelta(days=1) if price.valid_until else None)
-    if switch and at.date() >= switch:
+    if switch and in_utc(at).date() >= switch:
         return current_price(price.next, at)
     return price
 
@@ -205,10 +206,13 @@ def price_token_tiers(row: UsageRow, entry: PriceEntry, book: PriceBook, config:
 
 
 def is_peak(at: datetime | None, peak_hours_utc: tuple[tuple[int, int], ...]) -> bool:
-    """DeepSeek peak: Mon–Fri inside the configured UTC windows (holidays not modelled)."""
-    if at is None or at.weekday() >= 5:
+    """DeepSeek peak: Mon–Fri inside the configured UTC windows (holidays not modelled), read in UTC (``in_utc``)."""
+    if at is None:
         return False
-    return any(start <= at.hour < end for start, end in peak_hours_utc)
+    utc = in_utc(at)
+    if utc.weekday() >= 5:
+        return False
+    return any(start <= utc.hour < end for start, end in peak_hours_utc)
 
 
 def price_peak_offpeak(row: UsageRow, entry: PriceEntry, book: PriceBook, config: Config) -> Money:
@@ -316,3 +320,14 @@ def price(row: UsageRow, book: PriceBook, config: Config) -> Money:
             f"no price for {row.provider.value}/{row.model} and no reported cost (add it to prices.json)"
         )
     return PRICERS[type(entry)](row, entry, book, config)
+
+
+def how_priced(row: UsageRow, entry: PriceEntry, money: Money) -> str:
+    """How one call's list price was reached: the rates' tier, or the tariff window of the call's hour."""
+    if money.note:
+        return f"list price, {money.note}"
+    if not isinstance(entry, TokenTierPrice):
+        return "list price"
+    current = current_price(entry, row.at)
+    tier = "standard tier" if _tier(current, row.tokens) is current else "long-context tier"
+    return f"list price, {tier}"

@@ -15,24 +15,16 @@ from typing import cast
 from unittest import mock
 
 from .. import cli
+from .. import doctor as doctor_module
 from .. import ops as ops_module
 from ..collectors.claude import project_dir
 from ..errors import PricingError, UsageError
 from ..models import Window
-from ..ops import (
-    MonitorEntry,
-    ReportRequest,
-    _breaches,
-    build_report,
-    cron_has_entry,
-    cron_line,
-    cron_without_entry,
-    load_items,
-    monitor,
-    resolve_window,
-)
+from ..monitor import MonitorEntry, _breaches, monitor
+from ..ops import ReportRequest, build_report, load_items, resolve_window
 from ..process import self_command
 from ..render import render_json, render_markdown
+from ..schedules import cron_has_entry, cron_line, cron_without_entry
 from ..timeutil import iso, parse_ts
 from .fixtures import (
     BASE,
@@ -759,7 +751,7 @@ def test_a_plugin_that_raises_costs_its_own_rows_never_the_report(tmp_path: Path
 
 
 def test_a_plugin_doctor_that_raises_is_one_red_line_not_an_abort(tmp_path: Path) -> None:
-    from ..ops import doctor
+    from ..doctor import doctor
     from ..plugins import Loaded, Plugin
 
     def bad_doctor(ctx: object, line: object) -> None:
@@ -794,7 +786,7 @@ def test_selftest_still_runs_when_the_user_config_does_not_parse(tmp_path: Path)
 
 
 def test_unschedule_removes_an_earlier_label_of_the_launchd_job_too(tmp_path: Path) -> None:
-    from .. import ops
+    from .. import schedules
 
     agents = tmp_path / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
@@ -806,12 +798,12 @@ def test_unschedule_removes_an_earlier_label_of_the_launchd_job_too(tmp_path: Pa
     lines: list[str] = []
     with (
         mock.patch.object(Path, "home", return_value=tmp_path),
-        mock.patch.object(ops, "is_macos", return_value=True),
+        mock.patch.object(schedules, "is_macos", return_value=True),
         mock.patch("subprocess.run") as run,
     ):
-        assert ops.schedule_installed() is True
-        assert ops.remove_schedule(lines.append) == 0
-        assert ops.schedule_installed() is False
+        assert schedules.schedule_installed() is True
+        assert schedules.remove_schedule(lines.append) == 0
+        assert schedules.schedule_installed() is False
     unloaded = [call.args[0][2] for call in run.call_args_list if call.args[0][:2] == ["launchctl", "unload"]]
     assert len(unloaded) == 2 and sum("removed" in line for line in lines) == 2, (unloaded, lines)
     assert (agents / "other.plist").exists(), "a file that is not this job is untouched"
@@ -819,10 +811,10 @@ def test_unschedule_removes_an_earlier_label_of_the_launchd_job_too(tmp_path: Pa
     lines.clear()
     with (
         mock.patch.object(Path, "home", return_value=tmp_path),
-        mock.patch.object(ops, "is_macos", return_value=True),
+        mock.patch.object(schedules, "is_macos", return_value=True),
         mock.patch("subprocess.run"),
     ):
-        assert ops.remove_schedule(lines.append) == 1, "said and exit 1, never a traceback"
+        assert schedules.remove_schedule(lines.append) == 1, "said and exit 1, never a traceback"
     assert any("cannot remove" in line for line in lines), lines
 
 
@@ -931,7 +923,7 @@ def test_install_schedule_fails_loud_when_an_earlier_label_stays_or_a_directory_
 ) -> None:
     import subprocess
 
-    from .. import ops
+    from .. import schedules
     from ..errors import ToolError
 
     paths = paths_in(tmp_path)
@@ -942,17 +934,17 @@ def test_install_schedule_fails_loud_when_an_earlier_label_stays_or_a_directory_
     loaded = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with (
         mock.patch.object(Path, "home", return_value=tmp_path),
-        mock.patch.object(ops, "is_macos", return_value=True),
+        mock.patch.object(schedules, "is_macos", return_value=True),
         mock.patch("subprocess.run", return_value=loaded),
     ):
         assert (
-            ops.install_schedule(paths, 7, ["ai-cost"], lines.append) == 1
+            schedules.install_schedule(paths, 7, ["ai-cost"], lines.append) == 1
         ), "the new job loads, the old one stays: 1"
     assert any("cannot remove" in line for line in lines) and any("loaded" in line for line in lines), lines
     (tmp_path / "state-file").write_text("a file where the state directory should be")
     blocked = replace(paths, state_dir=tmp_path / "state-file")
     try:
-        ops.install_schedule(blocked, 7, ["ai-cost"], lines.append)
+        schedules.install_schedule(blocked, 7, ["ai-cost"], lines.append)
     except ToolError as exc:
         assert "state directory" in str(exc)
     else:
@@ -1113,7 +1105,9 @@ def test_a_source_whose_skips_are_not_skips_keeps_nothing_and_the_doctor_survive
     )
     lines: list[tuple[bool, str]] = []
     with mock.patch.object(ops_module, "load_configured_plugins", side_effect=ToolError("marker broken")):
-        ops_module._doctor_plugins(paths, config, lambda ok, text: lines.append((ok, text)), lambda _: None)
+        doctor_module._doctor_plugins(
+            paths, config, lambda ok, text: lines.append((ok, text)), lambda _: None
+        )
     assert lines == [(False, "plugins: marker broken")], lines
 
 
@@ -1227,7 +1221,7 @@ def test_a_source_whose_rows_name_no_source_keeps_nothing(tmp_path: Path) -> Non
 def test_month_to_date_at_the_first_midnight_is_zero_not_an_empty_window_error(tmp_path: Path) -> None:
     from datetime import datetime, timezone
 
-    from ..ops import month_to_date
+    from ..monitor import month_to_date
 
     paths = paths_in(tmp_path)
     config, book = defaults(paths)
@@ -1270,7 +1264,9 @@ def test_the_doctor_diagnoses_a_plugin_whose_sources_are_not_a_sequence(tmp_path
     lines: list[tuple[bool, str]] = []
     loaded = Loaded(plugins=[Plugin(name="acme", sources=None), Plugin(name="beta")])  # type: ignore[arg-type]
     with mock.patch.object(ops_module, "load_configured_plugins", return_value=loaded):
-        ops_module._doctor_plugins(paths, config, lambda ok, text: lines.append((ok, text)), lambda _: None)
+        doctor_module._doctor_plugins(
+            paths, config, lambda ok, text: lines.append((ok, text)), lambda _: None
+        )
     assert (
         False,
         "plugin acme: sources is not a sequence ('NoneType' object is not iterable)",

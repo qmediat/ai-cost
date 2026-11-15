@@ -38,11 +38,14 @@ ai-cost log --provider openai --model gpt-5.5 --input 1200 --output 300 --ref jo
 
 One line per request, from a shell, Python, Node or any language that can append to a file.
 
-## Supports · version 2.11.2
+## Supports · version 2.12.0
 
 | | |
 |---|---|
 | Reads | Claude Code · Codex CLI · Gemini CLI · Grok Build CLI · GitHub usage report and counts · your own app's usage log |
+| Embeds in an app | Python: `ai_cost.api` · any language: `ai-cost --instance DIR` ([EMBED.md](https://github.com/qmediat/ai-cost/blob/main/docs/EMBED.md)) |
+| Per tenant or feature | Labels on each call · `--where` / `--by` |
+| Apps elsewhere | `collect HOST:PATH` over ssh · `import usage` from a log stream |
 | Prices | Anthropic · OpenAI · Google · xAI · DeepSeek · Alibaba · Xiaomi · GitHub |
 | Runs on | macOS · Linux |
 | Needs | No Claude Code, no account, no network |
@@ -57,6 +60,7 @@ One line per request, from a shell, Python, Node or any language that can append
 | [Sources it reads](https://github.com/qmediat/ai-cost/blob/main/docs/SOURCES.md) | docs/SOURCES.md |
 | [Your plans and prices](https://github.com/qmediat/ai-cost/blob/main/docs/CONFIGURATION.md) | docs/CONFIGURATION.md |
 | [Report your own app's calls](https://github.com/qmediat/ai-cost/blob/main/docs/USAGE-LOG.md) | docs/USAGE-LOG.md |
+| [Embed it in an app](https://github.com/qmediat/ai-cost/blob/main/docs/EMBED.md) | docs/EMBED.md |
 | [JSON output](https://github.com/qmediat/ai-cost/blob/main/docs/JSON.md) | docs/JSON.md |
 | [Limits](https://github.com/qmediat/ai-cost/blob/main/docs/LIMITS.md) | docs/LIMITS.md |
 | [For AI agents](https://github.com/qmediat/ai-cost/blob/main/AGENTS.md) | AGENTS.md |

@@ -5,7 +5,7 @@ reading this: run the numbered steps in order, run every **Verify** command, and
 does not match — say what you saw instead of improvising. Everything here is idempotent (safe to re-run). Nothing
 here needs our setup: `ai-cost` reads only files on the machine it runs on and sends nothing anywhere; the only
 network use is the optional price-drift check of the vendors' public pricing pages, and — when you ask for it — the
-GitHub account's usage report (`providers.github.bill`) and `--github`, both through `gh`.
+GitHub account's usage report (`providers.github.bill`) and `--github`, both through `gh`, and `collect`, through `ssh`.
 
 Contents: [1. The first 10 minutes](#1-the-first-10-minutes) · [2. What is read, from where](#2-what-is-read-from-where) ·
 [3. Configuration reference](#3-configuration-reference) · [4. Count your own apps and MCP servers](#4-count-your-own-apps-and-mcp-servers) ·

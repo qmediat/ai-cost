@@ -34,13 +34,17 @@ provider's formula never reads (an `input` on a deepseek line) makes the line a 
 Optional: `cost` (USD the request was charged — the row's cash under an `api` rule; a row with `cost` and no list
 price is priced by it; a `currency` other than `USD` is a counted skip), `billing` (`api` \| `subscription`; a line
 with tokens or a cost is `api` by default), `event_id` (a repeated id in one file is read once — safe to replay an
-import), `source` (your program's name, shown in the report header), `ref`, `session` (name a CLI session id and the
+import; it is what makes `ai-cost --instance DIR import usage` of a log stream safe to repeat: a line without one is not imported, and the import takes a line `record` accepts: no keys beyond the documented ones), `source` (your program's name, shown in the report header), `ref`, `session` (name a CLI session id and the
 row takes that session's scope: its project and branch), `branch`, `pr`, `tags[]` (attribution keys), and who
 launched the work — `origin_session` (the session that started it, e.g. a Claude Code session id), `origin_repo`
 (`owner/name`), `origin_pr` (a positive integer, only with `origin_repo`), `run_id` (one id per invocation; `ai-cost
 log --origin-session … --origin-repo … --origin-pr … --run-id …`). `origin_session` and `run_id` are letters, digits
 and `. _ : -`, at most 200 characters; a malformed origin keeps the line's usage and is one counted warning per file.
-`pr` stays free text; `origin_pr` is the number.
+`pr` stays free text; `origin_pr` is the number. `labels` is an app's own exact labels — an object of names (1–64
+letters, digits, `_ . -`) to non-empty strings (at most 256 characters, no control character such as a newline or a tab), e.g. `{"tenant": "acme", "feature": "chat"}`;
+`report --where tenant=acme --by feature` reads them ([EMBED.md](EMBED.md)). A `labels` key in another shape (a
+list, a string, a name with `/`) is another program's own key: the line is counted, its labels ignored, and one
+warning per file says how many lines carry one.
 
 A line that fails validation (a boolean, a negative or fractional count, a malformed provider id) is a counted skip,
 never a guess; a well-formed provider or model the pricebook does not list, with no cost, is an unpriced row under
@@ -73,29 +77,64 @@ record("openai", resp.model,
 
 ## From Node (an MCP server, an Express app)
 
-Write the line yourself, one `appendFile` per request; the format is the contract, any language can write it:
+Write the line yourself, one `write` per request, starting on a line of its own (the rule in the table below); the
+format is the contract, any language can write it:
 
 ```js
-import { appendFile } from "node:fs/promises";
+import { closeSync, constants, fstatSync, openSync, readSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const LOG = process.env.AI_COST_USAGE_LOG
   ?? join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "ai-cost", "usage.jsonl");
 
-export async function logUsage(provider, model, tokens, extra = {}) {   // tokens: the provider's own counter names (table above)
+export function logUsage(provider, model, tokens, extra = {}) {   // tokens: the provider's own counter names (table above)
   const line = { schema: 1, at: new Date().toISOString(), provider, model, tokens, ...extra };
-  await appendFile(LOG, JSON.stringify(line) + "\n", { encoding: "utf8" });   // mkdir -p the directory once at startup
+  const fd = openSync(LOG, "a");                                    // mkdir -p the directory once at startup
+  try {
+    const data = Buffer.from((torn(fd) ? "\n" : "") + JSON.stringify(line) + "\n");
+    if (writeSync(fd, data) !== data.length) throw new Error(`${LOG}: short write`);   // one write, never retried
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function torn(fd) {                         // a regular file that ends without a newline: another writer's cut line
+  const stat = fstatSync(fd);
+  if (!stat.isFile() || stat.size === 0) return false;              // a pipe or a device: no check
+  try {
+    const reader = openSync(LOG, constants.O_RDONLY | constants.O_NONBLOCK), last = Buffer.alloc(1);
+    try {
+      const seen = fstatSync(reader);
+      if (seen.dev !== stat.dev || seen.ino !== stat.ino) return false;   // the path names another file now: no check
+      return seen.size > 0 && readSync(reader, last, 0, 1, seen.size - 1) === 1 && last[0] !== 0x0a;
+    } finally {
+      closeSync(reader);
+    }
+  } catch {
+    return false;                                                   // a log this process may not read: no check
+  }
 }
 
 // after an Anthropic call:
-await logUsage("anthropic", msg.model, {
+logUsage("anthropic", msg.model, {
   input: msg.usage.input_tokens, output: msg.usage.output_tokens,
   cache_read: msg.usage.cache_read_input_tokens ?? 0, cache_write_1h: msg.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
 }, { source: "my-mcp-server", event_id: msg.id });
 ```
 
-A line ≤ 4 KB written with one `write` is atomic on POSIX; the reader tolerates a torn last line and counts it. A
+| Writer | Rule |
+|---|---|
+| `ai-cost log`, `record()` | one `write` per line through a descriptor opened for appending; when the file does not end with a newline (another writer's line was cut short), the line goes out after a newline in that same write; a short or failed write is an error, and nothing more is written |
+| a program in another language | the same: start the line with a newline when the file does not end with one, write the line in one `write` |
+
+A line shorter than 4096 bytes (one byte is kept for a newline before it) is written whole; `ai-cost log` and `record()` pass no limit, so a longer line is written
+but not guaranteed whole (local POSIX filesystems). The reader counts a cut line as one skip and ignores blank lines.
+Two named limits: a writer that does not check the end of the file can be glued to a cut line, and a cut made by
+another writer between this writer's check and its write still glues (the check and the write are two steps). A log
+this writer may append to but not read, and a pipe, are written without the check. A pipe waits for its reader:
+in Node that open stops the whole event loop until one opens it. An instance refuses a line of 4096 bytes or more;
+an app installed in many places keeps one directory per installation ([EMBED.md](EMBED.md)). A
 log in another place: `--log FILE` for `ai-cost log`, and list the file under `usage_logs` in the config so reports
 read it (the command says so when you forget).
 

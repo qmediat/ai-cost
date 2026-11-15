@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import Mapping, Sequence
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -306,3 +308,13 @@ def fake_gh(tmp: Path) -> Path:
     )
     script.chmod(0o755)
     return folder
+
+
+def run_cli(argv: Sequence[str]) -> tuple[int, str, str]:
+    """The command run in-process: its exit code, what it printed, what it said on stderr."""
+    from .. import cli  # imported here: the command imports every module, a fixture file is read first
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = cli.main(list(argv))
+    return code, out.getvalue(), err.getvalue()

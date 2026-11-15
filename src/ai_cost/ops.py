@@ -1,26 +1,22 @@
-"""Operations: the report assembly, doctor, monitor, install/schedule. Commands return exit codes; nothing here exits."""
+"""Operations: the report assembly and the commands around it. Commands return exit codes; nothing here exits.
+
+The doctor, the monitor, the scheduled jobs and the header's warnings live in ``doctor.py``, ``monitor.py``,
+``schedules.py`` and ``report_warnings.py``.
+"""
 
 from __future__ import annotations
 
-import html
 import json
 import math
 import os
-import platform
-import re
-import shlex
-import shutil
-import subprocess
-import sys
-from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 from . import __version__
-from .attribution import attribution_group, parse_rules
+from .attribution import Rule, attribution_group, label_group, parse_rules
 from .collectors import BUILTIN, collect_claude, collect_github, find_session_files
 from .collectors.claude import SOURCE_NAME as CLAUDE_SOURCE
 from .collectors.files import or_skip
@@ -31,16 +27,14 @@ from .collectors.github_bill import (
     bill_warnings,
     collect_bill,
     fetch_month,
-    probe_bill,
     settled_by,
 )
-from .collectors.usage_log import log_files
-from .config import MAX_WINDOW_HOURS, Config, Paths, PriceBook
+from .config import MAX_WINDOW_HOURS, Config, Instance, Paths, PriceBook
 from .errors import ToolError, UsageError
 from .estimates import Estimates, left_out_warnings, scoped, valid
 from .groups import (
-    INVOICE_ATTRIBUTION,
     ApiGroup,
+    AttributionGroup,
     RealGroup,
     Report,
     api_group,
@@ -67,7 +61,6 @@ from .models import (
     Estimate,
     Provider,
     ProviderSummary,
-    RowKind,
     Scope,
     Size,
     Skipped,
@@ -78,20 +71,10 @@ from .models import (
 )
 from .onboarding import (
     BILL_HINT,
-    REPORT_CHECK_DAYS,
-    Check,
-    Mark,
-    billing_hint,
-    github_checks,
     init_config_lines,
-    outside_scope,
     paid_for,
-    provider_report_checks,
-    provider_use,
-    setup_checks,
-    source_checks,
-    source_files,
 )
+from .output import Emit, ensure_dir
 from .permodel import model_lines
 from .plugins import (
     Context,
@@ -104,14 +87,27 @@ from .plugins import (
     entry_point_modules,
     load_plugins,
 )
-from .prices_check import CheckResult, auto_check, load_result, state_file
+from .prices_check import auto_check
 from .pricing import entry_for
 from .providers import ReadContext, read_reports
 from .remainder import compare, interval, span_text
-from .timeutil import iso, minutes, now, parse_cli_ts
-from .values import merge_skips
+from .report_warnings import billing_warnings, config_warnings
+from .timeutil import iso, minutes, now, parse_cli_ts, zoned
+from .values import checked_label, merge_skips
+from .values import labels as labels_rule
 
-Emit = Callable[[str], None]
+ACCOUNTS_UNREAD = "an instance reads no account source"
+CLIS_UNREAD = "coding-CLI files: not read — an instance reads them only with read_clis"
+FILTERED = (
+    "the real group is their cash only, no plan share; a filter selects usage rows: work items and estimates are "
+    "left out"
+)
+FILTERED_ACCOUNT = "a report filtered by labels holds part of the account"
+
+
+def reads_clis(paths: Paths) -> bool:
+    """Whether a run reads the machine user's coding-CLI files: always, except an instance without ``read_clis``."""
+    return paths.instance is None or paths.instance.read_clis
 
 
 @dataclass(frozen=True)
@@ -133,7 +129,10 @@ class ReportRequest:
     vendor_profile: str | None = None
     detail: bool = False
     attribute: Sequence[str] = ()  # LABEL=REGEX specs (ADR-0003)
-    unpriced: str = "fail"  # fail (exit 5, the default) or skip (count the rows and go on)
+    # fail (exit 5) or skip (count the rows and go on); "" = the run's default, ``unpriced_rule``
+    unpriced: str = ""
+    where: Mapping[str, str] = field(default_factory=dict)  # only rows whose labels hold every pair, exactly
+    by: str = ""  # one label name: the attribution group lists one line per value of it
 
 
 def resolve_window(request: ReportRequest, span: Window | None, default_hours: float) -> Window:
@@ -259,6 +258,25 @@ def _size(value: str) -> Size:
         return Size.S
 
 
+@dataclass(frozen=True)
+class _Count:
+    """A sources line that counts rows, as a filtered report says it: its label, and whether it counts sessions."""
+
+    label: str
+    # the Claude transcripts' line counts files; filtered, it names the sessions of the rows it kept
+    sessions: bool = False
+
+    def recount(self, rows: Sequence[UsageRow], index: int) -> str:
+        """The line for the kept rows this line took (``UsageRow.intake``), naming only their writers; "" for none."""
+        kept = [row for row in rows if row.intake == index]
+        if not kept:
+            return ""
+        if self.sessions:
+            return f"{self.label}: {len({row.ref for row in kept})} session(s) kept"
+        writers = sorted({row.source for row in kept} - {self.label})
+        return f"{self.label} ×{len(kept)}" + (f" ({', '.join(writers)})" if writers else "")
+
+
 @dataclass
 class _Gathered:
     """Everything collected for a window, before grouping."""
@@ -275,6 +293,10 @@ class _Gathered:
     session: str = ""  # a session report's resolved id, known before any source runs
     estimates: list[Estimate] = field(default_factory=list)  # never priced, never summed (ADR-0010)
     project: str = ""  # a per-project report's directory: it shows no estimate (ADR-0010)
+    # the lines of ``sources`` that count rows, by index: a filtered report counts them again from the rows it kept
+    # (None: a line it drops, a source's estimates)
+    counts: dict[int, _Count | None] = field(default_factory=dict)
+    filtered: bool = False  # a label filter: every row is tagged with the sources line that took it
 
 
 def _default_project(request: ReportRequest, paths: Paths) -> tuple[Path | None, bool]:
@@ -307,20 +329,17 @@ def _gather(
     )
     claude = collect_claude(files, None, Billing.rule(config.anthropic_billing))
     window = resolve_window(request, claude.span, config.window_default_hours)
+    said = f"claude transcripts ×{len({p for _, p in files})}" if reads_clis(paths) else CLIS_UNREAD
     gathered = _Gathered(
-        window,
-        [],
-        [],
-        [f"claude transcripts ×{len({p for _, p in files})}"],
-        [],
-        [*unlisted, *claude.skipped],
-        book,
+        window, [], [], [said], [], [*unlisted, *claude.skipped], book, filtered=bool(request.where)
     )
-    session = _open_session(gathered, request, files, project)
-    gathered.rows += [row for row in claude.rows if window.contains(row.at)]
+    if reads_clis(paths):  # a line that counts rows; an instance's "not read" counts none
+        gathered.counts[0] = _Count("claude transcripts", sessions=True)
+    session = _open_session(gathered, request, files, project, reads_clis(paths))
+    gathered.rows += _taken(gathered, [row for row in claude.rows if window.contains(row.at)], 0)
     if request.github:  # before the plugins, so their enrichers see every row — the live GitHub rows included
         _gather_github(request, config, book, gathered)
-    bill = None if session else _gather_bill(request, paths, config, gathered)
+    bill = _bill_unless_part(request, paths, config, gathered, session)
     _collect_sources(request, paths, config, loaded, gathered)
     gathered.rows = _inherit_scope_by_ref(gathered.rows)
     per_project = False
@@ -332,16 +351,79 @@ def _gather(
     _enrich_rows(request, paths, config, loaded, gathered)
     gathered.rows = _with_billing_rules(gathered.rows, config)
     _select(gathered, session, claude.span)
+    _keep_labelled(gathered, request.where)
     return gathered
 
 
+def _taken(gathered: _Gathered, rows: list[UsageRow], index: int) -> list[UsageRow]:
+    """The rows a sources line takes; in a filtered report each is tagged with that line, to be counted by it later."""
+    return [replace(row, intake=index) for row in rows] if gathered.filtered else rows
+
+
+def _bill_unless_part(
+    request: ReportRequest, paths: Paths, config: Config, gathered: _Gathered, session: str | None
+) -> BillSummary | None:
+    """The GitHub usage report of an account view; a session's or a label filter's report reads none, and says so."""
+    if session:
+        return None
+    if request.where:
+        if config.github.bill is not None:
+            gathered.sources.append(f"GitHub usage report: not read — {FILTERED_ACCOUNT}")
+        return None
+    return _gather_bill(request, paths, config, gathered)
+
+
+def _holds(row: UsageRow, where: Mapping[str, str]) -> bool:
+    """Whether the row's labels hold every pair of the filter, exactly."""
+    return all(row.labels.get(key) == value for key, value in where.items())
+
+
+def _keep_labelled(gathered: _Gathered, where: Mapping[str, str]) -> None:
+    """``where``: the rows whose labels hold every pair, after inheritance, scope, selection and enrichment.
+
+    Every row took part in those steps (an unlabelled row can be the scope donor of a labelled one); the filter comes
+    last; work items and estimates are left out. The real group is the selection's cash only. The sources lines are
+    counted again once the rows are final (``_say_filter``).
+    """
+    if not where:
+        return
+    gathered.rows = [row for row in gathered.rows if _holds(row, where)]
+    gathered.items, gathered.estimates = [], []
+
+
+def _say_filter(gathered: _Gathered, where: Mapping[str, str]) -> None:
+    """A filtered report's sources from its final rows: each line counted from the rows it took, the filter last.
+
+    No line says how many rows the other selections have.
+    """
+    if not where:
+        return
+    lines = []
+    for index, line in enumerate(gathered.sources):
+        if index not in gathered.counts:
+            lines.append(line)  # a line that counts no row stays as it is
+            continue
+        count = gathered.counts[index]
+        text = count.recount(gathered.rows, index) if count else ""
+        lines += [text] if text else []
+    said = ", ".join(f"{key}={value}" for key, value in sorted(where.items()))
+    gathered.sources = [*lines, f"labels {said}: {len(gathered.rows)} row(s) — {FILTERED}"]
+
+
 def _open_session(
-    gathered: _Gathered, request: ReportRequest, files: Sequence[tuple[str, Path]], project: Path | None
+    gathered: _Gathered,
+    request: ReportRequest,
+    files: Sequence[tuple[str, Path]],
+    project: Path | None,
+    expected: bool = True,
 ) -> str | None:
-    """The report's session (``None`` for a period), kept for the plugins; a report without a transcript says so."""
+    """The report's session (``None`` for a period), kept for the plugins; a report without a transcript says so.
+
+    ``expected`` False: the run reads no CLI file (an instance), so no transcript is no news.
+    """
     session = _session_of(request, files, gathered.sources)
     gathered.session = session or ""
-    if not files:
+    if not files and expected:
         gathered.warnings.append(_no_transcript(request, project, session))
     return session
 
@@ -389,17 +471,28 @@ def _priced_groups(
     """The real group (with its billing warnings) and the API group, each only when asked for."""
     rows = gathered.rows
     real = real_group(rows, book, priced, gathered.window) if "real" in request.groups else None
-    gathered.warnings += _billing_warnings(real, rows, config, one_session=gathered.selection is not None)
+    gathered.warnings += billing_warnings(real, rows, config, one_session=gathered.selection is not None)
     api = api_group(rows, book, config) if "api" in request.groups else None  # it prices every row at list
     return real, api
+
+
+INSTANCE_GROUPS = ("real", "api")  # an instance's default groups, both doors: an app reads no vendor invoice
+
+
+def unpriced_rule(request: ReportRequest, paths: Paths) -> str:
+    """The unpriced rule a run follows: what the request says, else its default.
+
+    An instance skips and counts (an operator's screen never fails on a new model); the machine user's report fails.
+    """
+    return request.unpriced or ("skip" if paths.instance is not None else "fail")
 
 
 def _skip_unpriced(
     request: ReportRequest, paths: Paths, config: Config, book: PriceBook, gathered: _Gathered
 ) -> None:
     """``--unpriced skip``: rows without a price leave, counted (``_drop_unpriced``)."""
-    if request.unpriced == "skip":
-        list_priced = "api" in request.groups or bool(request.attribute)
+    if unpriced_rule(request, paths) == "skip":
+        list_priced = "api" in request.groups or bool(request.attribute) or bool(request.by)
         _drop_unpriced(gathered, book, config, paths.user_prices_file(), list_priced=list_priced)
 
 
@@ -432,8 +525,11 @@ def _gather_github(
 
 
 def bill_request(paths: Paths, config: Config, repos: Sequence[str] = ()) -> BillRequest | None:
-    """The configured usage report, read now; ``repos`` (``--github``) are the ones whose Actions lines count."""
-    if config.github.bill is None:
+    """The configured usage report, read now; ``repos`` (``--github``) are the ones whose Actions lines count.
+
+    An instance reads no account source: ``None`` for it whatever its config says.
+    """
+    if config.github.bill is None or paths.instance is not None:
         return None
     return BillRequest(config.github.bill, now(), paths.offline, frozenset(repo.lower() for repo in repos))
 
@@ -456,6 +552,9 @@ def _gather_bill(
     request: ReportRequest, paths: Paths, config: Config, gathered: _Gathered
 ) -> BillSummary | None:
     """The usage report's rows of the window's whole days; its exact summary for the header (ADR-0007)."""
+    if paths.instance is not None and config.github.bill is not None:
+        gathered.sources.append(f"github usage report: not read — {ACCOUNTS_UNREAD}")
+        return None
     reading = bill_request(paths, config, request.github)
     if reading is None:
         return None
@@ -516,6 +615,15 @@ def read_context(paths: Paths, window: Window) -> ReadContext:
 
 def _view_why(request: ReportRequest, paths: Paths) -> str:
     """Why this report compares no provider day ("" when it is an account view)."""
+    if paths.instance is not None:
+        return ACCOUNTS_UNREAD
+    return _part_of_the_account(request, paths)
+
+
+def _part_of_the_account(request: ReportRequest, paths: Paths) -> str:
+    """Why the report holds part of the account's records ("" when it holds them all)."""
+    if request.where:
+        return FILTERED_ACCOUNT
     project, all_projects = _default_project(request, paths)
     if project is not None and not all_projects:
         return "a per-project report holds part of the account"
@@ -674,19 +782,21 @@ def _absorb(gathered: _Gathered, source: Source, collected: Collected) -> None:
         collected.skipped
     )  # every part checked before any is kept
     estimates = _estimates_only(collected.estimates)
-    name = _piece_name(source)  # a nameless source fails here, before anything of it is in the report
+    name = piece_name(source)  # a nameless source fails here, before anything of it is in the report
     writers = sorted(
         {r.source for r in rows if isinstance(r.source, str) and r.source} - {name}
     )  # ADR-0005: the programs a log names
-    gathered.rows += rows
+    gathered.rows += _taken(gathered, rows, len(gathered.sources))  # the index of the line said below
     gathered.items += items
     gathered.estimates += estimates
     merge_skips(gathered.skipped, skips)
     if rows or items:  # the checked lists: a generator behind collected.rows has been consumed by now
         suffix = f" ({', '.join(writers)})" if writers else ""
         suffix += f", {len(items)} work items" if items else ""
+        gathered.counts[len(gathered.sources)] = _Count(name)
         gathered.sources.append(f"{name} ×{len(rows)}{suffix}")
     if estimates:
+        gathered.counts[len(gathered.sources)] = None
         gathered.sources.append(f"{name}: {len(estimates)} estimate(s), in no sum")
 
 
@@ -712,7 +822,7 @@ def _enrich_rows(
             _guarded_enricher(gathered, plugin.name, enricher, ctx)
 
 
-def _role_pieces(plugin: Plugin, role: str) -> tuple[Any, ...]:
+def role_pieces(plugin: Plugin, role: str) -> tuple[Any, ...]:
     """A plugin's sources or enrichers as a tuple; a ``TypeError`` naming the role when it is not a sequence."""
     try:
         return tuple(getattr(plugin, role))
@@ -723,7 +833,7 @@ def _role_pieces(plugin: Plugin, role: str) -> tuple[Any, ...]:
 def _pieces(gathered: _Gathered, plugin: Plugin, role: str) -> tuple[Any, ...]:
     """A plugin's sources or enrichers for the report; one that is not a sequence (``None``) costs the plugin that role only."""
     try:
-        return _role_pieces(plugin, role)
+        return role_pieces(plugin, role)
     except TypeError as exc:
         _plugin_failed(gathered, plugin.name, plugin.name, role, exc)
         return ()
@@ -734,7 +844,7 @@ def _guarded_source(gathered: _Gathered, plugin: str, source: Source, ctx: Conte
     try:
         _absorb(gathered, source, source.collect(ctx))  # a wrong shape fails inside _absorb: guarded as well
     except Exception as exc:
-        _plugin_failed(gathered, plugin, _piece_name(source), "source", exc)
+        _plugin_failed(gathered, plugin, piece_name(source), "source", exc)
 
 
 def _guarded_enricher(gathered: _Gathered, plugin: str, enricher: Enricher, ctx: Context) -> None:
@@ -744,7 +854,7 @@ def _guarded_enricher(gathered: _Gathered, plugin: str, enricher: Enricher, ctx:
             gathered.rows, enricher, ctx
         )  # a copy goes in: a raise leaves the rows as they were
     except Exception as exc:
-        _plugin_failed(gathered, plugin, _piece_name(enricher), "enricher", exc)
+        _plugin_failed(gathered, plugin, piece_name(enricher), "enricher", exc)
 
 
 def _enriched(rows: list[UsageRow], enricher: Enricher, ctx: Context) -> list[UsageRow]:
@@ -752,7 +862,10 @@ def _enriched(rows: list[UsageRow], enricher: Enricher, ctx: Context) -> list[Us
     result = _rows_only(enricher.enrich(list(rows), ctx))
     if len(result) != len(rows):
         raise TypeError(f"enrich() must return one row per input row, got {len(result)} for {len(rows)}")
-    return result
+    # one row per input row, in order: a row the enricher built afresh keeps the sources line that took its input
+    return [
+        new if new.intake == old.intake else replace(new, intake=old.intake) for old, new in zip(rows, result)
+    ]
 
 
 def _estimates_only(result: object) -> list[Estimate]:
@@ -789,10 +902,19 @@ def _rows_only(result: object, what: str = "enrich()") -> list[UsageRow]:
             not isinstance(row.source, str) or not row.source
         ):  # the boundary's promise: every row names its source
             raise TypeError(f"{what} must return rows that name their source, got {row.source!r}")
+        _labels_checked(row, what)
     return rows
 
 
-def _piece_name(piece: object) -> str:
+def _labels_checked(row: UsageRow, what: str) -> None:
+    """A row's labels by the writer's and the reader's one rule; a plugin's other shape fails its own piece."""
+    try:
+        labels_rule(row.labels)
+    except ValueError as exc:
+        raise TypeError(f"{what} must return rows whose labels follow the label rule: {exc}") from exc
+
+
+def piece_name(piece: object) -> str:
     """A source's or enricher's ``name``, or its type when a plugin forgot to give it one."""
     name = getattr(piece, "name", None)
     return name if isinstance(name, str) and name else type(piece).__name__
@@ -864,125 +986,17 @@ def _drop_unpriced(
     gathered.rows = kept
 
 
-def _config_warnings(paths: Paths, config: Config, book: PriceBook) -> list[str]:
-    """The retired keys, then the config: without a user one the package defaults; with one, a plan per plan rule."""
-    return [*_retired(paths, config, book), *_config_state(paths, config, book)]
+def plugins_for(paths: Paths, config: Config) -> Loaded:
+    """The plugins a run loads: an instance's own list and nothing else; otherwise the configured discovery."""
+    if paths.instance is not None:
+        return load_plugins(paths.instance.plugins)
+    return load_configured_plugins(config)
 
 
-def _config_state(paths: Paths, config: Config, book: PriceBook) -> list[str]:
-    if paths.user_config_file().exists():
-        on_plan = sorted(name for name, rule in config.billing_rules.items() if rule == "subscription")
-        return [
-            f"providers.{name}.billing = subscription but no subscription covers {name}: those plan rows cost "
-            f"nothing here — add the plan to {paths.user_config_file()}"
-            for name in on_plan
-            if not paid_for(name, config, book)
-        ]
-    if not config.subscriptions:
-        return [
-            "no user config — no subscriptions configured (the package ships none); run `ai-cost install --init-config` and add yours"
-        ]
-    plans = ", ".join(s.plan for s in config.subscriptions)
-    return [f"no user config — subscriptions are the defaults ({plans}); run `ai-cost install --init-config`"]
-
-
-def _retired(paths: Paths, config: Config, book: PriceBook) -> list[str]:
-    """The keys the user's files still set that 2.6 no longer reads: a Copilot review has no price (ADR-0007)."""
-    said = [
-        f"{key} is no longer read (a Copilot review has no price since 2.6): {BILL_HINT}"
-        for key in config.github.retired
-    ]
-    return said + [
-        f"{key} in {paths.user_prices_file()} is no longer read (a Copilot review has no price since 2.6) — remove it"
-        for key in book.retired
-    ]
-
-
-def _billing_warnings(
-    real: RealGroup | None, rows: Sequence[UsageRow], config: Config, one_session: bool = False
-) -> list[str]:
-    """Copilot counts without a usage report, and rows of unknown billing (priced by the API group only).
-
-    Those of clients outside scope are said as such; the rest are counted per provider with the rule to set.
-    """
-    counted = _copilot_counted(rows, config, one_session) + _plans_beside_seats(real)
-    if real is None or not real.unknown_billing:
-        return counted
-    return counted + _outside_warning(outside_scope(rows, config)) + _unknown_warning(real, rows, config)
-
-
-def _plans_beside_seats(real: RealGroup | None) -> list[str]:
-    """A configured GitHub plan still booked while the usage report states seats: said, the user decides."""
-    shares = real.subscriptions if real is not None else ()
-    seats = sorted({s.plan for s in shares if s.attribution == INVOICE_ATTRIBUTION})
-    kept = sorted(
-        s.plan for s in shares if s.provider == "github" and s.attribution != INVOICE_ATTRIBUTION and s.usd
-    )
-    if not seats or not kept:
-        return []
-    return [
-        f"subscription {', '.join(kept)} stays booked beside the seats the GitHub usage report bills "
-        f"({', '.join(seats)}) — remove it from subscriptions if those seats replaced it"
-    ]
-
-
-def _copilot_counted(rows: Sequence[UsageRow], config: Config, one_session: bool = False) -> list[str]:
-    """Copilot reviews without a usage report: counted, never priced — said, so a total is never read as complete.
-
-    A session report reads no usage report (it bills per repository and day, not per session): its reviews are said too.
-    """
-    reviews = sum(row.tokens.reviews for row in rows if row.kind is RowKind.COPILOT)
-    if not reviews or (config.github.bill is not None and not one_session):
-        return []
-    if one_session:
-        return [
-            f"{reviews} Copilot review(s) counted, not priced: the GitHub usage report bills a repository's day, "
-            "not a session — its amount is in `report --since/--until` for those days"
-        ]
-    return [f"{reviews} Copilot review(s) counted, not priced (a review has no price) — {BILL_HINT}"]
-
-
-def _outside_warning(clients: Mapping[str, int]) -> list[str]:
-    if not clients:
-        return []
-    return [
-        f"{sum(clients.values())} usage row(s) from clients outside scope ({', '.join(sorted(clients))}) have "
-        "unknown billing and stay out of the real group on purpose (outside_scope_clients); the API-only group "
-        "still prices their tokens"
-    ]
-
-
-def _unknown_warning(real: RealGroup, rows: Sequence[UsageRow], config: Config) -> list[str]:
-    """The unknown rows a rule or a plugin could place, per provider, and the ledger rows without a figure."""
-    outside = {use.provider: use.outside for use in provider_use(rows, config.outside_scope_clients)}
-    left = {name: n - outside.get(name, 0) for name, n in sorted(real.unknown_by_provider.items())}
-    left = {name: n for name, n in left.items() if n}
-    unfigured = real.unfigured_ledger
-    if not left and not unfigured:
-        return []
-    counts = [f"{name} {n}" for name, n in left.items()]
-    counts += [f"{unfigured} ledger row(s) without a figure, counted nowhere else"] if unfigured else []
-    rules = "; ".join(f"providers.{name}.billing — {billing_hint(name)}" for name in left)
-    fix = f"set {rules}; or add" if left else "add"
-    return [
-        f"{sum(left.values()) + unfigured} usage row(s) with unknown billing are left out of the real group "
-        f"({', '.join(counts)}; the API group prices the ones with tokens) — {fix} a plugin that knows how those "
-        f"sessions were paid{_booked_by_report(left, rows)}"
-    ]
-
-
-def _booked_by_report(left: Mapping[str, int], rows: Sequence[UsageRow]) -> str:
-    """The providers whose compared days put the charge of those rows into an untracked row: said, never hidden."""
-    booked = sorted({row.provider.value for row in rows if row.kind is RowKind.UNTRACKED} & set(left))
-    if not booked:
-        return ""
-    return f"; on the days a provider report compared ({', '.join(booked)}), their charge is in its untracked row"
-
-
-def _configured_or_warned(config: Config) -> Loaded:
-    """The configured plugins; a loader that fails (a broken bundle marker) is one header warning, not an abort."""
+def _configured_or_warned(paths: Paths, config: Config) -> Loaded:
+    """The run's plugins; a loader that fails (a broken bundle marker) is one header warning, not an abort."""
     try:
-        return load_configured_plugins(config)
+        return plugins_for(paths, config)
     except ToolError as exc:
         return Loaded(warnings=[f"plugins: {exc}"])
 
@@ -995,17 +1009,20 @@ def build_report(
     ``loaded`` is the plugin set to run (tests pass one); by default the configured plugins are loaded here.
     """
     rules = parse_rules(request.attribute)
+    _checked(request, rules, paths)
     if loaded is None:
-        loaded = _configured_or_warned(config)
+        loaded = _configured_or_warned(paths, config)
     gathered = _gather(request, paths, config, loaded, book)
     gathered.warnings += loaded.warnings
     compared = _compare_providers(request, paths, config, book, gathered)
     _skip_unpriced(request, paths, config, book, gathered)
     _say_selection(gathered)
-    gathered.warnings += _config_warnings(paths, config, book)
+    _say_filter(gathered, request.where)
+    gathered.warnings += config_warnings(paths, config, book)
     items = _vendor_items(request, gathered, config)
     window, rows = gathered.window, gathered.rows
-    priced = without_shares(config) if gathered.selection else config  # a session is not a period
+    # a session is not a period, a label filter not the installation: neither carries a plan share
+    priced = without_shares(config) if gathered.selection or request.where else config
     real, api = _priced_groups(request, gathered, book, config, priced)
     estimates = _scoped_estimates(gathered)
     return Report(
@@ -1019,15 +1036,66 @@ def build_report(
         prices_checked_at=book.checked_at.isoformat(),
         rows=rows,
         real=real,
-        attribution=attribution_group(rows, rules, book, priced, window) if rules else None,
+        attribution=_attribution(request, rows, rules, book, priced, window),
         github_bill=gathered.bill,
         provider_reports=compared,
         selection=gathered.selection,
+        where=dict(request.where),
         estimates=estimates,
         api=api,
         models=model_lines(rows, api, book, priced) if api else (),
         vendor=vendor_group(items, config, request.vendor_profile) if _vendor_asked(request, items) else None,
     )
+
+
+def _attribution(
+    request: ReportRequest,
+    rows: Sequence[UsageRow],
+    rules: Sequence[Rule],
+    book: PriceBook,
+    config: Config,
+    window: Window,
+) -> AttributionGroup | None:
+    """The attribution group: by the ``--attribute`` rules, or by the app's label ``by``; never both."""
+    if request.by:
+        return label_group(rows, request.by, book, config, window)
+    return attribution_group(rows, rules, book, config, window) if rules else None
+
+
+def _checked(request: ReportRequest, rules: Sequence[Rule], paths: Paths) -> None:
+    """The label options by the writer's rule, and the combinations a report refuses (one line each).
+
+    ``--by`` with ``--attribute`` would build one group twice; ``--where`` selects usage rows, so it reads no live
+    GitHub count (``--github``) and quotes no hand-sized scope (``--items``) — neither belongs to a selection; and
+    ``--github`` reads the machine user's GitHub account over the network: never on an instance.
+    """
+    if paths.instance is not None:
+        _instance_checked(request, paths.instance)
+    for name, value in request.where.items():
+        checked_label("--where", name, value)
+    if request.by:
+        checked_label("--by", request.by)
+    if request.by and rules:
+        raise UsageError("--by and --attribute both build the attribution group: give one")
+    for flag, given in (("--github", request.github), ("--items", request.items)):
+        if request.where and given:
+            raise UsageError(
+                f"--where with {flag}: a label filter selects usage rows, {flag} is not one of them"
+            )
+
+
+def _instance_checked(request: ReportRequest, instance: Instance) -> None:
+    """What an instance refuses: the machine's GitHub account, a transcript it does not read, a zone-less time."""
+    if request.session and not instance.read_clis:  # a session names a coding-CLI transcript, a path included
+        raise UsageError(
+            "--session reads a coding-CLI transcript: an instance reads one only with --read-clis (Instance.read_clis)"
+        )
+    if request.github:
+        raise UsageError(
+            f"--github reads this machine's GitHub account: not on an instance ({ACCOUNTS_UNREAD})"
+        )
+    zoned(request.since, "--since")
+    zoned(request.until, "--until")
 
 
 def _vendor_asked(request: ReportRequest, items: Sequence[WorkItem]) -> bool:
@@ -1044,669 +1112,6 @@ def _scoped_estimates(gathered: _Gathered) -> Estimates | None:
     estimates = scoped(gathered.estimates, session, gathered.project)
     gathered.warnings += left_out_warnings(estimates, gathered.project)
     return estimates
-
-
-# ---- doctor -----------------------------------------------------------------------------------------------------
-
-
-Line = Callable[[bool, str], None]
-
-
-def _doctor_window(paths: Paths, config: Config, book: PriceBook, line: Line) -> Report | None:
-    """The last 24 h, collected once: the skipped records and the setup lines read the same rows."""
-    try:
-        return build_report(ReportRequest(all_projects=True, hours=24.0, groups=()), paths, config, book)
-    except ToolError as exc:
-        line(False, f"collection over the last 24 h failed: {exc}")
-        return None
-
-
-def _doctor_skipped(report: Report, line: Line) -> None:
-    """What the collectors could not use in the last 24 h, per source (the counted records of Invariant #14d)."""
-    by_source = Counter(item.source for item in report.skipped)
-    detail = ", ".join(f"{name} {count}" for name, count in sorted(by_source.items())) or "none"
-    line(
-        True,
-        f"skipped records in the last 24 h: {sum(by_source.values())} ({detail}) — `report --detail` lists them",
-    )
-
-
-def _render(checks: Iterable[Check], line: Line, emit: Emit) -> None:
-    """A verdict goes through ``line`` (a problem counts); information is printed and never counted."""
-    for check in checks:
-        if check.mark is Mark.INFO:
-            emit(f"  --  {check.text}")
-        else:
-            line(check.mark is Mark.OK, check.text)
-
-
-def doctor(paths: Paths, config: Config, book: PriceBook, emit: Emit) -> int:
-    """Sources, config, price freshness, schedule; exit 1 on any problem."""
-    problems = 0
-
-    def line(good: bool, text: str) -> None:
-        nonlocal problems
-        emit(("  ok  " if good else "  !!  ") + text)
-        problems += 0 if good else 1
-
-    emit(f"ai-cost {__version__} doctor")
-    _doctor_sources(paths, config, book, line, emit)
-    _doctor_prices(book, line)
-    _doctor_state(paths, line, emit, config.github.bill is not None, book)
-    emit(f"doctor: {'all good' if problems == 0 else f'{problems} issue(s)'}")
-    return 0 if problems == 0 else 1
-
-
-def _doctor_sources(paths: Paths, config: Config, book: PriceBook, line: Line, emit: Emit) -> None:
-    """Python, the files of every source, the window's skipped records, the setup lines, plugins, user files."""
-    line(sys.version_info >= (3, 9), f"python {sys.version.split()[0]}")
-    found = source_files(paths)
-    report = _doctor_window(paths, config, book, line)
-    rows = list(report.rows) if report else []
-    _render(source_checks(found, log_files(paths, config), len(rows) if report else None), line, emit)
-    if report is not None:
-        _doctor_skipped(report, line)
-    _render(setup_checks(found, config, book, rows), line, emit)
-    request = bill_request(paths, config)
-    probe = probe_bill(request) if request is not None else None
-    uses = provider_use(rows, config.outside_scope_clients)
-    _render(github_checks(config, uses, probe), line, emit)
-    week = Window(now() - timedelta(days=REPORT_CHECK_DAYS), now())
-    reports = read_reports(config.provider_reports, read_context(paths, week))
-    _render(provider_report_checks(config, reports, uses, now()), line, emit)
-    _doctor_plugins(paths, config, line, emit)
-    user_config = paths.user_config_file()
-    emit(
-        ("  ok  " if user_config.exists() else "  --  ")
-        + f"user config {user_config} "
-        + (
-            "present"
-            if user_config.exists()
-            else "absent → defaults (ai-cost install --init-config writes it)"
-        )
-    )
-    user_prices = paths.user_prices_file()
-    emit(
-        ("  ok  " if user_prices.exists() else "  --  ")
-        + f"user prices {user_prices} {'present' if user_prices.exists() else 'absent → built-in registry'}"
-    )
-
-
-def _doctor_plugins(paths: Paths, config: Config, line: Line, emit: Emit) -> None:
-    """One line per loaded plugin (its sources), its own doctor lines, and every module that failed to load."""
-    try:
-        loaded = load_configured_plugins(config)
-    except ToolError as exc:  # a broken bundle marker: one red line, the rest of the doctor still runs
-        line(False, f"plugins: {exc}")
-        return
-    for warning in loaded.warnings:
-        line(False, warning)
-    if not loaded.plugins:
-        emit("  --  plugins: none (built-in sources only)")
-    end = now()
-    window = Window(end - timedelta(hours=config.window_default_hours), end)
-    for plugin in loaded.plugins:
-        try:
-            names = (
-                ", ".join(_piece_name(source) for source in _role_pieces(plugin, "sources")) or "no sources"
-            )
-        except TypeError as exc:  # sources=None: diagnosed, the other plugins still listed
-            line(False, f"plugin {plugin.name}: {exc}")
-            continue
-        line(True, f"plugin {plugin.name}: {names}")
-        if plugin.doctor is not None:
-            settings = config.plugin_settings.get(plugin.name, {})
-            try:
-                plugin.doctor(Context(paths, config, window, ReportRequest(), settings), line)
-            except Exception as exc:
-                line(False, f"plugin {plugin.name}: doctor failed ({exc.__class__.__name__}: {exc})")
-
-
-def _doctor_prices(book: PriceBook, line: Line) -> None:
-    age = (now().date() - book.checked_at).days
-    if book.auto_check_days > 0:
-        line(
-            age <= book.auto_check_days * 3,
-            f"prices checked_at {book.checked_at} ({age} days ago; auto-check every {book.auto_check_days} days)",
-        )
-    else:
-        line(
-            True,
-            f"prices checked_at {book.checked_at} ({age} days ago; the drift check is off: auto_check_days 0)",
-        )
-    today = now().date()
-    for provider, table in book.models.items():
-        for model, entry in table.items():
-            until = getattr(entry, "valid_until", None)
-            if until:
-                line(
-                    until >= today,
-                    f"{provider.value}/{model} price valid until {until}"
-                    + (
-                        ""
-                        if until >= today
-                        else " — expired: "
-                        + (
-                            "the next block applies"
-                            if getattr(entry, "next", None)
-                            else "NO next block, update prices.json"
-                        )
-                    ),
-                )
-
-
-def _doctor_state(
-    paths: Paths, line: Line, emit: Emit, bill: bool = False, book: PriceBook | None = None
-) -> None:
-    """The last price check, the state directory, the tools and the scheduled jobs."""
-    last = load_result(paths)
-    emit(
-        ("  ok  " if last else "  --  ")
-        + f"last price check: {last.checked_at if last else 'never'} ({state_file(paths)})"
-    )
-    for provider, model, rates in _unchecked_rates(last):
-        emit(
-            f"  --  {provider}/{model}: listed apart from its row on the vendor page — confirm by hand: {rates}"
-        )
-    for provider, model in _unlisted(last, book):
-        emit(
-            f"  --  {provider}/{model}: on the vendor's page, not in the price book — add its row, or name it under the provider's no_row"
-        )
-    state = paths.state_dir
-    if _writable(state):
-        line(
-            True, f"state dir {state} writable" + ("" if state.exists() else " (created on the first write)")
-        )
-    else:
-        line(False, f"state dir {state} is not writable — AI_COST_STATE_DIR, or fix the permissions")
-    _doctor_tools(emit)
-    _doctor_reports(paths, line, emit, bill)
-
-
-def _unlisted(last: CheckResult | None, book: PriceBook | None) -> list[tuple[str, str]]:
-    """The models the last price check found on a vendor's page without a row — less those priced since."""
-    if last is None:
-        return []
-    priced = (
-        {provider.value: provider for provider in book.models} if book else {}
-    )  # a state file may name any id
-
-    def has_row(provider: str, model: str) -> bool:
-        return (
-            book is not None and provider in priced and book.entry(priced[provider], model, None) is not None
-        )
-
-    return [
-        (provider, model)
-        for provider, prov in last.providers.items()
-        for model in prov.unlisted
-        if not has_row(provider, model)
-    ]
-
-
-def _unchecked_rates(last: CheckResult | None) -> list[tuple[str, str, str]]:
-    """The rates the last price check found listed apart from a model's row (its --quiet run prints none)."""
-    if last is None:
-        return []
-    return [
-        (provider, model, ", ".join(check.unchecked))
-        for provider, prov in last.providers.items()
-        for model, check in prov.models.items()
-        if check.unchecked
-    ]
-
-
-def _doctor_tools(emit: Emit) -> None:
-    """Informational only: neither tool is required, so nothing here counts as a problem."""
-    has_gh = shutil.which("gh") is not None
-    emit(
-        ("  ok  " if has_gh else "  --  ")
-        + f"gh {'present' if has_gh else 'absent'} (needed only for --github and providers.github.bill)"
-    )
-    emit(
-        ("  ok  " if schedule_installed() else "  --  ")
-        + f"scheduled price check: {'installed' if schedule_installed() else 'not installed (ai-cost install --schedule 3)'}"
-    )
-
-
-def _doctor_daily_job(line: Line, emit: Emit, bill: bool) -> None:
-    """The daily-report job: absent is information; one installed before 2.6 cannot find gh for the usage report."""
-    installed = schedule_installed(DAILY_JOB)
-    if installed and bill and not job_has_path(DAILY_JOB):
-        line(
-            False,
-            "scheduled daily reports: installed without a PATH — the job cannot find gh to read the "
-            "GitHub usage report; run ai-cost install --schedule-reports again",
-        )
-        return
-    emit(
-        ("  ok  " if installed else "  --  ")
-        + "scheduled daily reports: "
-        + ("installed" if installed else "not installed (ai-cost install --schedule-reports)")
-    )
-
-
-def _doctor_reports(paths: Paths, line: Line, emit: Emit, bill: bool = False) -> None:
-    """The daily-report job and what it last wrote, the last reconciliation: absent is informational, torn is red."""
-    from .daily import newest_index_file, read_index  # both modules build on this one: imported here only
-    from .reconcile import last_reconciliation
-
-    _doctor_daily_job(line, emit, bill)
-    index = newest_index_file(paths.reports_dir)
-    if index is None:
-        emit(f"  --  daily reports: none yet in {paths.reports_dir} (ai-cost daily)")
-    else:
-        try:
-            last = read_index(index)
-            failed = f", {len(last.failures)} project(s) FAILED — see its index.json" if last.failures else ""
-            line(
-                not last.failures,
-                f"daily reports: last {last.day} ({len(last.projects)} project(s){failed}) in {paths.reports_dir}",
-            )
-        except ToolError as exc:
-            line(False, f"daily reports: {exc}")
-    try:
-        check = last_reconciliation(paths)
-    except ToolError as exc:
-        line(False, f"last reconcile: {exc}")
-        return
-    if check is None:
-        emit("  --  last reconcile: never (ai-cost reconcile --provider <id> --usd <console figure>)")
-    else:
-        verdict = "within tolerance" if check.within_tolerance else "ABOVE TOLERANCE"
-        line(
-            check.within_tolerance,
-            f"last reconcile: {check.provider} {check.window[0]} → {check.window[1]}: {verdict}",
-        )
-
-
-def _writable(path: Path) -> bool:
-    """A directory that can be written, or created: its nearest existing ancestor is a writable directory."""
-    probe = path
-    while not probe.exists() and probe != probe.parent:
-        if probe.is_symlink():  # a dangling link: the first write would fail on it, not create a directory
-            return False
-        probe = probe.parent
-    return probe.is_dir() and os.access(probe, os.W_OK)
-
-
-# ---- monitor ----------------------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class MonitorEntry:
-    """One history line; ``outside`` names the amounts the totals leave out (GitHub and provider days, unread spans)."""
-
-    ts: str
-    window: tuple[str, str]
-    hours: float
-    real_usd: float
-    cash_usd: float
-    api_usd: float
-    by_provider_api_usd: dict[str, float]
-    outside: tuple[str, ...] = ()
-
-
-def bill_outside(bill: BillSummary | None) -> tuple[str, ...]:
-    """The GitHub amounts a window's totals leave out, exact: the days it only touches and the months not read."""
-    if bill is None:
-        return ()
-    days = tuple(
-        f"github {day.day.isoformat()} ({day.why}): net {day.net:f} USD, gross {day.gross:f}"
-        for day in bill.outside
-    )
-    return days + tuple(f"github {month}" for month in bill.missing)
-
-
-def month_to_date(paths: Paths, config: Config, book: PriceBook, at: datetime) -> float:
-    """API-equivalent cost from the first of ``at``'s month to ``at``.
-
-    One report over the month, so overlapping monitor windows never double count.
-    """
-    start = at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if at == start:  # the month has just begun: nothing to sum, and no empty window to refuse
-        return 0.0
-    request = ReportRequest(all_projects=True, since=iso(start), until=iso(at), groups=("api",))
-    report = build_report(request, paths, config, book)
-    return report.api.total_usd if report.api else 0.0
-
-
-def _breaches(config: Config, entry: MonitorEntry, month_total: float, scale: float) -> list[str]:
-    """Every budget the window exceeds; ``scale`` = exact window hours / 24 (the entry's hours are rounded)."""
-    by_provider = entry.by_provider_api_usd
-    found = []
-    if config.budgets.monthly_usd and month_total > config.budgets.monthly_usd:
-        found.append(
-            f"api-equivalent month-to-date {month_total:.2f} > monthly budget {config.budgets.monthly_usd:.2f}"
-        )
-    if config.budgets.daily_usd and entry.api_usd > config.budgets.daily_usd * scale:
-        found.append(
-            f"api-equivalent {entry.api_usd:.2f} > daily budget {config.budgets.daily_usd:.2f} × {scale:.2f} days"
-        )
-    for provider, limit in config.budgets.per_provider_daily_usd.items():
-        spent = by_provider.get(provider, 0.0)
-        if spent > limit * scale:
-            found.append(f"{provider} {spent:.2f} > {limit * scale:.2f}")
-    return found
-
-
-def _monitor_entry(report: Report) -> MonitorEntry:
-    assert report.real is not None and report.api is not None
-    by_provider: dict[str, float] = {}
-    for line in report.api.lines:
-        by_provider[line.provider.value] = by_provider.get(line.provider.value, 0.0) + line.usd
-    return MonitorEntry(
-        ts=report.generated_at,
-        window=report.window_iso,
-        hours=round(report.window.hours(), 2),
-        real_usd=round(report.real.total_usd, 4),
-        cash_usd=round(report.real.cash_usd, 4),
-        api_usd=round(report.api.total_usd, 4),
-        by_provider_api_usd={k: round(v, 4) for k, v in by_provider.items()},
-        outside=bill_outside(report.github_bill) + provider_outside(report.provider_reports),
-    )
-
-
-def _append_history(path: Path, entry: Any) -> None:
-    """One JSON line per monitor run; a state directory that cannot be written is a ``ToolError``, not a traceback."""
-    append_json_line(path, entry.__dict__)
-
-
-def append_json_line(path: Path, data: Mapping[str, Any]) -> None:
-    """One JSON object per line, appended; a path that cannot be written is a ``ToolError``, never a traceback."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            handle.write(json.dumps(data) + "\n")
-    except OSError as exc:
-        raise ToolError(f"cannot write {path}: {exc}") from exc
-
-
-def monitor(
-    request: ReportRequest,
-    paths: Paths,
-    config: Config,
-    book: PriceBook,
-    append: bool,
-    emit: Emit,
-) -> int:
-    """Rolling-window totals → history; exit 3 when a budget is breached."""
-    report = build_report(request, paths, config, book)
-    entry = _monitor_entry(report)
-    if append:
-        _append_history(paths.state_dir / "history.jsonl", entry)
-    month_end = parse_cli_ts(request.until, "--until") or now()  # the month of the window's end
-    month_total = month_to_date(paths, config, book, month_end) if config.budgets.monthly_usd else 0.0
-    hours = report.window.hours()
-    breaches = _breaches(config, entry, month_total, hours / 24.0 if hours else 1.0)
-    emit(json.dumps(entry.__dict__))
-    for breach in breaches:
-        emit("BUDGET BREACH: " + breach)
-    return 3 if breaches else 0
-
-
-def history(paths: Paths, count: int, emit: Emit) -> int:
-    """The last ``count`` history lines."""
-    path = paths.state_dir / "history.jsonl"
-    if not path.exists():
-        emit(f"no history yet ({path})")
-        return 0
-    entries = path.read_text().splitlines()
-    for line in entries[-count:] if count > 0 else []:
-        emit(line)
-    return 0
-
-
-# ---- install / schedule -----------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Job:
-    """One scheduled command of this program: launchd label ``ai-cost.<label>``, cron tag ``# ai-cost:<label>``."""
-
-    label: str
-    argv_tail: tuple[str, ...]  # after the command that starts this program
-    log_name: str  # its log file, under the state directory
-
-
-@dataclass(frozen=True)
-class Cadence:
-    """When a job runs: every ``days`` days, or (``days`` 0) every day at ``hour``:``minute`` local time."""
-
-    days: int = 0
-    hour: int = 6
-    minute: int = 17
-
-
-PRICES_JOB = Job("prices-check", ("prices", "check", "--quiet"), "prices-check.log")
-DAILY_JOB = Job("daily-report", ("daily",), "daily-report.log")
-DAILY_CADENCE = Cadence(hour=6, minute=40)
-
-
-def plist_path(job: Job = PRICES_JOB) -> Path:
-    """MacOS launchd agent file."""
-    return Path.home() / "Library" / "LaunchAgents" / f"ai-cost.{job.label}.plist"
-
-
-def plist_paths(job: Job = PRICES_JOB) -> list[Path]:
-    """The agent file plus any earlier label of the same job (``<prefix>.ai-cost.<label>.plist``) still on disk."""
-    current = plist_path(job)
-    earlier = sorted(p for p in current.parent.glob(f"*.ai-cost.{job.label}.plist") if p != current)
-    return [current, *earlier]
-
-
-def is_macos() -> bool:
-    """A runtime check (a ``sys.platform`` literal would let the type checker prune the other branch)."""
-    return platform.system() == "Darwin"
-
-
-CRON_TAG = "# ai-cost:prices-check"  # the price check's tag (``cron_tag(PRICES_JOB)``), kept by name
-_LEGACY_CRON = re.compile(
-    r"ai[-_]cost['\"]?\s+prices\s+check"
-)  # price-check lines written before the tag, quoted paths included
-
-
-def cron_tag(job: Job) -> str:
-    """The comment that marks a job's crontab line whatever the command looks like."""
-    return f"# ai-cost:{job.label}"
-
-
-def _is_our_cron_line(line: str, job: Job) -> bool:
-    legacy = job is PRICES_JOB and _LEGACY_CRON.search(line) is not None
-    return cron_tag(job) in line or legacy
-
-
-def cron_has_entry(crontab: str, job: Job = PRICES_JOB) -> bool:
-    """Whether a crontab text carries the job (tagged, or a pre-tag price-check line)."""
-    return any(_is_our_cron_line(line, job) for line in crontab.splitlines())
-
-
-def cron_without_entry(crontab: str, job: Job = PRICES_JOB) -> list[str]:
-    """The crontab lines minus the job's (tagged or legacy)."""
-    return [line for line in crontab.splitlines() if not _is_our_cron_line(line, job)]
-
-
-def _cron_when(cadence: Cadence) -> str:
-    """The five cron fields: every N days at 06:17, or every day at the given time."""
-    if cadence.days:
-        return f"17 6 */{cadence.days} * *"
-    return f"{cadence.minute} {cadence.hour} * * *"
-
-
-def cron_line(days: int, argv: Sequence[str], log: Path) -> str:
-    """The price check's crontab line: every ``days`` days at 06:17, quoted for the shell, tagged."""
-    return job_cron_line(PRICES_JOB, Cadence(days=days), argv, log)
-
-
-def job_cron_line(job: Job, cadence: Cadence, argv: Sequence[str], log: Path, search_path: str = "") -> str:
-    """A job's crontab line, quoted for the shell and tagged so it can be found and removed.
-
-    ``search_path`` is the PATH of the shell that installed it: cron's own finds neither ``gh`` nor a Homebrew tool.
-    """
-    command = shlex.join(list(argv))
-    env = f"PATH={shlex.quote(search_path)} " if search_path else ""
-    return f"{_cron_when(cadence)} {env}{command} >> {shlex.quote(str(log))} 2>&1 {cron_tag(job)}"
-
-
-def _crontab_write(text: str) -> bool:
-    try:
-        return (
-            subprocess.run(
-                ["crontab", "-"], input=text, text=True, capture_output=True, check=False
-            ).returncode
-            == 0
-        )
-    except OSError:
-        return False
-
-
-def _crontab() -> str:
-    try:
-        return subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False).stdout
-    except OSError:
-        return ""
-
-
-def schedule_installed(job: Job = PRICES_JOB) -> bool:
-    """Whether the job is registered (launchd or cron)."""
-    if is_macos():
-        return any(p.exists() for p in plist_paths(job))
-    return cron_has_entry(_crontab(), job)
-
-
-def job_has_path(job: Job) -> bool:
-    """Whether the registered job carries a PATH of its own (installed by 2.6 or later)."""
-    if is_macos():
-        try:
-            return "<key>PATH</key>" in plist_path(job).read_text()
-        except OSError:
-            return False
-    return any(" PATH=" in line for line in _crontab().splitlines() if _is_our_cron_line(line, job))
-
-
-def describe_cadence(cadence: Cadence) -> str:
-    """``every 3 day(s)`` or ``daily at 06:40``."""
-    if cadence.days:
-        return f"every {cadence.days} day(s)"
-    return f"daily at {cadence.hour:02d}:{cadence.minute:02d}"
-
-
-def _launchd_when(cadence: Cadence) -> str:
-    if cadence.days:
-        return f"<key>StartInterval</key><integer>{cadence.days * 86400}</integer>"
-    return (
-        "<key>StartCalendarInterval</key><dict>"
-        f"<key>Hour</key><integer>{cadence.hour}</integer><key>Minute</key><integer>{cadence.minute}</integer>"
-        "</dict>"
-    )
-
-
-def _plist(job: Job, cadence: Cadence, argv: Sequence[str], log: Path, search_path: str = "") -> str:
-    """The launchd agent; ``search_path`` (the installing shell's PATH) replaces launchd's bare /usr/bin:/bin one."""
-    program = "".join(f"<string>{html.escape(arg)}</string>" for arg in argv)
-    out = html.escape(str(log))
-    env = (
-        f"  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{html.escape(search_path)}</string></dict>\n"
-        if search_path
-        else ""
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0"><dict>\n'
-        f"  <key>Label</key><string>ai-cost.{job.label}</string>\n"
-        f"  <key>ProgramArguments</key><array>{program}</array>\n"
-        f"{env}"
-        f"  {_launchd_when(cadence)}\n"
-        f"  <key>StandardOutPath</key><string>{out}</string><key>StandardErrorPath</key><string>{out}</string>\n"
-        "  <key>RunAtLoad</key><false/>\n"
-        "</dict></plist>\n"
-    )
-
-
-def install_schedule(paths: Paths, days: int, command: Sequence[str], emit: Emit) -> int:
-    """Register the periodic price check (launchd on macOS, cron elsewhere); ``command`` starts this program."""
-    return install_job(paths, PRICES_JOB, Cadence(days=days), command, emit)
-
-
-def install_job(paths: Paths, job: Job, cadence: Cadence, command: Sequence[str], emit: Emit) -> int:
-    """Register one job (launchd on macOS, cron elsewhere); ``command`` starts this program."""
-    ensure_dir(paths.state_dir, "state directory")
-    log = paths.state_dir / job.log_name
-    argv = [*command, *job.argv_tail]
-    search_path = os.environ.get("PATH", "")  # the job finds what this shell finds (gh for the usage report)
-    if is_macos():
-        return _install_agent(
-            _plist(job, cadence, argv, log, search_path), describe_cadence(cadence), emit, job
-        )
-    lines = [*cron_without_entry(_crontab(), job), job_cron_line(job, cadence, argv, log, search_path)]
-    if not _crontab_write("\n".join(lines) + "\n"):
-        emit("crontab write failed — is crontab installed and allowed for this user?")
-        return 1
-    emit(f"cron entry installed ({describe_cadence(cadence)})")
-    return 0
-
-
-def ensure_dir(path: Path, what: str) -> None:
-    """Create ``path`` with its parents; a file in the way or a permission is a ToolError, never a traceback."""
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ToolError(f"cannot create the {what} {path}: {exc}") from exc
-
-
-def _install_agent(plist: str, when: str, emit: Emit, job: Job = PRICES_JOB) -> int:
-    """Write the launchd agent, retire every earlier label, load it: 0 only when it loads AND every earlier label is gone."""
-    target = plist_path(job)
-    ensure_dir(target.parent, "LaunchAgents directory")
-    try:
-        target.write_text(plist)
-    except OSError as exc:
-        raise ToolError(f"cannot write the launchd agent {target}: {exc}") from exc
-    retired = [_remove_plist(path, emit) for path in plist_paths(job) if path != target]
-    subprocess.run(["launchctl", "unload", str(target)], capture_output=True, check=False)
-    result = subprocess.run(["launchctl", "load", str(target)], capture_output=True, text=True, check=False)
-    state = "loaded" if result.returncode == 0 else f"written (load failed: {result.stderr.strip()})"
-    emit(f"launchd agent {state} {when}: {target}")
-    return 0 if result.returncode == 0 and False not in retired else 1  # a label that stayed is said above
-
-
-def _remove_plist(path: Path, emit: Emit) -> bool | None:
-    """Unload and delete one agent file: ``None`` when there was none, ``False`` when it could not be removed."""
-    subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
-    if not path.exists():
-        return None
-    try:
-        path.unlink()
-    except OSError as exc:  # a directory in its place, a permission: said, never a traceback
-        emit(f"cannot remove {path}: {exc}")
-        return False
-    emit(f"removed {path}")
-    return True
-
-
-def remove_schedule(emit: Emit) -> int:
-    """Unregister the periodic price check."""
-    return remove_job(PRICES_JOB, emit)
-
-
-def remove_job(job: Job, emit: Emit) -> int:
-    """Unregister one job; every label it ever had goes, none keeps running."""
-    if is_macos():
-        outcomes = [_remove_plist(path, emit) for path in plist_paths(job)]
-        if not any(outcome is not None for outcome in outcomes):
-            emit("not installed")
-        return 1 if False in outcomes else 0
-    crontab = _crontab()
-    if not cron_has_entry(crontab, job):
-        emit("not installed")
-        return 0
-    kept = "\n".join(cron_without_entry(crontab, job)) + "\n"
-    if not _crontab_write(kept):
-        emit("crontab write failed — is crontab installed and allowed for this user?")
-        return 1
-    emit("cron entry removed")
-    return 0
 
 
 def init_config(paths: Paths, force: bool, emit: Emit) -> int:
@@ -1728,6 +1133,37 @@ def init_config(paths: Paths, force: bool, emit: Emit) -> int:
     for text in init_config_lines(target, written=True):
         emit(text)
     return 0
+
+
+# what an installation's operators set most: their plans and their budgets
+INSTANCE_CONFIG: Mapping[str, Any] = {
+    "subscriptions": [],
+    "budgets": {"daily_usd": 0, "monthly_usd": 0, "per_provider_daily_usd": {}},
+}
+
+
+def init_instance(instance: Instance, emit: Emit) -> int:
+    """The instance's directory, its usage segments directory and a starting config; what exists is kept as it is."""
+    try:
+        instance.usage_dir.mkdir(parents=True, exist_ok=True)
+        instance.state_dir.mkdir(parents=True, exist_ok=True)
+        written = _create(instance.config_file, json.dumps(INSTANCE_CONFIG, indent=2) + "\n")
+    except OSError as exc:
+        raise ToolError(f"instance init: cannot write {instance.root}: {exc}") from exc
+    emit(f"config  {instance.config_file} ({'written' if written else 'kept'})")
+    emit(f"usage   {instance.usage_dir}/YYYY-MM.jsonl")
+    emit(f"state   {instance.state_dir}")
+    return 0
+
+
+def _create(path: Path, text: str) -> bool:
+    """Write ``text`` to a file that does not exist yet, in one exclusive create; one that exists is kept (False)."""
+    try:
+        with path.open("x", encoding="utf-8") as created:
+            created.write(text)
+    except FileExistsError:
+        return False
+    return True
 
 
 def run_auto_check(paths: Paths, book: PriceBook, quiet: bool, emit_err: Emit) -> None:

@@ -12,8 +12,23 @@
 | Tell projects apart | A line's `source`, `ref` and `tags`; `--attribute LABEL=REGEX` in the report; or one log file per project |
 | Plans and billing rules | `ai-cost install --init-config`, then `ai-cost doctor` names every key that is missing |
 | A budget in CI | `ai-cost monitor` exits 3 on a breach |
-| An app on another machine | The log is a local file: copy it to the machine that reports and list it under `usage_logs` |
+| An app on another machine | `ai-cost collect HOST:PATH --into DIR` pulls its instance's log over ssh into one file, which you list under `usage_logs` ([docs/COMMANDS.md](docs/COMMANDS.md#collect)) |
 | Check the integration | `ai-cost doctor` lists the usage log and its counted skips; `ai-cost report --hours 1` shows the new rows |
+
+## Embed it in an app
+
+| | |
+|---|---|
+| Python | `from ai_cost.api import Call, Engine, Instance, Period` — `Engine(Instance(DIR))` |
+| Any other language | `ai-cost --instance DIR log \| price \| report \| doctor`, the same JSON |
+| Start an installation | `ai-cost instance init DIR` |
+| Record / price / report | `engine.record(Call(…))` · `engine.price(Call(…))` · `engine.report_json(Period(hours=24))` |
+| Per tenant or feature | `Call(labels={…})`, then `where=` / `by=` (`--where` / `--by`) |
+| What it reads | the instance directory only; `read_clis=True` / `--read-clis` adds the coding CLIs |
+| The interface | `ai_cost.api.__all__`, pinned by `src/ai_cost/tests/data/api-surface.json` |
+| The app runs on another machine | `ai-cost collect HOST:DIR --into PULLS` on the machine that reports |
+| An app that cannot write into the instance | it prints usage lines with an `event_id` to its log; `ai-cost --instance DIR import usage FILE\|-` puts them in, each once |
+| Detail | [docs/EMBED.md](docs/EMBED.md) |
 
 ## Operate the tool
 
@@ -42,10 +57,18 @@
 
 | | |
 |---|---|
+| `src/ai_cost/api.py` | The library interface: Engine, Instance, Call, Period, Price |
 | `src/ai_cost/models.py` | Typed data: UsageRow, Tokens, Window, WorkItem, Report |
 | `src/ai_cost/collectors/` | One module per source |
 | `src/ai_cost/pricing.py` | One pricer per price shape |
 | `src/ai_cost/groups.py` | Real, API-only, vendor |
+| `src/ai_cost/ops.py` | Report assembly |
+| `src/ai_cost/doctor.py` | `ai-cost doctor` |
+| `src/ai_cost/monitor.py` | `ai-cost monitor`, budgets, history |
+| `src/ai_cost/schedules.py` | The launchd / cron jobs |
+| `src/ai_cost/report_warnings.py` | The report header's warnings |
+| `src/ai_cost/collect.py` | `ai-cost collect`: remote instances' logs over ssh |
+| `src/ai_cost/output.py` | Emit, ensure_dir, append_json_line |
 | `src/ai_cost/data/` | Shipped prices and default config |
 | `src/ai_cost/tests/` | Tests, shipped inside the file |
 

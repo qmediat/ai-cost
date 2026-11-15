@@ -491,6 +491,12 @@ class UsageRow:
     invoice: InvoiceAmounts | None = None  # a usage-report line's own amounts (RowKind.INVOICE)
     untracked: Untracked | None = None  # a provider day's difference (RowKind.UNTRACKED, ADR-0008)
     origin_session: str = ""  # the session that launched the work: a transcript id, a line's origin_session
+    # an app's exact labels (usage-log lines); compared like every field — a row is never hashed (``tokens.by_os`` is
+    # a dict as well)
+    labels: Mapping[str, str] = field(default_factory=dict)
+    # the report's own bookkeeping, never data: the sources line that took the row (-1: none), so a filtered report
+    # counts each line from the rows it contributed; not compared, never in the JSON
+    intake: int = field(default=-1, compare=False, repr=False, metadata={"internal": True})
 
 
 @dataclass(frozen=True)

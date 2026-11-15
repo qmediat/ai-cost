@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from .. import monitor as monitor_module
 from .. import ops as ops_module
+from .. import report_warnings
 from ..collectors import github_bill
 from ..collectors.github import GhCall
 from ..collectors.github_bill import (
@@ -235,7 +237,7 @@ def test_monitor_names_the_github_amounts_its_totals_leave_out() -> None:
     )
     with _report():
         bill = collect_bill(_request(read_at=datetime(2026, 9, 25, 10, 30, tzinfo=timezone.utc)), window)
-    assert ops_module.bill_outside(bill.summary) == (
+    assert monitor_module.bill_outside(bill.summary) == (
         "github 2026-09-24 (the window holds 12.00 h of it): net 3.237386934 USD, gross 3.237386934",
         "github 2026-09-25 (the day is not over): net 2.45861137 USD, gross 2.45861137",
     )
@@ -318,9 +320,9 @@ def test_copilot_counts_without_a_usage_report_are_said_not_priced(tmp_path: Pat
         Billing.SUBSCRIPTION,
         Tokens(reviews=3),
     )
-    said = ops_module._copilot_counted([review], replace(config, github=GithubSettings()))
+    said = report_warnings._copilot_counted([review], replace(config, github=GithubSettings()))
     assert said and said[0].startswith("3 Copilot review(s) counted, not priced")
-    assert ops_module._copilot_counted([review], replace(config, github=GithubSettings(bill=ACME))) == []
+    assert report_warnings._copilot_counted([review], replace(config, github=GithubSettings(bill=ACME))) == []
 
 
 def test_a_configured_plan_beside_the_billed_seats_is_said(tmp_path: Path) -> None:
@@ -331,7 +333,7 @@ def test_a_configured_plan_beside_the_billed_seats_is_said(tmp_path: Path) -> No
     with _report():
         rows = collect_bill(_request(), TWO_DAYS).rows
     real = real_group(rows, book, config, TWO_DAYS)
-    said = ops_module._plans_beside_seats(real)
+    said = report_warnings._plans_beside_seats(real)
     assert said == [
         "subscription copilot-pro stays booked beside the seats the GitHub usage report bills (Copilot Business) — "
         "remove it from subscriptions if those seats replaced it"
@@ -344,7 +346,7 @@ def test_a_copilot_price_left_in_the_users_prices_file_is_said(tmp_path: Path) -
     config, _ = defaults(paths_in(tmp_path))
     old = {"providers": {"github": {"copilot": {"units_per_code_review": 13}}}}
     book = parse_pricebook(builtin_prices(), old, "prices")
-    said = ops_module._retired(paths_in(tmp_path), config, book)
+    said = report_warnings._retired(paths_in(tmp_path), config, book)
     assert (
         len(said) == 1
         and said[0].startswith("providers.github.copilot in ")

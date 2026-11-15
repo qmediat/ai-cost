@@ -29,9 +29,9 @@ from ..config import (
     parse_config,
     parse_pricebook,
 )
+from ..doctor import doctor
 from ..errors import ConfigError
 from ..models import Alias, BillAccount, BillScope, CheckStatus, PeakOffpeakPrice, Provider, TokenTierPrice
-from ..ops import doctor
 from ..prices_check import (
     USER_AGENT,
     CheckResult,
@@ -1726,7 +1726,7 @@ def test_update_writes_a_pair_only_when_the_check_expected_a_pair(tmp_path: Path
 
 
 def test_doctor_names_the_rates_the_last_check_found_listed_apart() -> None:
-    from ..ops import _unchecked_rates
+    from ..doctor import _unchecked_rates
 
     result = CheckResult(checked_at="2026-09-30T00:00:00Z")
     result.providers["alibaba"] = ProviderCheck(
@@ -2128,7 +2128,7 @@ def test_a_table_further_from_the_name_than_the_old_span_is_read(tmp_path: Path)
 
 def test_prices_check_prints_the_new_models_and_doctor_forgets_one_priced_since(tmp_path: Path) -> None:
     from .. import cli
-    from ..ops import _unlisted
+    from ..doctor import _unlisted
 
     paths = paths_in(tmp_path)
     _, book = defaults(paths)
@@ -2222,7 +2222,7 @@ def test_a_template_that_names_a_group_the_pattern_lacks_is_a_config_error() -> 
 
 
 def test_doctor_reads_a_state_file_that_names_a_provider_the_book_does_not_have(tmp_path: Path) -> None:
-    from ..ops import _unlisted
+    from ..doctor import _unlisted
 
     _, book = defaults(paths_in(tmp_path))
     result = CheckResult("2026-11-14T00:00:00Z")

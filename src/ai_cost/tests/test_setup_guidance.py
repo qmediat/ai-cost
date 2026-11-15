@@ -12,10 +12,12 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
-from .. import cli
+from .. import cli, report_warnings
+from .. import doctor as doctor_module
 from .. import ops as ops_module
 from ..collectors.github_bill import BillProbe
 from ..config import Config, PriceBook, builtin_config, load_config, load_pricebook, parse_config
+from ..doctor import doctor
 from ..groups import real_group
 from ..models import BillAccount, Billing, BillScope, Provider, RowKind, Tokens, UsageRow
 from ..onboarding import (
@@ -34,7 +36,7 @@ from ..onboarding import (
     source_checks,
     source_files,
 )
-from ..ops import ReportRequest, build_report, doctor, init_config
+from ..ops import ReportRequest, build_report, init_config
 from ..plugins import Loaded
 from ..timeutil import iso
 from .fixtures import WINDOW, defaults, paths_in, write_claude_session, write_recent_claude_session
@@ -93,7 +95,7 @@ def _doctor_lines(paths_root: Path, config: Config | None = None) -> tuple[int, 
     lines: list[str] = []
     with (
         mock.patch.object(ops_module, "load_configured_plugins", return_value=Loaded()),
-        mock.patch.object(ops_module, "schedule_installed", return_value=False),
+        mock.patch.object(doctor_module, "schedule_installed", return_value=False),
     ):
         code = doctor(paths, config or load_config(paths), load_pricebook(paths), lines.append)
     return code, lines
@@ -314,10 +316,10 @@ def test_the_report_header_counts_the_usage_report_and_the_allowance_switch_as_p
     paths.user_config_file().write_text("{}")
     book = _book()
     unpaid = _config({"github": "subscription"})
-    assert [w for w in ops_module._config_warnings(paths, unpaid, book) if "covers github" in w]
+    assert [w for w in report_warnings.config_warnings(paths, unpaid, book) if "covers github" in w]
     for paid in ({"actions_plan_exhausted": True}, {"bill": {"scope": "organization", "name": "acme"}}):
         assert (
-            ops_module._config_warnings(paths, _config({"github": "subscription"}, **paid), book) == []
+            report_warnings.config_warnings(paths, _config({"github": "subscription"}, **paid), book) == []
         ), paid
 
 
@@ -326,7 +328,7 @@ def test_a_retired_github_key_is_said_in_the_header_and_by_doctor(tmp_path: Path
     paths.user_config_dir.mkdir(parents=True)
     paths.user_config_file().write_text("{}")
     retired = _config({}, copilot_plan_exhausted=True)
-    said = ops_module._config_warnings(paths, retired, _book())
+    said = report_warnings.config_warnings(paths, retired, _book())
     assert [
         w for w in said if w.startswith("providers.github.copilot_plan_exhausted is no longer read")
     ], said
@@ -515,7 +517,7 @@ def test_unknown_rows_are_counted_per_provider_and_a_ledger_row_apart(tmp_path: 
     group = real_group(rows, book, config, WINDOW)
     assert group.unknown_by_provider == {"xai": 2, "google": 1} and group.unfigured_ledger == 1
     assert group.unknown_billing == 4, "the per-provider rows and the ledger row, each counted once"
-    said = ops_module._billing_warnings(group, rows, config)[0]
+    said = report_warnings.billing_warnings(group, rows, config)[0]
     assert (
         "xai 2" in said and "1 ledger row(s) without a figure" in said and "providers.openai" not in said
     ), said
@@ -550,11 +552,11 @@ def test_the_report_header_says_outside_scope_rows_apart_from_the_ones_to_fix(tm
     _, book = defaults(paths_in(tmp_path))
     config = _config({}, outside=(_APP,))
     app = [_row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP)]
-    alone = ops_module._billing_warnings(real_group(app, book, config, WINDOW), app, config)
+    alone = report_warnings.billing_warnings(real_group(app, book, config, WINDOW), app, config)
     assert len(alone) == 1 and f"clients outside scope ({_APP})" in alone[0], alone
     assert "providers.openai.billing" not in alone[0], "nothing to fix for rows left unknown on purpose"
     mixed = [*app, _row(Provider.OPENAI, Billing.UNKNOWN, "c", client="codex_exec")]
-    said = ops_module._billing_warnings(real_group(mixed, book, config, WINDOW), mixed, config)
+    said = report_warnings.billing_warnings(real_group(mixed, book, config, WINDOW), mixed, config)
     assert len(said) == 2 and said[1].startswith("1 usage row(s) with unknown billing"), said
     assert "openai 1" in said[1] and "providers.openai.billing — " in said[1], said
 
@@ -591,7 +593,7 @@ def test_the_outside_scope_line_says_the_api_group_still_prices_them(tmp_path: P
     _, book = defaults(paths_in(tmp_path))
     config = _config({}, outside=(_APP,))
     app = [_row(Provider.OPENAI, Billing.UNKNOWN, "a", client=_APP)]
-    said = ops_module._billing_warnings(real_group(app, book, config, WINDOW), app, config)
+    said = report_warnings.billing_warnings(real_group(app, book, config, WINDOW), app, config)
     assert said and "the API-only group still prices their tokens" in said[0], said
 
 

@@ -24,7 +24,8 @@ from .collectors.gemini_cli import session_files
 from .collectors.github_bill import BillProbe
 from .collectors.grok_build import SOURCE_NAME as GROK_SOURCE
 from .collectors.grok_build import usage_files
-from .config import Budgets, Config, Paths, PriceBook
+from .collectors.usage_log import Unread, leads_nowhere
+from .config import Budgets, Config, Instance, Paths, PriceBook
 from .models import Billing, ProviderDays, Skipped, UsageRow, client_outside
 
 SETUP_GUIDE = "https://github.com/qmediat/ai-cost/blob/main/docs/SETUP.md"
@@ -266,22 +267,32 @@ def source_checks(found: Sequence[SourceFiles], logs: Sequence[Path], window_row
     ``window_rows`` is None when the doctor's collection failed, and a source or a log that could not be read may
     hold usage: in both cases "no usage" is not claimed.
     """
-    checks = [_source_check(f) for f in found]
     logged = [_usage_log_check(path, first=index == 0) for index, path in enumerate(dict.fromkeys(logs))]
-    checks += [check for check, _ in logged]
+    return [*cli_checks(found), *(check for check, _ in logged), *_no_usage(found, logged, window_rows)]
+
+
+def _no_usage(
+    found: Sequence[SourceFiles], logged: Sequence[tuple[Check, bool]], window_rows: int | None
+) -> list[Check]:
+    """The one "no usage found" line: nothing in the window, no CLI file, no log, and nothing that could not be read."""
     has_log = any(present for _, present in logged)
     unread = any(f.found is Found.UNREADABLE or f.unlisted for f in found)
     unread = unread or any(c.mark is Mark.PROBLEM for c, _ in logged)
-    if window_rows == 0 and not has_log and not unread and not any(f.count for f in found):
-        checks.append(
-            Check(
-                Mark.PROBLEM,
-                "no usage found: no session files of Claude Code, Codex CLI, Gemini CLI or Grok Build, no usage log, "
-                "no plugin rows in the last 24 h — a CLI that keeps its files elsewhere: CLAUDE_CONFIG_DIR, "
-                "CODEX_HOME, GEMINI_CLI_HOME, GROK_HOME",
-            )
+    if window_rows != 0 or has_log or unread or any(f.count for f in found):
+        return []
+    return [
+        Check(
+            Mark.PROBLEM,
+            "no usage found: no session files of Claude Code, Codex CLI, Gemini CLI or Grok Build, no usage log, "
+            "no plugin rows in the last 24 h — a CLI that keeps its files elsewhere: CLAUDE_CONFIG_DIR, "
+            "CODEX_HOME, GEMINI_CLI_HOME, GROK_HOME",
         )
-    return checks
+    ]
+
+
+def cli_checks(found: Sequence[SourceFiles]) -> list[Check]:
+    """One line per coding CLI whose files were looked for."""
+    return [_source_check(item) for item in found]
 
 
 def _source_check(found: SourceFiles) -> Check:
@@ -305,15 +316,41 @@ def _source_check(found: SourceFiles) -> Check:
     return Check(mark, text)
 
 
+def instance_checks(
+    instance: Instance,
+    found: Sequence[SourceFiles],
+    logs: Sequence[Path],
+    unread: Sequence[Unread],
+    window_rows: int | None,
+) -> list[Check]:
+    """An instance's usage: its directory, segments, listed logs, what ``usage/`` holds unread, the CLIs' files.
+
+    ``found`` lists the CLIs' files when the instance reads them, nothing otherwise. Without the CLIs every remedy names an instance command or the instance's own config; with them, the one "no
+    usage found" line weighs the CLIs' files and the instance's logs together, as the machine's doctor does.
+    """
+    if not instance.root.is_dir():
+        return [
+            Check(
+                Mark.PROBLEM,
+                f"instance {instance.root} does not exist yet — ai-cost instance init {instance.root}",
+            )
+        ]
+    logged = [_usage_log_check(path, first=False) for path in dict.fromkeys(logs)]
+    checks = [*cli_checks(found), *(check for check, _ in logged)]
+    checks += [
+        Check(Mark.PROBLEM, f"{instance.usage_dir}/{item.name}: {item.why}, not read") for item in unread
+    ]
+    if instance.read_clis:
+        return checks + _no_usage(found, logged, window_rows)
+    if window_rows == 0:
+        checks.append(Check(Mark.INFO, f"no call recorded in {instance.usage_dir} in the last 24 h"))
+    return checks
+
+
 def _usage_log_check(usage_log: Path, first: bool) -> tuple[Check, bool]:
     """A usage log: present, absent (information), or unreadable (a problem)."""
     if not usage_log.exists():
-        text = (
-            f"usage log: none yet (programs can write one: {_USAGE_LOG_GUIDE})"
-            if first
-            else f"usage log {usage_log}: absent (listed in usage_logs)"
-        )
-        return Check(Mark.INFO, text), False
+        return _absent_log(usage_log, first), False
     if not usage_log.is_file() or not os.access(usage_log, os.R_OK):
         return (
             Check(Mark.PROBLEM, f"usage log {usage_log}: not a readable file — its lines would be skipped"),
@@ -324,6 +361,17 @@ def _usage_log_check(usage_log: Path, first: bool) -> tuple[Check, bool]:
     except OSError as exc:
         return Check(Mark.PROBLEM, f"usage log {usage_log}: cannot read ({exc})"), False
     return Check(Mark.OK if size else Mark.INFO, f"usage log {usage_log}: {size} bytes"), size > 0
+
+
+def _absent_log(usage_log: Path, first: bool) -> Check:
+    """A usage log that is not there: a link that leads nowhere is a problem (the reader counts a skip)."""
+    if leads_nowhere(usage_log):  # a loop or a dangling link, the file's own or a parent directory's
+        return Check(
+            Mark.PROBLEM, f"usage log {usage_log}: a link that leads nowhere — its lines are never read"
+        )
+    if first:
+        return Check(Mark.INFO, f"usage log: none yet (programs can write one: {_USAGE_LOG_GUIDE})")
+    return Check(Mark.INFO, f"usage log {usage_log}: absent (listed in usage_logs)")
 
 
 def covers(cover: str, provider: str) -> bool:

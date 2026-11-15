@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from ..attribution import attribution_group, parse_rules
-from ..config import Config, GithubSettings, PriceBook, Subscription
+from ..config import Config, GithubSettings, PriceBook, Subscription, load_pricebook
 from ..errors import ConfigError, PricingError
 from ..groups import (
     INVOICE_ATTRIBUTION,
@@ -29,10 +29,11 @@ from ..models import (
     Scope,
     Size,
     Tokens,
+    TokenTierPrice,
     UsageRow,
     WorkItem,
 )
-from ..pricing import NO_PRICE, REPORTED_ON_THE_BILL, is_peak, price
+from ..pricing import NO_PRICE, REPORTED_ON_THE_BILL, current_price, is_peak, price
 from ..timeutil import parse_ts
 from .fixtures import BASE, WINDOW, defaults, paths_in
 
@@ -738,3 +739,26 @@ def test_a_seat_price_change_inside_the_window_is_said_not_zeroed(tmp_path: Path
     share = next(s for s in real.subscriptions if s.attribution == INVOICE_ATTRIBUTION)
     assert share.monthly_usd == 0.0 and "at 0.01 / 21.0 USD" in share.note
     assert "| Copilot Business | — | — | invoice |" in "\n".join(_real_section(real, 24.0))
+
+
+def test_peak_hours_are_read_in_utc_whatever_the_offset() -> None:
+    windows = ((1, 4), (6, 10))
+    shanghai = timezone(timedelta(hours=8))
+    assert is_peak(datetime(2026, 11, 16, 10, 30, tzinfo=shanghai), windows), "02:30 UTC on a Monday is peak"
+    assert not is_peak(datetime(2026, 11, 16, 13, 30, tzinfo=shanghai), windows), "05:30 UTC is not"
+    assert is_peak(datetime(2026, 11, 16, 2, 30), windows), "a naive time is taken as UTC, as before"
+
+
+def test_a_price_day_is_the_utc_day_whatever_the_offset(tmp_path: Path) -> None:
+    book = load_pricebook(paths_in(tmp_path))
+    argon = book.entry(Provider.GOOGLE, "gemini-4-argon", None)
+    assert (
+        isinstance(argon, TokenTierPrice)
+        and argon.valid_until == date(2026, 11, 30)
+        and argon.next is not None
+    )
+    warsaw_midnight = datetime(
+        2026, 12, 1, 0, 30, tzinfo=timezone(timedelta(hours=2))
+    )  # 2026-11-30 22:30 UTC
+    assert current_price(argon, warsaw_midnight) is argon, "still the 30 November price in UTC"
+    assert current_price(argon, warsaw_midnight + timedelta(hours=2)) is argon.next, "1 December 00:30 UTC"

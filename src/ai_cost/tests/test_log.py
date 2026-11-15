@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 from ..collectors.usage_log import collect_usage_log
 from ..errors import UsageError
-from ..log import Attribution, Usage, append, default_path, entry, from_response, record
+from ..log import (
+    MAX_LINE_BYTES,
+    Attribution,
+    Usage,
+    append,
+    default_path,
+    encoded,
+    entry,
+    from_response,
+    record,
+)
 from .fixtures import BASE
 
 ANTHROPIC = {
@@ -267,3 +282,195 @@ def test_both_spellings_of_deepseek_cache_usage_on_one_line_are_refused(tmp_path
         raise AssertionError(
             "a line with both spellings must be refused, never folded over the writer's input"
         )
+
+
+def test_append_writes_one_line_in_one_write_call(tmp_path: Path) -> None:
+    line = entry(Usage("openai", "gpt-6-sol", {"input": 5}), BASE)
+    with mock.patch("os.write", wraps=os.write) as write:
+        append(tmp_path / "deep" / "usage.jsonl", line)
+        append(tmp_path / "deep" / "usage.jsonl", line)
+    assert write.call_count == 2, "one write per line: a buffered write may split a line between writers"
+    assert (tmp_path / "deep" / "usage.jsonl").read_text("utf-8") == (json.dumps(line) + "\n") * 2
+
+
+def test_append_with_a_limit_refuses_a_line_that_leaves_no_byte_for_a_newline(tmp_path: Path) -> None:
+    def line(size: int) -> dict[str, object]:
+        filler = {"ref": ""}
+        fixed = len((json.dumps(filler) + "\n").encode("utf-8"))
+        return {
+            "ref": "é" * ((size - fixed) // 2) + "x" * ((size - fixed) % 2)
+        }  # é: two bytes, one character
+
+    append(tmp_path / "usage.jsonl", line(MAX_LINE_BYTES - 1), MAX_LINE_BYTES)
+    try:
+        append(tmp_path / "usage.jsonl", line(MAX_LINE_BYTES), MAX_LINE_BYTES)
+    except ValueError as exc:
+        assert "4096 bytes" in str(exc), exc
+    else:
+        raise AssertionError("a 4096-byte line was written")
+    written = (tmp_path / "usage.jsonl").read_bytes()
+    assert (
+        len(written) == MAX_LINE_BYTES - 1
+    ), "the encoded size counts, not the characters; the long line wrote nothing"
+
+
+def test_labels_are_written_only_when_given_and_checked_like_the_reader() -> None:
+    assert "labels" not in entry(Usage("openai", "gpt-6-sol", {"input": 5}), BASE)
+    labelled = entry(Usage("openai", "gpt-6-sol", {"input": 5}), BASE, Attribution(labels={"tenant": "acme"}))
+    assert labelled["labels"] == {"tenant": "acme"}
+    for bad in ({"a b": "x"}, {"tenant": ""}, {"tenant": 5}, {"t": "x" * 257}):
+        try:
+            Attribution(labels=bad)  # type: ignore[arg-type]
+        except ValueError:
+            continue
+        raise AssertionError(f"labels {bad!r} accepted")
+
+
+def _line(tokens: int) -> dict[str, object]:
+    return entry(Usage("openai", "gpt-6-sol", {"input": tokens}), BASE)
+
+
+def _read(log: Path) -> tuple[list[int], int]:
+    collected, _ = collect_usage_log([log], None)
+    return [row.tokens.input for row in collected.rows], len(collected.skipped)
+
+
+def test_a_line_after_a_torn_tail_starts_a_line_of_its_own(tmp_path: Path) -> None:
+    log = tmp_path / "usage.jsonl"
+    log.write_bytes(b'{"schema": 1, "at": "2026-09-19T15:')  # another writer's line, cut short
+    append(log, _line(7))
+    assert _read(log) == ([7], 1), "the fragment is one counted skip, the new line a row"
+
+
+def test_two_lines_after_a_torn_tail_are_two_rows_and_a_blank_line_is_no_skip(tmp_path: Path) -> None:
+    log = tmp_path / "usage.jsonl"
+    log.write_bytes(b'{"schema": 1, "at": "2026-09-19T15:')
+    append(log, _line(7))
+    append(log, _line(8))
+    with log.open(
+        "a", encoding="utf-8"
+    ) as handle:  # two writers that both saw a torn tail leave a blank line
+        handle.write("\n")
+    append(log, _line(9))
+    assert _read(log) == ([7, 8, 9], 1)
+
+
+def test_an_empty_a_missing_and_a_crlf_ended_file_get_no_newline_first(tmp_path: Path) -> None:
+    empty, missing, crlf = tmp_path / "empty.jsonl", tmp_path / "missing.jsonl", tmp_path / "crlf.jsonl"
+    empty.write_bytes(b"")
+    crlf.write_bytes(json.dumps(_line(1)).encode() + b"\r\n")
+    for log in (empty, missing, crlf):
+        append(log, _line(7))
+    assert empty.read_bytes() == missing.read_bytes() == json.dumps(_line(7)).encode() + b"\n"
+    assert crlf.read_bytes().endswith(b"\r\n" + json.dumps(_line(7)).encode() + b"\n")
+
+
+def test_a_short_write_raises_and_writes_nothing_more(tmp_path: Path) -> None:
+    real = os.write
+    with mock.patch("os.write", side_effect=lambda fd, data: real(fd, data[:10])) as write:
+        try:
+            append(tmp_path / "usage.jsonl", _line(7))
+        except OSError as exc:
+            assert "a fragment may be left; the next line starts on a new line" in str(exc), exc
+        else:
+            raise AssertionError("a short write was not said")
+    assert (
+        write.call_count == 1
+        and (tmp_path / "usage.jsonl").read_bytes() == json.dumps(_line(7)).encode()[:10]
+    )
+
+
+def test_a_line_within_the_limit_is_written_whatever_the_tail_is(tmp_path: Path) -> None:
+    log = tmp_path / "usage.jsonl"
+    log.write_bytes(b"torn")
+    line = {"ref": "x" * (MAX_LINE_BYTES - len(json.dumps({"ref": ""}).encode()) - 2)}
+    assert len(encoded(line)) == MAX_LINE_BYTES - 1, "the longest line the limit takes"
+    append(log, line, MAX_LINE_BYTES)
+    assert log.read_bytes() == b"torn\n" + encoded(line), "one write of exactly the limit"
+
+
+def test_a_log_this_writer_cannot_read_is_appended_to_without_the_check(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        return  # root reads every file: the refusal this test needs cannot happen
+    log = tmp_path / "usage.jsonl"
+    log.write_bytes(b'{"torn"')
+    log.chmod(0o200)
+    try:
+        append(log, _line(7))
+    finally:
+        log.chmod(0o600)
+    assert (
+        log.read_bytes() == b'{"torn"' + json.dumps(_line(7)).encode() + b"\n"
+    ), "no check: no newline first"
+
+
+def test_a_pipe_delivers_the_whole_line_to_a_reader_that_opens_later(tmp_path: Path) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    received: list[bytes] = []
+
+    def read_later() -> None:
+        time.sleep(0.3)
+        with open(fifo, "rb") as stream:
+            received.append(stream.read())
+
+    reader = threading.Thread(target=read_later, daemon=True)
+    reader.start()
+    append(fifo, _line(7))  # waits for the reader: a write-only open of a pipe
+    reader.join(5)
+    assert received == [json.dumps(_line(7)).encode() + b"\n"]
+
+
+def test_a_device_is_appended_to_without_the_check() -> None:
+    append(Path(os.devnull), _line(7))
+
+
+def _swapping_open(log: Path, swap: Callable[[], None]) -> Callable[..., int]:
+    """``os.open`` that runs ``swap`` once, just before the tail check's (read-only) open of ``log``."""
+    real_open, state = os.open, {"swapped": False}
+
+    def opener(path: object, flags: int, *more: int, **named: int) -> int:
+        if not flags & os.O_APPEND and not state["swapped"]:
+            state["swapped"] = True
+            swap()
+        return real_open(path, flags, *more, **named)  # type: ignore[arg-type]
+
+    return opener
+
+
+def test_a_log_rotated_between_the_open_and_the_check_gets_the_line_in_the_new_file(tmp_path: Path) -> None:
+    log, moved = tmp_path / "usage.jsonl", tmp_path / "moved.jsonl"
+    log.write_bytes(b'{"torn"')
+
+    def rotate() -> None:
+        os.replace(log, moved)
+        log.write_bytes(b'{"also torn"')
+
+    with mock.patch("os.open", _swapping_open(log, rotate)):
+        append(log, _line(7))
+    assert moved.read_bytes() == b'{"torn"'
+    assert log.read_bytes() == b'{"also torn"\n' + json.dumps(_line(7)).encode() + b"\n"
+
+
+def test_a_pipe_put_under_the_path_after_the_open_gets_the_line_when_its_reader_opens(tmp_path: Path) -> None:
+    log, moved = tmp_path / "usage.jsonl", tmp_path / "moved.jsonl"
+    log.write_bytes(b'{"torn"')
+    received: list[bytes] = []
+    reader = threading.Thread(target=lambda: received.append(log.read_bytes()), daemon=True)
+
+    def to_a_pipe() -> None:
+        os.replace(log, moved)
+        os.mkfifo(log)
+        reader.start()
+
+    def run() -> None:
+        with mock.patch("os.open", _swapping_open(log, to_a_pipe)):
+            append(log, _line(7))
+
+    writer = threading.Thread(target=run, daemon=True)
+    writer.start()
+    writer.join(5)
+    assert not writer.is_alive(), "the append waited at the tail check's open"
+    reader.join(5)
+    assert moved.read_bytes() == b'{"torn"'
+    assert received == [json.dumps(_line(7)).encode() + b"\n"]

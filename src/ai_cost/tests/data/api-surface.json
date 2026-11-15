@@ -1,0 +1,94 @@
+{
+  "ApiError": {
+    "bases": [
+      "ValueError"
+    ],
+    "methods": {},
+    "properties": []
+  },
+  "Call": {
+    "bases": [
+      "object"
+    ],
+    "methods": {},
+    "properties": [],
+    "signature": "(provider: 'str', model: 'str', tokens: 'Mapping[str, int]' = <factory>, cost: 'float | None' = None, at: 'datetime | None' = None, labels: 'Mapping[str, str]' = <factory>, keys: 'Mapping[str, Any]' = <factory>) -> None"
+  },
+  "Engine": {
+    "bases": [
+      "object"
+    ],
+    "methods": {
+      "doctor": "(self) -> 'Sequence[str]'",
+      "import_usage": "(self, lines: 'Iterable[str]') -> 'UsageImport'",
+      "price": "(self, call: 'Call') -> 'Price'",
+      "record": "(self, call: 'Call') -> 'Mapping[str, Any]'",
+      "report": "(self, period: 'Period', *, groups: 'Sequence[str]' = ('real', 'api'), attribute: 'Sequence[str]' = (), where: 'Mapping[str, str] | None' = None, by: 'str | None' = None) -> 'Report'",
+      "report_json": "(self, period: 'Period', *, groups: 'Sequence[str]' = ('real', 'api'), attribute: 'Sequence[str]' = (), where: 'Mapping[str, str] | None' = None, by: 'str | None' = None, detail: 'bool' = False) -> 'str'"
+    },
+    "properties": [],
+    "signature": "(instance: 'Instance') -> 'None'"
+  },
+  "Instance": {
+    "bases": [
+      "object"
+    ],
+    "methods": {},
+    "properties": [
+      "config_file",
+      "prices_file",
+      "state_dir",
+      "usage_dir"
+    ],
+    "signature": "(root: 'Path', read_clis: 'bool' = False, offline: 'bool' = True, plugins: 'tuple[str, ...]' = (), outside_logs: 'tuple[Path, ...]' = ()) -> None"
+  },
+  "Period": {
+    "bases": [
+      "object"
+    ],
+    "methods": {},
+    "properties": [],
+    "signature": "(since: 'datetime | None' = None, until: 'datetime | None' = None, hours: 'float | None' = None) -> None"
+  },
+  "Price": {
+    "bases": [
+      "object"
+    ],
+    "methods": {},
+    "properties": [],
+    "signature": "(usd: 'float | None', note: 'str') -> None"
+  },
+  "Report": {
+    "bases": [
+      "object"
+    ],
+    "methods": {},
+    "properties": [
+      "row_count",
+      "window_hours"
+    ],
+    "signature": "(version: 'str', generated_at: 'str', window: 'Window', window_iso: 'tuple[str, str]', sources: 'Sequence[str]', warnings: 'Sequence[str]', skipped: 'Sequence[Skipped]', prices_checked_at: 'str', rows: 'Sequence[UsageRow]', real: 'RealGroup | None', api: 'ApiGroup | None', vendor: 'VendorGroup | None', attribution: 'AttributionGroup | None' = None, github_bill: 'BillSummary | None' = None, provider_reports: 'Sequence[ProviderSummary]' = (), models: 'Sequence[ModelLine]' = (), selection: 'SessionSelection | None' = None, estimates: 'Estimates | None' = None, where: 'Mapping[str, str]' = <factory>) -> None"
+  },
+  "SkipClass": {
+    "bases": [
+      "Enum"
+    ],
+    "members": {
+      "INVALID": "invalid usage line",
+      "LINE_TOO_LONG": "line too long",
+      "NOT_A_USAGE_LINE": "not a usage line",
+      "NO_EVENT_ID": "no event_id",
+      "UNREADABLE": "a usage line that cannot be read"
+    }
+  },
+  "UsageImport": {
+    "bases": [
+      "object"
+    ],
+    "methods": {},
+    "properties": [
+      "failed"
+    ],
+    "signature": "(imported: 'int', already_there: 'int', skipped: 'Mapping[SkipClass, int]', examples: 'Mapping[SkipClass, str]') -> None"
+  }
+}

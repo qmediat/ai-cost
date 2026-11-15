@@ -1,10 +1,13 @@
 # JSON output (`--format json`)
 
+An app reads the same JSON from `ai_cost.api.Engine.report_json` or `ai-cost --instance DIR report --format json`
+([EMBED.md](EMBED.md)). Within one major version a field here is never renamed or removed; fields may be added.
+
 Top level: `version`, `generated_at`, `window` (`{start, end}`), `window_iso` (`[start, end]`), `window_hours`,
-`row_count`, `sources`, `warnings`, `skipped` (`[{source, path, reason}]`), `prices_checked_at`, `real`
+`row_count`, `where` (only in a report filtered by `--where`: the filter), `sources`, `warnings`, `skipped` (`[{source, path, reason}]`), `prices_checked_at`, `real`
 (`subscriptions[]` — a share the usage report states has `attribution` `invoice`, `seats` 0 and its user-months in
 `note` —, `usage[]`, `cash_usd`, `subscription_usd`, `total_usd`, `unknown_billing`, `unknown_by_provider`, `unfigured_ledger`), `api` (`lines[]`,
-`total_usd`), `models[]` (with the API group: one per model — `provider`, `model`, `records`, `model_calls`, `tokens`, `api_usd`, `paid_usd`, `payments[]` with `paid` (`plan`, `metered beyond the plan`, `API key`, `billed`, `untracked`, `settled on another row`, `unknown`), `evidence` (`list price`, `reported`, `ledger`, `usage report`, `provider report`, `no amount`), `usd`, `rows` and `text` (the table's cell); the payments sum to the real group's cash on the model), `vendor` (when items exist), `attribution` (with `--attribute`: `lines[]`, each with its `models[]` — `provider`, `model`, `calls`, `model_calls`, `tokens`,
+`total_usd`), `models[]` (with the API group: one per model — `provider`, `model`, `records`, `model_calls`, `tokens`, `api_usd`, `paid_usd`, `payments[]` with `paid` (`plan`, `metered beyond the plan`, `API key`, `billed`, `untracked`, `settled on another row`, `unknown`), `evidence` (`list price`, `reported`, `ledger`, `usage report`, `provider report`, `no amount`), `usd`, `rows` and `text` (the table's cell); the payments sum to the real group's cash on the model), `vendor` (when items exist), `attribution` (with `--attribute`, or `--by LABEL` — one line per value of the label, then `(no LABEL)`, a value spelled like that in quotes; `heading` says what the lines are split by: `lines[]`, each with its `models[]` — `provider`, `model`, `calls`, `model_calls`, `tokens`,
 `api_usd`, `cash_usd`, `notes`, `payments[]`; one per model the label's rows name, the largest list price first; cash is
 what the real group counts on that model's own rows — a ledger's settlement included, 0 under a plan —, `notes` name the
 billing rules that counted it (`api-key (ledger)`, `plan`, …) and `payments[]` split that cash as the per-model table
@@ -23,7 +26,7 @@ text; `null` when not compared), `why_not`, `unknown_rows`, `local_requests`, `u
 `daily` reads a day not final again)). A line's `calls` is what it folded in
 (rows, review runs, Copilot reviews — the `Records` column) and `model_calls` the API requests its sources reported
 (`Model calls`; 0 where none does); `--detail` adds `rows[]`, where
-`client` is the program that wrote the session (a Codex rollout's `originator`), `cost_reported` is the source's
+`labels` are a usage-log line's own labels (present only on a row that has some), `client` is the program that wrote the session (a Codex rollout's `originator`), `cost_reported` is the source's
 own figure for the row: cash for an `api` row (a charge the source reported), the
 source's list-price estimate for a `subscription` row (never counted as cash; the API-equivalent fallback when the
 model has no list price), a part of the session's figure when a session spans several rows; `source` names the

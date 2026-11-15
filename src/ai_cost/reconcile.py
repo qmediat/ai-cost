@@ -18,7 +18,8 @@ from .config import Config, Paths, PriceBook
 from .errors import ToolError
 from .groups import UNTRACKED_LABEL
 from .models import Billing, RowKind, Tokens, UsageRow, client_outside
-from .ops import Emit, ReportRequest, append_json_line, build_report
+from .ops import ReportRequest, build_report
+from .output import Emit, append_json_line
 from .render import plain
 from .timeutil import iso, now
 

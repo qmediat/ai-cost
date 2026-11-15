@@ -19,7 +19,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .errors import ConfigError
+from .errors import ApiError, ConfigError
 from .models import (
     Alias,
     BillAccount,
@@ -33,6 +33,7 @@ from .models import (
     TokenTierPrice,
 )
 from .providers import SETTINGS, TEXT, ReportSource, sources_of
+from .timeutil import in_utc
 from .values import as_object, object_at
 
 JsonDict = dict[str, Any]
@@ -67,6 +68,101 @@ def same_model(served: str, row_id: str) -> bool:
     return served.startswith(row_id) and _SAME_MODEL_TAIL.fullmatch(served, len(row_id)) is not None
 
 
+def _path_text(value: Any, what: str) -> str:
+    """A path given as a ``str`` or an ``os.PathLike``, as text; a ``~`` is refused, never expanded here.
+
+    The library reads no environment, and ``~`` names the environment's home: the caller expands it first
+    (``Path.expanduser()``), as the command does for ``--instance`` and ``AI_COST_USAGE_LOG``.
+    """
+    if isinstance(value, bytes) or not isinstance(value, (str, os.PathLike)):
+        raise ApiError(f"{what} must be a path (str or os.PathLike), got {type(value).__name__}")
+    text = os.fspath(value)
+    if not isinstance(text, str):
+        raise ApiError(f"{what} must be a path of text, got {value!r}")
+    if text.startswith("~"):
+        raise ApiError(f"{what}: {value!r} — a ~ is never expanded here; expand it first (Path.expanduser())")
+    return text
+
+
+def _unnamed(text: str) -> bool:
+    """A name that names nothing: empty, blank, or one that normalises to the current directory ("", ".", "a/..")."""
+    return not text.strip() or os.path.normpath(text) == "."
+
+
+def _root(value: Any) -> Path:
+    """``Instance.root`` made absolute (``..`` collapsed, links kept); judged by its value, never by its type."""
+    text = _path_text(value, "Instance.root")
+    if _unnamed(text):
+        raise ApiError(
+            f"Instance.root must name a directory, got {value!r} — an empty or '.' name is never taken for the "
+            "current directory: give an absolute path, or Path.cwd()"
+        )
+    return Path(os.path.abspath(text))
+
+
+def _log_file(value: Any) -> Path:
+    """One ``Instance.outside_logs`` entry made absolute: a usage log file, never an empty or '.' name."""
+    text = _path_text(value, "Instance.outside_logs")
+    if _unnamed(text):
+        raise ApiError(f"Instance.outside_logs: each entry names a usage log file, got {value!r}")
+    return Path(os.path.abspath(text))
+
+
+def _sequence(value: Any, what: str) -> tuple[Any, ...]:
+    """A list or a tuple of values (a single string is a mistake, not a list of its letters)."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ApiError(f"{what} must be a list or a tuple, got {type(value).__name__}")
+    return tuple(value)
+
+
+@dataclass(frozen=True)
+class Instance:
+    """One installation of an app: its own usage log, config, prices and state, all under ``root``.
+
+    Nothing outside ``root`` is read unless ``read_clis`` asks for the machine user's coding-CLI files or
+    ``outside_logs`` names a usage log elsewhere; no plugin runs unless ``plugins`` names it.
+    """
+
+    root: Path  # a str or any os.PathLike is taken too; stored absolute (links kept as given)
+    read_clis: bool = False
+    offline: bool = True
+    plugins: tuple[str, ...] = ()
+    outside_logs: tuple[Path, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Every field checked and normalised here, so a wrong type is an ``ApiError`` naming the field."""
+        object.__setattr__(self, "root", _root(self.root))
+        for name in ("read_clis", "offline"):
+            if not isinstance(getattr(self, name), bool):
+                raise ApiError(f"Instance.{name} must be True or False, got {getattr(self, name)!r}")
+        plugins = _sequence(self.plugins, "Instance.plugins")
+        if not all(isinstance(name, str) and name for name in plugins):
+            raise ApiError(f"Instance.plugins must name modules (strings), got {self.plugins!r}")
+        outside = _sequence(self.outside_logs, "Instance.outside_logs")
+        object.__setattr__(self, "plugins", plugins)
+        object.__setattr__(self, "outside_logs", tuple(_log_file(path) for path in outside))
+
+    @property
+    def usage_dir(self) -> Path:
+        """The monthly usage segments: ``<root>/usage/YYYY-MM.jsonl``."""
+        return self.root / "usage"
+
+    @property
+    def config_file(self) -> Path:
+        """``<root>/config.json``; absent: the shipped defaults."""
+        return self.root / "config.json"
+
+    @property
+    def prices_file(self) -> Path:
+        """``<root>/prices.json``; absent: the shipped prices."""
+        return self.root / "prices.json"
+
+    @property
+    def state_dir(self) -> Path:
+        """``<root>/state``: monitor history and every other state file of the instance."""
+        return self.root / "state"
+
+
 @dataclass(frozen=True)
 class Paths:
     """Where the sources and the state live; every path is overridable through the environment."""
@@ -84,6 +180,32 @@ class Paths:
     usage_log: Path | None = (
         None  # the default usage log (AI_COST_USAGE_LOG, else $XDG_DATA_HOME/ai-cost/usage.jsonl)
     )
+    instance: Instance | None = None  # set by for_instance only: the paths of one app installation
+
+    @classmethod
+    def for_instance(cls, instance: Instance) -> Paths:
+        """Every path of ``instance`` set explicitly; the environment decides nothing but the CLI homes of ``read_clis``.
+
+        Without ``read_clis`` the CLI homes point under the instance's state, where no CLI writes: the collectors
+        find nothing. There is no default usage log: the instance's lines are its monthly segments.
+        """
+        root = instance.root
+        clis = cls.from_env() if instance.read_clis else None
+        none = instance.state_dir / "no-cli"
+        return cls(
+            claude_home=clis.claude_home if clis else none / "claude",
+            codex_home=clis.codex_home if clis else none / "codex",
+            gemini_home=clis.gemini_home if clis else none / "gemini",
+            grok_home=clis.grok_home if clis else none / "grok",
+            state_dir=instance.state_dir,
+            reports_dir=root / "reports",
+            user_config_dir=root,
+            offline=instance.offline,
+            config_file=instance.config_file,
+            prices_file=instance.prices_file,
+            usage_log=None,
+            instance=instance,
+        )
 
     @classmethod
     def from_env(cls) -> Paths:
@@ -287,7 +409,7 @@ def _aliased_row(named: list[tuple[Alias, PriceEntry]], at: datetime | None) -> 
     """The row an alias named on ``at``'s day; without a day, the one row naming it (several: none)."""
     if at is None:
         return named[0][1] if len(named) == 1 else None
-    day = at.date()
+    day = in_utc(at).date()
     return next((row for alias, row in named if alias.holds(day)), None)
 
 

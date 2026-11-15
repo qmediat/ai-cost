@@ -312,7 +312,7 @@ def test_the_window_never_ends_past_now_and_always_after_the_last_turn(tmp_path:
 
 def test_copilot_reviews_of_a_session_are_said_unpriced_even_with_a_usage_report(tmp_path: Path) -> None:
     """The usage report bills a repository's day: a session report does not read it, and says so."""
-    from ..ops import _copilot_counted
+    from ..report_warnings import _copilot_counted
     from .fixtures import defaults as fixture_defaults
 
     config, _ = fixture_defaults(paths_in(tmp_path))

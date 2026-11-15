@@ -5,6 +5,57 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-11-16
+
+### Added
+
+- Embed ai-cost in an app (`docs/EMBED.md`). From Python, `ai_cost.api`: `Engine(Instance(DIR))` with
+  `record`, `price`, `report`, `report_json`, `doctor` and `import_usage`, and the types `Call`, `Period`, `Price`,
+  `UsageImport`, `SkipClass` and `ApiError`. From any other language, the same through the command: the global
+  `--instance DIR` (or `AI_COST_INSTANCE`) for `report`, `log`, `price`, `doctor`, `monitor` and `import usage`, and
+  the new commands `price` and `instance init DIR`. An instance reads only its own directory: its calls in monthly
+  files `usage/YYYY-MM.jsonl` (a report reads the months it covers; an `event_id` counts once across them), its
+  config and its prices — no coding-CLI file, plugin, account report or environment variable unless the app asks
+  for it (`--read-clis`, `--plugin`, `--outside-log`). A line of 4096 bytes or more is refused there.
+- Labels: a usage-log line's `labels` (`--label NAME=VALUE`, `labels=` of `record()`), filtered exactly by
+  `report --where` and grouped by `report --by` (one line per value, then `(no <label>)`). A filtered report covers
+  its usage rows only: the real group holds their cash, no plan share; work items, estimates, the GitHub usage report
+  and the provider reports are left out, each said. A `labels` key of another shape in an existing log is ignored,
+  the line counted, one warning per file.
+- `ai-cost collect HOST:PATH … --into DIR`: pulls the usage log of an app instance on another machine over ssh
+  (`BatchMode`, `--timeout` for the connect, `AI_COST_SSH` for another executable) into one file per instance, written
+  atomically, to list under `usage_logs`. A failed host — a `usage/` it cannot read, a `usage/` that is a link, a
+  month entry that is a link or not a regular file — keeps its previous file and makes the exit 1; nothing is skipped
+  silently. A pull with fewer bytes than the file is refused the same way (delete the file to accept it). A linked
+  instance root is followed; `AI_COST_OFFLINE=1` refuses the command.
+- `ai-cost --instance DIR import usage FILE|-` (Python: `Engine.import_usage(lines)`): an app that cannot write into
+  its instance prints one usage line per call into its log stream, and the operator's side feeds the stream here.
+  Each line is validated and written as `record` writes a call, in the month of its own time, each `event_id` once:
+  a stream fed twice adds nothing. A usage line is read whole or behind a log prefix (`journalctl`,
+  `kubectl logs --timestamps`). The stream's other lines, an app's own JSON records included, are counted as
+  `not a usage line` (exit 0). A usage line without an `event_id`, one `record` would refuse, a torn one or one over
+  the limit is skipped and counted by class, with its first line as the example (exit 1). A stream without a single
+  usage line says so; an instance config that does not parse, or a read that fails midway, is exit 2.
+
+### Changed
+
+- `ai-cost log` and `record()` append each line in one `write` through a descriptor opened for appending, and start
+  it with a newline when the file does not end with one (another writer's line was cut short), so a line is never
+  glued to a cut one before it — save a cut made between the check and the write. A line shorter than 4096 bytes is
+  written whole; a longer one is written but not guaranteed whole. A short or failed write is an error; nothing more
+  is written.
+- Every price day (a price's announced change, a rolling alias's window) is the UTC day, like the tariff hour.
+- DeepSeek's peak hours are read in UTC whatever the offset of a time handed to the pricing.
+
+### Fixed
+
+- A usage-log line whose `at` is `true` or `false` is a counted skip, no longer a time in 1970.
+
+### Development only
+
+- The command's code is split by responsibility, moved unchanged: the doctor, the budget monitor, the scheduled jobs,
+  the report header's warnings and the report assembly each have a module of their own.
+
 ## [2.11.2] - 2026-11-15
 
 ### Changed

@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from .. import cli, ops
+from .. import cli, ops, schedules
 from .. import daily as daily_module
+from .. import doctor as doctor_module
 from ..collectors.github_bill import BillResult
 from ..collectors.grok_build import TICKS_PER_USD
 from ..config import Config, GithubSettings, Paths, PriceBook
@@ -29,15 +30,8 @@ from ..daily import (
 )
 from ..errors import ToolError, UsageError
 from ..models import BillAccount, BillScope, BillSummary, Tokens
-from ..ops import (
-    DAILY_CADENCE,
-    DAILY_JOB,
-    PRICES_JOB,
-    Cadence,
-    ReportRequest,
-    cron_has_entry,
-    cron_without_entry,
-)
+from ..onboarding import Mark
+from ..ops import ReportRequest
 from ..plugins import Loaded, Plugin
 from ..reconcile import (
     Reported,
@@ -48,6 +42,7 @@ from ..reconcile import (
     reconcile,
     run_reconcile,
 )
+from ..schedules import DAILY_CADENCE, DAILY_JOB, PRICES_JOB, Cadence, cron_has_entry, cron_without_entry
 from ..timeutil import iso
 from .fixtures import BASE, GROK_TICKS, defaults, paths_in, write_grok
 from .test_estimates import CELL, FOUND, Guessing
@@ -237,9 +232,9 @@ def test_a_project_whose_files_cannot_be_written_is_a_failure_and_exit_1(tmp_pat
     assert len(index.failures) == 1 and "cannot write" in index.failures[0] and len(index.projects) == 1
     assert any(line.startswith(f"daily {DAY}: FAIL ") for line in lines), "said, not a silent note"
     doctor_lines: list[str] = []
-    with mock.patch.object(ops, "schedule_installed", return_value=True):
+    with mock.patch.object(doctor_module, "schedule_installed", return_value=True):
         assert (
-            ops.doctor(paths, config, book, doctor_lines.append) == 1
+            doctor_module.doctor(paths, config, book, doctor_lines.append) == 1
         ), "a failed project is a red doctor line"
     assert any("!!  daily reports: last" in line and "1 project(s) FAILED" in line for line in doctor_lines)
 
@@ -264,11 +259,11 @@ def test_a_project_whose_rows_are_all_unpriced_says_so(tmp_path: Path) -> None:
 def test_removing_an_absent_cron_job_says_not_installed_and_rewrites_nothing() -> None:
     lines: list[str] = []
     with (
-        mock.patch.object(ops, "is_macos", return_value=False),
-        mock.patch.object(ops, "_crontab", return_value="0 0 * * * backup\n"),
-        mock.patch.object(ops, "_crontab_write") as write,
+        mock.patch.object(schedules, "is_macos", return_value=False),
+        mock.patch.object(schedules, "_crontab", return_value="0 0 * * * backup\n"),
+        mock.patch.object(schedules, "_crontab_write") as write,
     ):
-        assert ops.remove_job(DAILY_JOB, lines.append) == 0
+        assert schedules.remove_job(DAILY_JOB, lines.append) == 0
     assert lines == ["not installed"] and not write.called
 
 
@@ -277,42 +272,44 @@ def test_the_doctor_shows_the_last_daily_run_and_flags_a_torn_index(tmp_path: Pa
     config, book = defaults(paths)
     _transcript(paths, tmp_path / "proj", "p1", str(tmp_path / "proj"))
     lines: list[str] = []
-    with mock.patch.object(ops, "schedule_installed", return_value=False):
-        ops.doctor(paths, config, book, lines.append)
+    with mock.patch.object(doctor_module, "schedule_installed", return_value=False):
+        doctor_module.doctor(paths, config, book, lines.append)
     assert any("daily reports: none yet" in line for line in lines)
     assert any("scheduled daily reports: not installed" in line for line in lines)
     assert any("last reconcile: never" in line for line in lines)
     daily_reports(paths, config, book, DAY, paths.reports_dir, Output(lambda _: None, lambda _: None))
     lines.clear()
-    with mock.patch.object(ops, "schedule_installed", return_value=True):
-        ops.doctor(paths, config, book, lines.append)
+    with mock.patch.object(doctor_module, "schedule_installed", return_value=True):
+        doctor_module.doctor(paths, config, book, lines.append)
     assert any(f"ok  daily reports: last {DAY} (1 project(s))" in line for line in lines), lines
     (paths.reports_dir / "2026-12-31").mkdir()
     (paths.reports_dir / "2026-12-31" / "index.json").write_text("[]")
     lines.clear()
-    with mock.patch.object(ops, "schedule_installed", return_value=True):
-        code = ops.doctor(paths, config, book, lines.append)
+    with mock.patch.object(doctor_module, "schedule_installed", return_value=True):
+        code = doctor_module.doctor(paths, config, book, lines.append)
     assert code == 1 and any("!!  daily reports:" in line for line in lines), lines
 
 
 def test_the_daily_job_has_its_own_cron_tag_and_calendar_plist(tmp_path: Path) -> None:
-    daily = ops.job_cron_line(DAILY_JOB, DAILY_CADENCE, ["ai-cost", *DAILY_JOB.argv_tail], tmp_path / "log")
-    prices = ops.cron_line(3, ["ai-cost", *PRICES_JOB.argv_tail], tmp_path / "log")
+    daily = schedules.job_cron_line(
+        DAILY_JOB, DAILY_CADENCE, ["ai-cost", *DAILY_JOB.argv_tail], tmp_path / "log"
+    )
+    prices = schedules.cron_line(3, ["ai-cost", *PRICES_JOB.argv_tail], tmp_path / "log")
     assert daily.startswith("40 6 * * * ai-cost daily >> ") and daily.endswith("# ai-cost:daily-report")
     crontab = "0 0 * * * backup\n" + prices + "\n" + daily + "\n"
     assert cron_has_entry(crontab, DAILY_JOB) and cron_has_entry(crontab)
     assert cron_without_entry(crontab, DAILY_JOB) == ["0 0 * * * backup", prices], "only the daily line goes"
     assert cron_without_entry(crontab) == ["0 0 * * * backup", daily], "only the price-check line goes"
-    plist = ops._plist(DAILY_JOB, Cadence(hour=7, minute=5), ["ai-cost", "daily"], tmp_path / "log")
+    plist = schedules._plist(DAILY_JOB, Cadence(hour=7, minute=5), ["ai-cost", "daily"], tmp_path / "log")
     assert "<key>Label</key><string>ai-cost.daily-report</string>" in plist
     assert "<key>StartCalendarInterval</key><dict><key>Hour</key><integer>7</integer>" in plist
     assert "<key>Minute</key><integer>5</integer></dict>" in plist and "StartInterval" not in plist
-    assert "<key>StartInterval</key><integer>259200</integer>" in ops._plist(
+    assert "<key>StartInterval</key><integer>259200</integer>" in schedules._plist(
         PRICES_JOB, Cadence(days=3), ["ai-cost"], tmp_path / "log"
     )
     assert (
-        ops.describe_cadence(DAILY_CADENCE) == "daily at 06:40"
-        and ops.describe_cadence(Cadence(days=2)) == "every 2 day(s)"
+        schedules.describe_cadence(DAILY_CADENCE) == "daily at 06:40"
+        and schedules.describe_cadence(Cadence(days=2)) == "every 2 day(s)"
     )
 
 
@@ -324,17 +321,21 @@ def test_install_and_remove_the_daily_job_on_macos(tmp_path: Path) -> None:
     lines: list[str] = []
     with (
         mock.patch.object(Path, "home", return_value=tmp_path),
-        mock.patch.object(ops, "is_macos", return_value=True),
+        mock.patch.object(schedules, "is_macos", return_value=True),
         mock.patch("subprocess.run", return_value=loaded),
     ):
-        assert ops.install_job(paths, DAILY_JOB, DAILY_CADENCE, ["ai-cost"], lines.append) == 0
+        assert schedules.install_job(paths, DAILY_JOB, DAILY_CADENCE, ["ai-cost"], lines.append) == 0
         agent = tmp_path / "Library" / "LaunchAgents" / "ai-cost.daily-report.plist"
-        assert agent.exists() and ops.schedule_installed(DAILY_JOB) and not ops.schedule_installed(PRICES_JOB)
+        assert (
+            agent.exists()
+            and schedules.schedule_installed(DAILY_JOB)
+            and not schedules.schedule_installed(PRICES_JOB)
+        )
         assert "<string>daily</string>" in agent.read_text() and any(
             "daily at 06:40" in line for line in lines
         )
-        assert ops.remove_job(DAILY_JOB, lines.append) == 0 and not agent.exists()
-        assert ops.remove_job(DAILY_JOB, lines.append) == 0 and lines[-1] == "not installed"
+        assert schedules.remove_job(DAILY_JOB, lines.append) == 0 and not agent.exists()
+        assert schedules.remove_job(DAILY_JOB, lines.append) == 0 and lines[-1] == "not installed"
 
 
 def test_the_install_flags_for_the_daily_job_and_their_usage_errors(tmp_path: Path) -> None:
@@ -456,8 +457,8 @@ def test_run_reconcile_keeps_a_history_the_doctor_reads_and_flags_when_torn(tmp_
     else:
         raise AssertionError("a torn last line is a ToolError, never a silent None")
     doctor_lines: list[str] = []
-    with mock.patch.object(ops, "schedule_installed", return_value=False):
-        assert ops.doctor(paths, config, book, doctor_lines.append) == 1
+    with mock.patch.object(doctor_module, "schedule_installed", return_value=False):
+        assert doctor_module.doctor(paths, config, book, doctor_lines.append) == 1
     assert any("!!  last reconcile:" in line for line in doctor_lines)
 
 
@@ -606,37 +607,33 @@ def test_a_failed_reread_keeps_the_day_as_written_and_tries_again_next_run(tmp_p
 
 
 def test_a_scheduled_job_carries_the_installing_shells_path(tmp_path: Path) -> None:
-    line = ops.job_cron_line(
+    line = schedules.job_cron_line(
         DAILY_JOB, DAILY_CADENCE, ["ai-cost", "daily"], tmp_path / "log", "/opt/homebrew/bin:/usr/bin"
     )
     assert " PATH=/opt/homebrew/bin:/usr/bin ai-cost daily >> " in line
-    plist = ops._plist(
+    plist = schedules._plist(
         DAILY_JOB, DAILY_CADENCE, ["ai-cost", "daily"], tmp_path / "log", "/opt/homebrew/bin:/usr/bin"
     )
     assert (
         "<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin</string></dict>"
         in plist
     )
-    assert "EnvironmentVariables" not in ops._plist(DAILY_JOB, DAILY_CADENCE, ["ai-cost"], tmp_path / "log")
+    assert "EnvironmentVariables" not in schedules._plist(
+        DAILY_JOB, DAILY_CADENCE, ["ai-cost"], tmp_path / "log"
+    )
 
 
 def test_doctor_flags_a_daily_job_that_cannot_find_gh_for_the_usage_report(tmp_path: Path) -> None:
-    lines: list[str] = []
-    problems: list[str] = []
-
-    def line(good: bool, text: str) -> None:
-        (lines if good else problems).append(text)
-
     with (
-        mock.patch.object(ops, "schedule_installed", return_value=True),
-        mock.patch.object(ops, "job_has_path", return_value=False),
+        mock.patch.object(doctor_module, "schedule_installed", return_value=True),
+        mock.patch.object(doctor_module, "job_has_path", return_value=False),
     ):
-        ops._doctor_daily_job(line, lines.append, bill=True)
-        ops._doctor_daily_job(line, lines.append, bill=False)
-    assert len(problems) == 1 and "installed without a PATH" in problems[0]
-    assert lines == [
-        "  ok  scheduled daily reports: installed"
-    ], "without a usage report the PATH does not matter"
+        with_bill, without = doctor_module._daily_job_check(True), doctor_module._daily_job_check(False)
+    assert with_bill.mark is Mark.PROBLEM and "installed without a PATH" in with_bill.text
+    assert (without.mark, without.text) == (
+        Mark.OK,
+        "scheduled daily reports: installed",
+    ), "without a usage report the PATH does not matter"
 
 
 def test_a_project_with_only_the_usage_reports_seat_is_no_project_of_the_day(tmp_path: Path) -> None:

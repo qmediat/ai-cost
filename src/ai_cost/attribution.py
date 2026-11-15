@@ -6,8 +6,9 @@ or ``unattributed`` (none), and both are always reported with the keys they abso
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .config import Config, PriceBook
@@ -90,7 +91,11 @@ def _context_usd(rows: Sequence[UsageRow], book: PriceBook) -> float:
 
 
 def _subscription_split(
-    labelled: dict[str, list[UsageRow]], book: PriceBook, config: Config, window: Window
+    labelled: dict[str, list[UsageRow]],
+    book: PriceBook,
+    config: Config,
+    window: Window,
+    rest: str = UNATTRIBUTED,
 ) -> dict[str, float]:
     """Split each plan's window share between the labels.
 
@@ -113,7 +118,7 @@ def _subscription_split(
         weights = {label: usd.get(share.provider, 0.0) for label, usd in by_label_provider.items()}
         total = sum(weights.values())
         if total <= 0:
-            out[UNATTRIBUTED] += share.usd
+            out[rest] += share.usd
             continue
         for label, weight in weights.items():
             out[label] += share.usd * weight / total
@@ -178,12 +183,59 @@ def attribution_group(
     rows: Sequence[UsageRow], rules: Sequence[Rule], book: PriceBook, config: Config, window: Window
 ) -> AttributionGroup:
     """One line per label (rules, then ``mixed``, then ``unattributed``); the lines sum to the api/real totals."""
-    labelled: dict[str, list[UsageRow]] = {rule.label: [] for rule in rules}
-    labelled[MIXED] = []
-    labelled[UNATTRIBUTED] = []
+    seeds = (*(rule.label for rule in rules), MIXED, UNATTRIBUTED)
+    labelled = _labelled(rows, seeds, lambda row: label_for(row.scope, rules))
+    return _group(labelled, _Split(POLICY, UNATTRIBUTED), book, config, window)
+
+
+def label_group(
+    rows: Sequence[UsageRow], name: str, book: PriceBook, config: Config, window: Window
+) -> AttributionGroup:
+    """One line per value of the app's label ``name`` (sorted), then ``(no <name>)`` for the rows without it.
+
+    Rows are grouped by their raw value, the rows without the label under their own marker (``None``); only the
+    lines' names are text: a value that starts with ``"`` or ``(`` is shown JSON-quoted, so no two groups read alike.
+    """
+    missing = f"(no {name})"
+    grouped: dict[str | None, list[UsageRow]] = {None: []}
     for row in rows:
-        labelled[label_for(row.scope, rules)].append(row)
-    subscriptions = _subscription_split(labelled, book, config, window)
+        grouped.setdefault(row.labels.get(name), []).append(row)
+    values = sorted(value for value in grouped if value is not None)
+    labelled = {_shown(value): grouped[value] for value in values}
+    labelled[missing] = grouped[None]
+    policy = f"a row is attributed whole to the value of its label {name!r}; a row without it is {missing}"
+    return _group(labelled, _Split(policy, missing, f"by the label {name}"), book, config, window)
+
+
+def _shown(value: str) -> str:
+    """A label value as a line's name: as it is, JSON-quoted when it could be read as a marker or a quoted value."""
+    return json.dumps(value, ensure_ascii=False) if value[:1] in ('"', "(") else value
+
+
+def _labelled(
+    rows: Sequence[UsageRow], seeds: Sequence[str], label_of: Callable[[UsageRow], str]
+) -> dict[str, list[UsageRow]]:
+    """Every row under its one label, the seeded labels first and present even when empty."""
+    labelled: dict[str, list[UsageRow]] = {label: [] for label in seeds}
+    for row in rows:
+        labelled[label_of(row)].append(row)
+    return labelled
+
+
+@dataclass(frozen=True)
+class _Split:
+    """How a group divides the rows: its policy text, the line a plan share nobody's rows weigh lands on, its heading."""
+
+    policy: str
+    rest: str
+    heading: str = ""  # "" = the group's default heading
+
+
+def _group(
+    labelled: dict[str, list[UsageRow]], split: _Split, book: PriceBook, config: Config, window: Window
+) -> AttributionGroup:
+    """The lines of every label; a plan share nobody's rows weigh lands whole on ``split.rest``."""
+    subscriptions = _subscription_split(labelled, book, config, window, split.rest)
     lines = []
     for label, subset in labelled.items():
         api = api_group(subset, book, config)
@@ -201,4 +253,6 @@ def attribution_group(
                 models=_models(subset, api, book, config, window),
             )
         )
-    return AttributionGroup(policy=POLICY, lines=lines)
+    if not split.heading:
+        return AttributionGroup(policy=split.policy, lines=lines)
+    return AttributionGroup(policy=split.policy, lines=lines, heading=split.heading)

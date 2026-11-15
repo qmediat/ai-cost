@@ -860,3 +860,38 @@ def test_the_reader_folds_native_deepseek_counters_of_a_tiers_priced_model_like_
     assert [s.reason for s in collected.skipped] == [
         "line 2: cache_hit/cache_miss and input/cached_input are two spellings of the same usage: give one"
     ], [s.reason for s in collected.skipped]
+
+
+def test_a_lines_labels_reach_the_row(tmp_path: Path) -> None:
+    log = _write(tmp_path / "usage.jsonl", [_line(tokens={"input": 1}, labels={"tenant": "acme"})])
+    collected, warnings = collect_usage_log([log], WINDOW)
+    assert [row.labels for row in collected.rows] == [{"tenant": "acme"}] and warnings == []
+
+
+def test_a_labels_key_of_another_shape_keeps_the_usage_and_is_counted_once(tmp_path: Path) -> None:
+    shapes = (["a", "b"], {"app.kubernetes.io/name": "x"}, {"tenant": 7}, {"tenant": "a"}, "prod")
+    log = _write(
+        tmp_path / "usage.jsonl",
+        [_line(tokens={"input": 1}, ref=f"r{n}", labels=shape) for n, shape in enumerate(shapes)],
+    )
+    collected, warnings = collect_usage_log([log], WINDOW)
+    assert len(collected.rows) == 5 and collected.skipped == [], collected.skipped
+    assert [row.labels for row in collected.rows] == [{}, {}, {}, {"tenant": "a"}, {}]
+    assert warnings == [
+        f"{log}: 4 line(s) carry a `labels` key the reader does not use: usage counted, labels ignored"
+    ], warnings
+
+
+def test_a_repeated_event_that_only_lends_its_stamp_is_not_counted_twice(tmp_path: Path) -> None:
+    log = _write(
+        tmp_path / "usage.jsonl",
+        [
+            _line(tokens={"input": 1}, event_id="e-1", labels=["x"]),
+            _line(tokens={"input": 1}, event_id="e-1", labels=["x"], origin_session="sess-1"),
+        ],
+    )
+    collected, warnings = collect_usage_log([log], WINDOW)
+    assert len(collected.rows) == 1 and collected.rows[0].origin_session == "sess-1"
+    assert warnings == [
+        f"{log}: 1 line(s) carry a `labels` key the reader does not use: usage counted, labels ignored"
+    ], warnings

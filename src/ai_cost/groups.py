@@ -196,6 +196,9 @@ class AttributionGroup:
 
     policy: str
     lines: Sequence[AttributionLine]
+    heading: str = (
+        "by branch / workspace / PR, then by the paths a turn touched"  # what the lines are split by
+    )
 
     @property
     def total_api_usd(self) -> float:
@@ -232,6 +235,9 @@ class Report:
     ] = ()  # one row per model: tokens, how it was paid and on what evidence, list price
     selection: SessionSelection | None = None  # a session report: what it kept and what it left out
     estimates: Estimates | None = None  # amounts that are no cost, apart from every group (ADR-0010)
+    where: Mapping[str, str] = field(
+        default_factory=dict
+    )  # a label filter: its rows, their cash, no plan share
 
     @property
     def window_hours(self) -> float:

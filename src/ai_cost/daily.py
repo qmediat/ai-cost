@@ -24,7 +24,8 @@ from .config import Config, Paths, PriceBook
 from .errors import ToolError
 from .groups import Report, SubscriptionShare, is_seat
 from .models import ProviderSummary, Window
-from .ops import Emit, ReportRequest, bill_unreadable, build_report, ensure_dir
+from .ops import ReportRequest, bill_unreadable, build_report
+from .output import Emit, ensure_dir
 from .remainder import NOT_CLOSED
 from .render import plain, render_json, render_markdown
 from .timeutil import iso, now

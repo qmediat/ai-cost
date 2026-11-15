@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime
@@ -23,6 +24,7 @@ from .models import Provider
 from .origin import Origin
 from .timeutil import iso, now
 from .values import count, money
+from .values import labels as labels_of
 
 SCHEMA = 1
 
@@ -183,6 +185,7 @@ class Attribution:
     origin_repo: str = ""
     origin_pr: int | None = None
     run_id: str = ""
+    labels: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """The keys as the reader will read them: tags a sequence of strings (never one string), billing known."""
@@ -200,6 +203,7 @@ class Attribution:
                 raise ValueError(f"{key} must be a string, got {type(getattr(self, key)).__name__}")
         _ = self.origin  # the origin keys by the reader's own validator: a malformed one is its ValueError
         object.__setattr__(self, "tags", listed)
+        object.__setattr__(self, "labels", labels_of(self.labels))  # the reader's own label rule
 
     @property
     def origin(self) -> Origin:
@@ -233,6 +237,8 @@ def entry(usage: Usage, at: datetime | None = None, meta: Attribution | None = N
     line.update(meta.origin.line_keys())
     if meta.tags:
         line["tags"] = list(meta.tags)
+    if meta.labels:
+        line["labels"] = dict(meta.labels)
     return line
 
 
@@ -241,11 +247,111 @@ def default_path(environ: Mapping[str, str] | None = None, home: Path | None = N
     return usage_log_path(os.environ if environ is None else environ, home or Path.home())
 
 
-def append(path: Path, line: Mapping[str, Any]) -> None:
-    """Append one line; the directory is created, the write is a single call (atomic for one short line on POSIX)."""
+# one write of at most this many bytes to an O_APPEND file on a local POSIX filesystem is never interleaved
+MAX_LINE_BYTES = 4096
+
+
+def encoded(line: Mapping[str, Any], limit: int | None = None) -> bytes:
+    """The line as written: UTF-8 JSON and a newline.
+
+    With a ``limit`` the line must leave one byte for the newline that precedes it after a torn tail, so whether a
+    line is accepted never depends on the state of the file: ``limit`` bytes or more is a ``ValueError``.
+    """
+    data = (json.dumps(line, ensure_ascii=False) + "\n").encode("utf-8")
+    if limit is not None and len(data) >= limit:
+        raise ValueError(
+            f"the line is {len(data)} bytes; with the newline that may precede it that is more than {limit}: "
+            "one write could not keep it whole"
+        )
+    return data
+
+
+def append(path: Path, line: Mapping[str, Any], limit: int | None = None) -> None:
+    """Append one line in ONE ``write`` through an ``O_APPEND`` descriptor, starting on a line of its own.
+
+    The writer protects itself from a torn tail another writer left: when the file does not end with a newline, the
+    line goes out after a newline, in the same write (two writers that both see the tail leave one blank line, which
+    the reader ignores). Named limits: a tear made by another writer between this check and this write still glues,
+    and a log that cannot be read (opening it for reading is refused, or it is no regular file: a pipe) is appended to
+    without the check. The descriptor written to is write-only, so a pipe waits for its reader as it always did; a
+    log rotated between the open and the check is opened again. A line of at most ``MAX_LINE_BYTES`` written in one ``write`` is never interleaved with another
+    writer's; ``ai-cost log`` and ``record()`` pass no ``limit`` (a longer line is written, not guaranteed whole); a
+    caller that passes ``MAX_LINE_BYTES`` as the limit has it count the bytes written, the newline that may precede
+    the line included whatever the file's tail is: a longer line is a ``ValueError`` before anything is written. A short or failed write raises
+    ``OSError``; nothing more is written.
+    """
+    data = encoded(line, limit)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+    descriptor, clean = _open_checked(path)
+    try:
+        payload = (b"" if clean else b"\n") + data
+        written = _write(path, descriptor, payload)
+    finally:
+        os.close(descriptor)
+    if written != len(payload):
+        raise OSError(f"{path}: short write, {written} of {len(payload)} bytes — {_FRAGMENT}")
+
+
+_FRAGMENT = "a fragment may be left; the next line starts on a new line"
+
+
+def _write(path: Path, descriptor: int, payload: bytes) -> int:
+    """One ``write``; its failure says a fragment may be left (a failed tail check never says so: it wrote nothing)."""
+    try:
+        return os.write(descriptor, payload)
+    except OSError as exc:
+        raise OSError(f"{path}: the write failed ({exc}) — {_FRAGMENT}") from exc
+
+
+_REOPENS = 3  # a path replaced between the two opens (a rotation) is opened again; after these, no check
+
+
+def _open_checked(path: Path) -> tuple[int, bool]:
+    """The write-only ``O_APPEND`` descriptor of the file the path names, and whether a line may start at once.
+
+    The descriptor is write-only, so a pipe keeps waiting for its reader. When the path names another file by the
+    time its tail is read (the log was rotated between the two opens), the new file is opened instead.
+    """
+    for _ in range(_REOPENS):
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+        try:
+            clean = _ends_a_line(path, descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        if clean is not None:
+            return descriptor, clean
+        os.close(descriptor)
+    return os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666), True
+
+
+def _ends_a_line(path: Path, descriptor: int) -> bool | None:
+    """True: the file is empty, ends with a newline, or cannot be checked; None: the path names another file now.
+
+    The last byte is read through a second, read-only descriptor, only for a regular file. That open never waits: a
+    pipe put under the path meanwhile opens at once and is another file. Without ``os.pread`` there is no check.
+    """
+    target = os.fstat(descriptor)
+    if not stat.S_ISREG(target.st_mode) or target.st_size == 0 or not hasattr(os, "pread"):
+        return True
+    try:
+        reader = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:  # a log this writer may append to but not read: no check
+        return True
+    try:
+        return _tail_ends_a_line(reader, target)
+    except OSError:  # the last byte cannot be read: no check, nothing was written
+        return True
+    finally:
+        os.close(reader)
+
+
+def _tail_ends_a_line(reader: int, target: os.stat_result) -> bool | None:
+    """Whether the file behind ``reader`` is empty or ends with a newline; None when it is not ``target``."""
+    seen = os.fstat(reader)
+    if (seen.st_dev, seen.st_ino) != (target.st_dev, target.st_ino):
+        return None
+    return seen.st_size == 0 or os.pread(reader, 1, seen.st_size - 1) == b"\n"
 
 
 from .collectors.usage_log import (  # noqa: E402 — the reader's counter set, one definition
