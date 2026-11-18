@@ -58,6 +58,7 @@ from .prices_check import (
     ModelCheck,
     apply_check,
     check_prices,
+    check_provider_names,
     exit_code,
     merged_registry_json,
     save_result,
@@ -550,17 +551,34 @@ def _emit_unlisted(result: CheckResult) -> None:
         )
 
 
+def _emit_kept(saved: CheckResult) -> None:
+    """One closing line per vendor whose page could not be read: its saved entry stays, and says when it was read."""
+    for name, prov in saved.providers.items():
+        if prov.kept():
+            emit(f"{name}: its page could not be read; its saved entry ({prov.read_when()}) is kept")
+
+
+def _emit_limited(result: CheckResult) -> None:
+    """The closing line of a `prices check --providers` that left vendors out: the saved check time stays."""
+    if result.limited:
+        emit(
+            "\nOnly the vendors named by --providers were read: the others keep their saved entries, and the next scheduled check counts from the last check of every vendor."
+        )
+
+
 def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
     """Show / check / update."""
     if args.action == "show":
         return _show_prices(args, paths)
     _refuse_offline(paths, "price check")
     book = load_pricebook(paths)
-    providers = [p.strip() for p in args.providers.split(",")] if args.providers else None
+    names = [name.strip() for name in args.providers.split(",")] if args.providers else []
+    providers = [name for name in names if name] or None
+    check_provider_names(book, providers)
     try:
         result = check_prices(book, providers)
         applied = apply_check(result, book, paths.user_prices_file()) if args.action == "update" else []
-        save_result(paths, result)
+        saved = save_result(paths, result)
     finally:  # a check that raised (a price-book key that is no regex) must not hold the next one off
         with contextlib.suppress(OSError):  # never the error that hides the check's own
             (paths.state_dir / "prices-check.lock").unlink(missing_ok=True)
@@ -582,6 +600,8 @@ def cmd_prices(args: argparse.Namespace, paths: Paths) -> int:
         emit(f"applied {provider}/{model} → input {new_in} output {new_out} ({paths.user_prices_file()})")
     code = exit_code(unresolved)
     _emit_unlisted(result)
+    _emit_limited(result)
+    _emit_kept(saved)
     if code:
         emit(
             f"\n{unresolved} suspected change(s) not applied. Verify on the vendor page, then `ai-cost prices update` or edit {paths.user_prices_file()}."

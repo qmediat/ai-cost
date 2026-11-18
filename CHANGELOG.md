@@ -5,6 +5,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.12.1] - 2026-11-18
+
+### Fixed
+
+- `ai-cost prices check` reads a vendor's answer whole or not at all, and a vendor it could not read loses nothing it
+  knew. A page cut off mid-read — a chunked body that ended early, or one shorter than its declared `Content-Length`,
+  which was read as the whole page — is `fetch-failed IncompleteRead`, never a traceback that stopped the check (the
+  scheduled job exited 1). The markdown twin (`<url>.md`) counts as absent only when the vendor answers 404 or 410;
+  any other failure of the twin is `fetch-failed twin …`, where it used to read as "no twin" and gave false `changed?`
+  and not-found lines. The saved check keeps an unread vendor's previous models, new ids and drift, its status naming
+  the failed read and when the kept entry was read (`read_at` in `prices-check.json`), so reports go on saying the
+  drift; the vendor is read again at the next due check. `prices check --providers a,b` keeps every other vendor as
+  saved, where it erased them and their drift, and no longer moves the saved check time the next scheduled check
+  counts from: only a check of every vendor does — nor does `prices update` write its `checked_at` into the user
+  prices file then (the run says so in its last line; `doctor` says there is no check of every vendor yet and names
+  the newest read, and names every kept entry with the time it was read). A kept vendor is named by one closing line
+  of the run. A page longer than the 2 000 000 bytes the check reads is `fetch-failed PageTooLarge`, never a page
+  read up to its cap and matched as whole; an unknown `--providers` name is a usage error (exit 2). The xAI and
+  Alibaba bill readers use the same body reader and the same list of failures; an Alibaba error body cut off costs
+  that one day, not the days already read.
+- `ai-cost prices check` reads a table that names its models in its header row by its columns: each model's prices
+  are the cells under its own name. DeepSeek's pricing page is such a table (one row per price, one cell per model):
+  `deepseek-flash` read the Search API's $0.75 from the next section as its price (`changed?`), and `deepseek-v4-pro`
+  was `confirmed` only because its reading took both models' prices. Both are now confirmed by their own six prices,
+  from the markdown twin and from the page alone — an HTML table reaches the matcher as the same markdown table, a
+  cell spanning columns repeated in each as the twin writes it, a cell spanning rows holding its place. The per-vendor
+  "page in columns" rule that read 900 characters after a DeepSeek name is gone: no vendor's other result changed
+  (every vendor's page measured before and after).
+- The column reading reads what a table shows: a header cell's link text, an html tag and a footnote mark
+  (`deepseek-flash<sup>1</sup>`) are read as the name; a caption row above the row that names the models is not the
+  header; a table's rows are its lines, so a short row keeps its empty cells instead of ending the table; an HTML
+  cell's `&#124;` stays in its cell; a column takes its place in the page as a row does — an earlier table no longer
+  decides over an earlier row; and a column with no amount in a pricing table is `not-found`, never the figures of the
+  rows around it (a table with no amount at all, such as a features table, decides nothing). An HTML table inside a
+  markdown twin — its spans in any spelling, `rowSpan={2}` included — and one inside a layout table are read as the
+  page's own table.
+- `ai-cost selftest` hands each test's `tmp_path` out resolved, as pytest does: on macOS the temp root sits
+  under a symlink, and a test comparing a resolved path saw the unresolved one only in the selftest.
+
 ## [2.12.0] - 2026-11-16
 
 ### Added

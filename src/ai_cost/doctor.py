@@ -270,10 +270,14 @@ def _doctor_state(
 def _price_check_state(paths: Paths, book: PriceBook | None) -> list[Check]:
     """The last price check and what it found that the price book does not show."""
     last = load_result(paths)
-    checks = [
-        _present(
-            bool(last), f"last price check: {last.checked_at if last else 'never'} ({state_file(paths)})"
+    checks = [_last_check_line(last, paths)]
+    checks += [
+        Check(
+            Mark.INFO,
+            f"{name}: its page could not be read when last asked; its entry {prov.read_when()} is kept",
         )
+        for name, prov in (last.providers.items() if last else ())
+        if prov.kept()
     ]
     checks += [
         Check(
@@ -291,6 +295,20 @@ def _price_check_state(paths: Paths, book: PriceBook | None) -> list[Check]:
         for provider, model in _unlisted(last, book)
     ]
     return checks
+
+
+def _last_check_line(last: CheckResult | None, paths: Paths) -> Check:
+    """OK only when a check of every vendor was saved; one limited by --providers names its newest read instead."""
+    where = state_file(paths)
+    if last and last.checked_at:
+        return _present(True, f"last price check of every vendor: {last.checked_at} ({where})")
+    newest = max((prov.read_at for prov in last.providers.values()), default="") if last else ""
+    if newest:
+        return _present(
+            False,
+            f"no check of every vendor yet: only vendors named by --providers were read, the newest at {newest} ({where})",
+        )
+    return _present(False, f"last price check of every vendor: never ({where})")
 
 
 def _unlisted(last: CheckResult | None, book: PriceBook | None) -> list[tuple[str, str]]:

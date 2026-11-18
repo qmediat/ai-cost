@@ -1,6 +1,6 @@
 """The shipped tests without pytest: every ``test_*`` function of every ``ai_cost.tests.test_*`` module, one line each.
 
-The only fixture the runner provides is ``tmp_path`` (a temporary directory per test); ``unsupported_fixtures`` names a
+The only fixture the runner provides is ``tmp_path`` (a temporary directory per test, resolved as pytest gives it); ``unsupported_fixtures`` names a
 test that asks for another one, which pytest would provide in CI and this runner cannot.
 """
 
@@ -90,7 +90,8 @@ def _call(check: Callable[..., None]) -> None:
             f"asks for {', '.join(missing)}, which the selftest does not provide ({', '.join(FIXTURES)} only)"
         )
     with ExitStack() as stack:
-        check(**{name: Path(stack.enter_context(FIXTURES[name]())) for name in asked})
+        # resolved, as pytest hands tmp_path out: macOS lists its temp root under a symlink
+        check(**{name: Path(stack.enter_context(FIXTURES[name]())).resolve() for name in asked})
 
 
 def _run_module(package: ModuleType, module_name: str, emit: Emit, verbose: bool) -> tuple[int, int]:

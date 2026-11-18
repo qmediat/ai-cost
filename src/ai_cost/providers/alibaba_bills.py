@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import http.client
 import json
 import secrets
 import urllib.error
@@ -24,6 +23,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..models import Provider, ProviderDay, ProviderDays, ProviderLine, Span, Window
+from ..netread import ANSWER_ERRORS, TRANSPORT_ERRORS, read_body
 from .common import day_interval, days_touched, exact_amount, holds_a_whole_day, key_problem, not_read, redact
 
 SOURCE = "bss-api"
@@ -107,7 +107,7 @@ def send(url: str, headers: Mapping[str, str]) -> str:
     """One signed POST; the answer's text, or the ``urllib`` error."""
     request = urllib.request.Request(url, data=b"", method="POST", headers=dict(headers))
     with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
-        return str(response.read().decode("utf-8"))
+        return str(read_body(response).decode("utf-8"))
 
 
 def bill_days(window: Window) -> list[date]:
@@ -230,7 +230,7 @@ def _one_day(request: AlibabaRequest, day: date, sender: Send) -> ProviderDay | 
         return provider_day(day, day_items(request, day, sender), request)
     except urllib.error.HTTPError as exc:
         reason = f"HTTP {exc.code} from BSS: {_refusal(exc)}"
-    except (urllib.error.URLError, OSError, http.client.HTTPException, UnicodeDecodeError) as exc:
+    except ANSWER_ERRORS as exc:  # the answer unreadable, or not UTF-8
         reason = f"BSS could not be read ({exc.__class__.__name__}: {exc})"
     except BillShapeError as exc:
         reason = f"the bill answer is not the documented shape: {exc}"
@@ -253,8 +253,8 @@ HINTS = {  # what an Alibaba error code means for the person who set the keys (t
 def _refusal(exc: urllib.error.HTTPError) -> str:
     """The error code of Alibaba's answer body, and what it means; the body is read, never a header."""
     try:
-        code = _code_of(json.loads(exc.read().decode("utf-8", "replace")))
-    except (ValueError, OSError):
+        code = _code_of(json.loads(read_body(exc).decode("utf-8", "replace")))
+    except (*TRANSPORT_ERRORS, ValueError):
         code = "no readable error body"
     return f"{code} — {HINTS.get(code, 'read again next time')}"
 

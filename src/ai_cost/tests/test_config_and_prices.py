@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import email
+import http.client
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import date, datetime, timezone
 from functools import partial
+from importlib import resources
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -49,7 +51,6 @@ from ..prices_check import (
     load_result,
     match_model,
     name_variants,
-    numbers_near,
     page_rows,
     page_text,
     save_result,
@@ -159,12 +160,6 @@ def test_user_defined_peak_model_parses(tmp_path: Path) -> None:
     }
     merged = parse_pricebook(book.raw, over, "user.json")
     assert isinstance(merged.entry(Provider.DEEPSEEK, "deepseek-v5-lite", None), PeakOffpeakPrice)
-
-
-def test_price_parser_finds_amounts_after_the_model_name() -> None:
-    page = "<html><body><h1>Pricing</h1><table><tr><td>claude-fable-5-1</td><td>$10 / MTok</td><td>$12.50</td><td>$20</td><td>$0.25</td><td>$50 / MTok</td></tr></table></body></html>"
-    assert numbers_near(page_text(page), "claude-fable-5-1") == [10.0, 12.5, 20.0, 0.25, 50.0]
-    assert numbers_near(page_text(page), "gpt-9") is None
 
 
 def test_display_name_variants_per_provider(tmp_path: Path) -> None:
@@ -815,6 +810,37 @@ def test_auto_check_reports_saved_drift_and_spawns_once_when_due(tmp_path: Path)
     _, started_again = auto_check(paths, book, spawn=spawn)
     assert drift == [("openai", "gpt-6-astra")] and started and not started_again and len(spawned) == 1
     assert spawned[0][-3:] == ["prices", "check", "--quiet"]
+
+
+def test_a_vendor_the_check_did_not_read_keeps_its_saved_drift(tmp_path: Path) -> None:
+    """A failed read, or a vendor left out by --providers, is a missing observation: its saved drift survives."""
+    paths = paths_in(tmp_path)
+    _, book = defaults(paths)
+    changed = {"gpt-6-astra": ModelCheck(CheckStatus.CHANGED, [10, 50], [12.0, 60.0])}
+    other = {"claude-fable-5": ModelCheck(CheckStatus.CHANGED, [3, 15], [4.0, 20.0])}
+    earlier = CheckResult(
+        "2026-11-10T00:00:00Z",
+        {"openai": ProviderCheck("u", "fetched", changed), "anthropic": ProviderCheck("v", "fetched", other)},
+    )
+    save_result(paths, earlier)
+    both = [("openai", "gpt-6-astra"), ("anthropic", "claude-fable-5")]
+
+    def cut_off(url: str, timeout: int = 15) -> str:
+        raise http.client.IncompleteRead(b"<html>cut", 4989)
+
+    with mock.patch("ai_cost.prices_check.fetch", side_effect=cut_off):
+        save_result(paths, check_prices(book, ["openai"]))
+        limited = load_result(paths)
+        save_result(paths, check_prices(book))
+    whole = load_result(paths)
+    assert limited is not None and whole is not None
+    assert limited.checked_at == earlier.checked_at, "a check limited by --providers does not move check_due"
+    assert sorted(limited.drift()) == sorted(both) and limited.providers["anthropic"].status == "fetched"
+    openai = limited.providers["openai"]
+    assert openai.status.startswith("fetch-failed IncompleteRead") and openai.read_at == earlier.checked_at
+    assert earlier.checked_at in openai.status, "the status names when the kept entry was read"
+    assert whole.checked_at != earlier.checked_at, "a check of every vendor moves check_due, read or not"
+    assert sorted(whole.drift()) == sorted(both) and whole.providers["openai"].read_at == earlier.checked_at
 
 
 def test_auto_check_is_quiet_when_recent_or_offline(tmp_path: Path) -> None:
@@ -1633,30 +1659,28 @@ def test_a_changed_long_context_rate_is_a_change(tmp_path: Path) -> None:
     assert check.status is CheckStatus.CHANGED and check.missing == [f"long output {pro.long.output:g}"]
 
 
-def test_a_page_in_columns_keeps_the_span(tmp_path: Path) -> None:
-    """DeepSeek names both models, then every figure: a row bound would give the first name nothing."""
+def test_a_table_that_names_its_models_in_its_header_is_read_by_columns(tmp_path: Path) -> None:
+    """DeepSeek's recorded pricing page: each model is confirmed by the cells under its own name, and by nothing else.
+
+    The header row names the models (`deepseek-flash(1) | deepseek-v4-pro`), each price is a row; the page's next
+    section prices the Search API at $0.75.
+    """
     _, book = defaults(paths_in(tmp_path))
-    flash = book.entry(Provider.DEEPSEEK, "deepseek-flash", None)
-    assert isinstance(flash, PeakOffpeakPrice)
-    figures = [
-        getattr(tariff, rate)
-        for tariff in (flash.peak, flash.offpeak)
-        for rate in ("cache_hit", "cache_miss", "output")
-    ]
-    page = "MODEL deepseek-flash deepseek-v4-pro VERSION DeepSeek-V4.1-Flash DeepSeek-V4-Pro-0813 PRICE "
-    page += " ".join(f"${rate:g}" for rate in figures)
-    assert match_model([page], Provider.DEEPSEEK, "deepseek-flash", flash).status is CheckStatus.CONFIRMED
-    pro = book.entry(Provider.DEEPSEEK, "deepseek-v4-pro", None)
-    assert isinstance(pro, PeakOffpeakPrice)
-    theirs = " ".join(
-        f"${getattr(tariff, rate):g}"
-        for tariff in (pro.peak, pro.offpeak)
-        for rate in ("cache_hit", "cache_miss", "output")
-    )
-    labels = "MODEL VERSION DeepSeek-V4-Pro-0813 PRICE " + theirs
-    assert (
-        match_model([labels], Provider.DEEPSEEK, "deepseek-v4-pro", pro).status is CheckStatus.CONFIRMED
-    ), "a display name inside a compound label"
+    recorded = resources.files(__package__).joinpath("data/deepseek-pricing")
+    page = page_text(recorded.joinpath("pricing.html").read_text("utf-8"))
+    twin = twin_text(recorded.joinpath("pricing.md").read_text("utf-8"))
+    rows = vendor_rows(book, Provider.DEEPSEEK)
+    for model in ("deepseek-flash", "deepseek-v4-pro"):
+        entry = book.entry(Provider.DEEPSEEK, model, None)
+        assert isinstance(entry, PeakOffpeakPrice)
+        tariffs = (entry.peak, entry.offpeak)
+        own = sorted(
+            getattr(tariff, rate) for tariff in tariffs for rate in ("cache_hit", "cache_miss", "output")
+        )
+        for texts in ([page, twin], [page]):
+            check = match_model(texts, Provider.DEEPSEEK, model, entry, rows)
+            assert check.status is CheckStatus.CONFIRMED, (model, len(texts), check.seen)
+            assert sorted(check.seen) == own, f"{model}: its own column only, {len(texts)} variant(s)"
 
 
 def test_the_state_file_keeps_what_a_row_lacks_and_an_older_one_loads() -> None:
@@ -2180,8 +2204,6 @@ def test_the_id_decides_before_the_display_name(tmp_path: Path) -> None:
     )
     check = match_model([section], Provider.GOOGLE, "gemini-4-hydrogen", hydrogen, rows)
     assert check.status is CheckStatus.CONFIRMED and check.seen == [1.5, 7.5, 0.075]
-    heading = numbers_near(section, "Gemini 4 Hydrogen", 900)
-    assert heading != check.seen, "the heading's 900 characters do not hold the whole row: it must not decide"
 
 
 def test_an_unpriced_models_id_before_the_first_amount_ends_the_row(tmp_path: Path) -> None:

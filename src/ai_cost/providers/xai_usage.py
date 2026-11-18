@@ -9,7 +9,6 @@ query ends at the next midnight. Amounts are read as the answer's own decimal te
 
 from __future__ import annotations
 
-import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -22,6 +21,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..models import Provider, ProviderDay, ProviderDays, ProviderLine, Window
+from ..netread import ANSWER_ERRORS, read_body
 from ..timeutil import parse_ts
 from .common import day_interval, days_touched, exact_amount, holds_a_whole_day, key_problem, not_read, redact
 
@@ -133,7 +133,7 @@ def post(url: str, key: str, body: bytes) -> str:
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
-        return str(response.read().decode("utf-8"))
+        return str(read_body(response).decode("utf-8"))
 
 
 def read_days(request: XaiRequest, send: Post = post) -> ProviderDays:
@@ -150,7 +150,7 @@ def read_days(request: XaiRequest, send: Post = post) -> ProviderDays:
         by_day = parse_usage(send(url, request.key, body))
     except urllib.error.HTTPError as exc:
         reason = f"HTTP {exc.code} from the Management API ({_hint(exc.code)})"
-    except (urllib.error.URLError, OSError, http.client.HTTPException, UnicodeDecodeError) as exc:
+    except ANSWER_ERRORS as exc:  # the answer unreadable, or not UTF-8
         reason = f"the Management API could not be read ({exc.__class__.__name__}: {exc})"
     except UsageShapeError as exc:
         reason = f"the usage answer is not the documented shape: {exc}"
