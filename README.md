@@ -38,7 +38,7 @@ ai-cost log --provider openai --model gpt-5.5 --input 1200 --output 300 --ref jo
 
 One line per request, from a shell, Python, Node or any language that can append to a file.
 
-## Supports · version 2.12.1
+## Supports · version 2.13.0
 
 | | |
 |---|---|

@@ -141,11 +141,13 @@ read it (the command says so when you forget).
 ## A plugin for a source of your own
 
 Any program can add a source (rows for a window), an enricher (a pass over every row, e.g. to settle what a key was
-actually charged), doctor lines and tests. A plugin is a Python module that exports
-`PLUGIN = ai_cost.plugins.Plugin(...)`. The protocol is in
+actually charged), a placer (the directory a row's work belongs to, for `--project`), doctor lines and tests. A plugin
+is a Python module that exports `PLUGIN = ai_cost.plugins.Plugin(...)`. The protocol is in
 [`src/ai_cost/plugins.py`](../src/ai_cost/plugins.py): a `Source` has a `name` and `collect(ctx) -> Collected`, an
-`Enricher` has `enrich(rows, ctx) -> rows`, and `Context` gives them the paths, the config, the window, the request,
-the plugin's settings and the shared `skipped` / `warnings` sinks.
+`Enricher` has `enrich(rows, ctx) -> rows`, a `Placer` has `place(rows, ctx) -> list[str]` (one absolute directory or
+`""` per row; it runs only for a per-project report, before the filter, and changes no row — ADR-0011), and `Context`
+gives them the paths, the config, the window, the request, the plugin's settings and the shared `skipped` /
+`warnings` sinks.
 
 ```python
 # my_llm_costs/__init__.py

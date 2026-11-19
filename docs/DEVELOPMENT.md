@@ -6,7 +6,7 @@
 `src/ai_cost/` is the package: `models.py` (the typed data — `UsageRow`, `Tokens`, `Window`, `WorkItem`, `Report`),
 `pricing.py` (one pricer per price shape, chosen from a dispatch table), `groups.py` (real / api / vendor),
 `collectors/` (one module per built-in source — `claude`, `codex`, `gemini_cli`, `grok_build`, `github`, `github_bill`, `usage_log` — each
-returning `Collected` rows plus counted `Skipped` records), `plugins.py` (the source / enricher protocol and
+returning `Collected` rows plus counted `Skipped` records), `plugins.py` (the source / enricher / placer protocol and
 discovery), `config.py` with `data/{prices,config}.json`, `prices_check.py`, `ops.py` (report assembly and the
 per-project scope), `doctor.py`, `monitor.py`, `schedules.py` (the launchd / cron jobs), `report_warnings.py` (the header's warnings), `output.py` (`Emit` and the state-file helpers), `daily.py`, `reconcile.py`, `render.py`, `cli.py`. The design note and
 the architecture decision records are kept with the development source, not in the published tree.

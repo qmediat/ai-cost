@@ -258,3 +258,54 @@ def test_a_report_run_from_inside_a_project_scopes_the_other_sources_to_it(tmp_p
         os.chdir(cwd)
     assert [r.ref for r in report.rows if r.provider.value == "openai"] == ["sid-in"]
     assert any("left out (codex-rollouts ×1)" in w for w in report.warnings)
+
+
+class _PlaceOut:
+    """A placer that puts the rollout of the other directory into the project; a ``broken`` one fails its shape."""
+
+    name = "place-out"
+
+    def __init__(self, project: Path, broken: str = "") -> None:
+        self.project, self.broken = project, broken
+
+    def place(self, rows: list[UsageRow], ctx: Context) -> list[str]:
+        if self.broken == "raise":
+            raise RuntimeError("no records")
+        placed = [
+            str(self.project) if r.source == "codex-rollouts" and r.ref == "sid-out" else "" for r in rows
+        ]
+        return placed[:-1] if self.broken == "count" else placed
+
+
+def _placed_report(paths: Paths, project: Path, *placers: _PlaceOut) -> tuple[list[UsageRow], list[str]]:
+    config, book = defaults(paths)
+    request = ReportRequest(project=project, since=iso(WINDOW.start), until=iso(WINDOW.end), groups=("api",))
+    plugin = Plugin(name="placing", sources=(_Named(), _ByRef(), _Tilde()), placers=placers)
+    with mock.patch.dict(os.environ, {"HOME": str(project.parent)}):  # ~/proj is the project
+        report = build_report(request, paths, config, book, Loaded(plugins=[plugin]))
+    return list(report.rows), list(report.warnings)
+
+
+def test_a_row_a_placer_puts_in_the_project_is_kept_as_it_came_and_not_counted_as_left_out(
+    tmp_path: Path,
+) -> None:
+    paths, project = _populated(tmp_path)
+    rows, warnings = _placed_report(paths, project, _PlaceOut(project))
+    placed = [r for r in rows if r.ref == "sid-out" and r.source == "codex-rollouts"]
+    assert [r.scope.workspace for r in placed] == [str(tmp_path / "other")], "kept, its scope unchanged"
+    assert any(
+        "1 row(s) of other working directories left out (grok-build ×1)" in w for w in warnings
+    ), warnings
+    assert any(r.source == "byref" for r in rows), "inherited its scope from the placed row: placed with it"
+
+
+def test_a_placer_that_fails_costs_its_placements_only_and_the_raw_directories_decide(tmp_path: Path) -> None:
+    paths, project = _populated(tmp_path)
+    for broken in ("raise", "count"):
+        rows, warnings = _placed_report(paths, project, _PlaceOut(project, broken))
+        assert not any(r.ref == "sid-out" and r.source == "codex-rollouts" for r in rows), broken
+        assert any("plugin placing: placer place-out failed" in w for w in warnings), warnings
+        assert any(
+            "3 row(s) of other working directories left out (byref ×1, codex-rollouts ×1, grok-build ×1)" in w
+            for w in warnings
+        ), warnings

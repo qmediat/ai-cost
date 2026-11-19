@@ -32,7 +32,7 @@ BUNDLE_MODULE = "ai_cost_bundle"  # written by the build when plugin packages ar
 
 @dataclass(frozen=True)
 class Context:
-    """What every source and enricher sees for one report."""
+    """What every source, enricher and placer sees for one report."""
 
     paths: Paths
     config: Config
@@ -73,6 +73,19 @@ class Enricher(Protocol):
         ...
 
 
+class Placer(Protocol):
+    """An optional pass that says where rows belong for the per-project filter; it never changes a row."""
+
+    name: str
+
+    def place(self, rows: list[UsageRow], ctx: Context) -> list[str]:
+        """Per input row, in order: the absolute directory the row's work belongs to, or ``""`` for its own workspace.
+
+        Runs only for a per-project report, before the filter; the core checks the shape and the count.
+        """
+        ...
+
+
 Line = Callable[[bool, str], None]  # doctor: (ok, text)
 
 
@@ -88,6 +101,7 @@ class Plugin:
         ""  # a tests package (``pkg.tests``) that ``ai-cost selftest`` runs when the plugin is loaded
     )
     api_version: int = API_VERSION
+    placers: tuple[Placer, ...] = ()  # last: a plugin built with the fields before it still loads
 
 
 @dataclass

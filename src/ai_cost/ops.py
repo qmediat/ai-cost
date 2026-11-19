@@ -80,6 +80,7 @@ from .plugins import (
     Context,
     Enricher,
     Loaded,
+    Placer,
     Plugin,
     Source,
     bundled_modules,
@@ -341,10 +342,12 @@ def _gather(
         _gather_github(request, config, book, gathered)
     bill = _bill_unless_part(request, paths, config, gathered, session)
     _collect_sources(request, paths, config, loaded, gathered)
-    gathered.rows = _inherit_scope_by_ref(gathered.rows)
+    gathered.rows, donors = _inherit_scope_by_ref(gathered.rows)
     per_project = False
-    if project is not None and not all_projects:  # the sources' raw working directories, before any enricher
-        _keep_project_rows(gathered, project)
+    # the placers' directories, else the sources' raw ones — before any enricher renames a workspace
+    if project is not None and not all_projects:
+        placed = _placements(request, paths, config, loaded, gathered, donors)
+        _keep_project_rows(gathered, project, placed)
         per_project = True
         gathered.project = str(project)
     _absorb_bill(gathered, bill, per_project, config)
@@ -657,25 +660,28 @@ def provider_outside(summaries: Sequence[ProviderSummary]) -> tuple[str, ...]:
 # ---- per-project scope (ADR-0006) -------------------------------------------------------------------------------
 
 
-def _inherit_scope_by_ref(rows: list[UsageRow]) -> list[UsageRow]:
+def _inherit_scope_by_ref(rows: list[UsageRow]) -> tuple[list[UsageRow], dict[int, int]]:
     """A row without any scope key takes the scope of a row of another source that shares its ref (ADR-0006).
 
     The ref is a CLI session's id, or what a program wrote as ``ref`` / ``session`` in a usage-log line: a ledger
     line, a proxy log or an app's own record of a CLI session is placed with that session. Only an empty scope is
-    filled, only from another source, and the row's own paths stay.
+    filled, only from another source, and the row's own paths stay. Beside the rows: per row that inherited, the
+    index of the row it inherited from, so a placement follows the scope (ADR-0011).
     """
-    scopes: dict[str, tuple[str, Scope]] = {}
-    for row in rows:
+    scopes: dict[str, tuple[str, Scope, int]] = {}
+    for index, row in enumerate(rows):
         if row.ref and row.scope.identity() and row.ref not in scopes:
-            scopes[row.ref] = (row.source, row.scope)
+            scopes[row.ref] = (row.source, row.scope, index)
     out: list[UsageRow] = []
-    for row in rows:
+    donors: dict[int, int] = {}
+    for index, row in enumerate(rows):
         found = scopes.get(row.ref)
         if found is None or row.scope.identity() or found[0] == row.source:
             out.append(row)
         else:
             out.append(replace(row, scope=replace(found[1], paths=row.scope.paths)))
-    return out
+            donors[index] = found[2]
+    return out, donors
 
 
 def _is_under(workspace: str, project: Path) -> bool:
@@ -688,7 +694,7 @@ def _is_under(workspace: str, project: Path) -> bool:
     return any(d == root or d.startswith(root.rstrip(os.sep) + os.sep) for d in dirs for root in roots)
 
 
-def _keep_project_rows(gathered: _Gathered, project: Path) -> None:
+def _keep_project_rows(gathered: _Gathered, project: Path, placed: Sequence[str]) -> None:
     """``--project`` (or the cwd's project): rows that name another scope leave, counted per source.
 
     Exclusion needs evidence (ADR-0006). A row that names an absolute working directory outside the project is
@@ -696,12 +702,14 @@ def _keep_project_rows(gathered: _Gathered, project: Path) -> None:
     nobody can map) is left out too — it belongs somewhere, just not provably here; a row that names nothing (a
     usage-log line, a GitHub row) stays. Each group is counted in its own header warning, so the reader sees how
     much of the total is placed by evidence. The Claude rows are the project's already: their transcripts were
-    chosen by it.
+    chosen by it. A directory a placer gave (``placed``, one per row, ``""`` for none) is read in place of the
+    row's workspace; the row itself is kept as it came.
     """
     kept: list[UsageRow] = []
     counts: dict[str, dict[str, int]] = {"outside": {}, "named": {}, "unplaced": {}}
-    for row in gathered.rows:
-        workspace = os.path.expanduser(row.scope.workspace)  # a source may say ~/…: still a directory
+    for row, where in zip(gathered.rows, placed):
+        # a source may say ~/…: still a directory
+        workspace = os.path.expanduser(where or row.scope.workspace)
         if row.source == CLAUDE_SOURCE or (os.path.isabs(workspace) and _is_under(workspace, project)):
             kept.append(row)
             continue
@@ -822,8 +830,49 @@ def _enrich_rows(
             _guarded_enricher(gathered, plugin.name, enricher, ctx)
 
 
+def _placements(
+    request: ReportRequest,
+    paths: Paths,
+    config: Config,
+    loaded: Loaded,
+    gathered: _Gathered,
+    donors: Mapping[int, int],
+) -> list[str]:
+    """Every plugin's placers, in load order: per row the directory to filter by; a later non-empty answer wins.
+
+    A row that inherited its scope by ref takes the placement of the row it inherited from, unless a placer
+    placed it itself.
+    """
+    placed = [""] * len(gathered.rows)
+    for plugin in loaded.plugins:
+        ctx = _context(request, paths, config, gathered, plugin)
+        for placer in _pieces(gathered, plugin, "placers"):
+            answer = _guarded_placer(gathered, plugin.name, placer, ctx)
+            placed = [new or old for old, new in zip(placed, answer)]
+    return [where or placed[donors[i]] if i in donors else where for i, where in enumerate(placed)]
+
+
+def _guarded_placer(gathered: _Gathered, plugin: str, placer: Placer, ctx: Context) -> list[str]:
+    """A placer that raises or answers in another shape costs its own placements: one counted skip and one warning."""
+    try:
+        return _placed(gathered.rows, placer, ctx)
+    except Exception as exc:
+        _plugin_failed(gathered, plugin, piece_name(placer), "placer", exc)
+        return [""] * len(gathered.rows)
+
+
+def _placed(rows: list[UsageRow], placer: Placer, ctx: Context) -> list[str]:
+    """The placer's answer, checked: a list of strings, exactly one per input row."""
+    result: object = placer.place(list(rows), ctx)  # a copy goes in: the rows are the core's
+    if not isinstance(result, list) or not all(isinstance(item, str) for item in result):
+        raise TypeError(f"place() must return a list of strings, got {type(result).__name__}")
+    if len(result) != len(rows):
+        raise TypeError(f"place() must return one directory per input row, got {len(result)} for {len(rows)}")
+    return cast("list[str]", result)
+
+
 def role_pieces(plugin: Plugin, role: str) -> tuple[Any, ...]:
-    """A plugin's sources or enrichers as a tuple; a ``TypeError`` naming the role when it is not a sequence."""
+    """A plugin's sources, enrichers or placers as a tuple; a ``TypeError`` naming the role when it is not a sequence."""
     try:
         return tuple(getattr(plugin, role))
     except TypeError as exc:
@@ -831,7 +880,7 @@ def role_pieces(plugin: Plugin, role: str) -> tuple[Any, ...]:
 
 
 def _pieces(gathered: _Gathered, plugin: Plugin, role: str) -> tuple[Any, ...]:
-    """A plugin's sources or enrichers for the report; one that is not a sequence (``None``) costs the plugin that role only."""
+    """A plugin's pieces of one role for the report; one that is not a sequence (``None``) costs the plugin that role only."""
     try:
         return role_pieces(plugin, role)
     except TypeError as exc:
@@ -920,12 +969,18 @@ def piece_name(piece: object) -> str:
     return name if isinstance(name, str) and name else type(piece).__name__
 
 
+# what a failed piece costs the report, by its role; any other role's failure loses the rows it would have given
+_PLACING = "its rows are filtered by their own working directories"
+_FAILURE_COST = {"placer": _PLACING, "placers": _PLACING}
+
+
 def _plugin_failed(gathered: _Gathered, plugin: str, name: str, role: str, exc: Exception) -> None:
     gathered.skipped.append(
         Skipped(f"plugin {plugin}", name, f"{role} failed: {exc.__class__.__name__}: {exc}")
     )
+    cost = _FAILURE_COST.get(role, "its rows are missing")
     gathered.warnings.append(
-        f"plugin {plugin}: {role} {name} failed ({exc.__class__.__name__}: {exc}) — its rows are missing"
+        f"plugin {plugin}: {role} {name} failed ({exc.__class__.__name__}: {exc}) — {cost}"
     )
 
 

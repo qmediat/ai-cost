@@ -5,6 +5,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.13.0] - 2026-11-19
+
+### Added
+
+- A plugin may place its rows for a per-project report: a `Placer` (`Plugin.placers`) names, per row, the directory
+  the row's work belongs to, and `--project` keeps the row when that directory lies under the project — a CLI run
+  from a throw-away copy of the checkout is then counted in its project's report. The row itself is not changed; a
+  placer that fails costs only its own placements, with one warning (ADR-0011).
+
 ## [2.12.1] - 2026-11-18
 
 ### Fixed
